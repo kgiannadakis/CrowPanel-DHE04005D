@@ -1,0 +1,17 @@
+# Dual-boot partition table for CrowPanel DHE04005D (ESP32-P4, 16 MB flash).
+# Must stay byte-identical to selector/partitions_dualboot.csv and the
+# Meshtastic variant, otherwise the firmwares disagree on slot offsets and
+# corrupt each other when one of them writes to its own data partition.
+#
+# factory = boot selector, ota_0 = MeshCore, ota_1 = Meshtastic.
+# MeshCore's SPIFFS uses partition label "mcdata".
+#
+# Name,    Type, SubType,  Offset,    Size,      Flags
+nvs,       data, nvs,      0x9000,    0x5000,
+otadata,   data, ota,      0xe000,    0x2000,
+factory,   app,  factory,  0x10000,   0x180000,
+ota_0,     app,  ota_0,    0x190000,  0x500000,
+ota_1,     app,  ota_1,    0x690000,  0x500000,
+mcdata,    data, spiffs,   0xb90000,  0x230000,
+mtdata,    data, spiffs,   0xdc0000,  0x230000,
+coredump,  data, coredump, 0xff0000,  0x10000,

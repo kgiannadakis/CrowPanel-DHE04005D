@@ -1,0 +1,13 @@
+# Partition table for CrowPanel DHE04005D (ESP32-P4, 16 MB flash).
+#
+# Layout:
+#   nvs       20 KB   arduino NVS (unused on P4 WiFi, kept for compat)
+#   otadata    8 KB   OTA slot selector (kept for future use)
+#   app0       6 MB   active application (must start on a 64 KB boundary)
+#   spiffs  ~9.94 MB  persistent storage (MeshCore identity + state)
+#
+# Name,     Type, SubType, Offset,   Size,      Flags
+nvs,        data, nvs,     0x9000,   0x5000,
+otadata,    data, ota,     0xE000,   0x2000,
+app0,       app,  ota_0,   0x10000,  0x600000,
+spiffs,     data, spiffs,  0x610000, 0x9F0000,

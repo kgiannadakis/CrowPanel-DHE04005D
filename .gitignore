@@ -1,0 +1,35 @@
+# PlatformIO build output
+.pio/
+**/.pio/
+
+# IDE / editor settings
+.vscode/
+**/.vscode/
+.idea/
+*.code-workspace
+
+# Large generated map tiles (not distributed with the firmware)
+meshcore/tools/tiles/
+
+# pioarduino managed components (downloaded at build time)
+**/managed_components/
+
+# Python
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+.direnv/
+
+# Build leftovers
+out/
+.cache/
+compile_commands.json
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini

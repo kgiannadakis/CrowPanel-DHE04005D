@@ -1,0 +1,288 @@
+// ============================================================
+// examples/crowpanel_p4_lvgl_chat/main.cpp  (PHASE 1)
+// ------------------------------------------------------------
+// Boots the CrowPanel DHE04005D (ESP32-P4) directly via ESP-IDF's
+// esp_lcd_panel_rgb (see display.cpp), starts LVGL, and brings
+// up the MeshCore SX1262 radio. Draws a status screen. Touch and
+// chat UI are deferred to Phase 2.
+// ============================================================
+
+#include <Arduino.h>
+#include <esp_log.h>
+#include <lvgl.h>
+#include <WiFi.h>
+
+#include "display.h"
+#include "target.h"       // MeshCore SX1262 bring-up — variants/crowpanel_dhe04005d
+#include "stc8.h"         // STC8 coprocessor (backlight PWM, GPIO outputs)
+#include "board_config.h" // WIFI_HOSTED_SDIO_* pin numbers for the on-board C6
+#include "c6_upgrade.h"   // one-shot slave firmware upgrade on boot
+
+// ---- LVGL widgets ----
+static lv_obj_t* s_lbl_title    = nullptr;
+static lv_obj_t* s_lbl_hardware = nullptr;
+static lv_obj_t* s_lbl_radio    = nullptr;
+static lv_obj_t* s_lbl_uptime   = nullptr;
+static lv_obj_t* s_lbl_touch    = nullptr;
+static lv_obj_t* s_touch_dot    = nullptr;   // small follower that tracks the finger
+static lv_obj_t* s_lbl_wifi     = nullptr;
+
+// ---- LoRa defaults (EU Narrow, matches the DIS05020A v1.1 build) ----
+static constexpr float   kLoraFreqMhz = 869.618f;
+static constexpr float   kLoraBwKhz   =  62.5f;
+static constexpr uint8_t kLoraSf      =   8;
+static constexpr uint8_t kLoraCr      =   8;
+static constexpr int8_t  kLoraTxDbm   =  22;
+
+static uint32_t s_last_ui_ms = 0;
+
+// forward decl
+static void screen_touch_event_cb(lv_event_t* e);
+
+static void build_status_screen() {
+  if (!lvgl_lock(-1)) return;
+
+  lv_obj_t* scr = lv_scr_act();
+  lv_obj_set_style_bg_color(scr, lv_color_hex(0x101018), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+
+  s_lbl_title = lv_label_create(scr);
+  lv_label_set_text(s_lbl_title, "MeshCore  -  CrowPanel DHE04005D");
+  lv_obj_set_style_text_color(s_lbl_title, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_style_text_font(s_lbl_title, &lv_font_montserrat_24, 0);
+  lv_obj_align(s_lbl_title, LV_ALIGN_TOP_MID, 0, 24);
+
+  s_lbl_hardware = lv_label_create(scr);
+  lv_label_set_text(s_lbl_hardware,
+                    "ESP32-P4  |  800x480 RGB  |  SX1262  (touch: Phase 2)");
+  lv_obj_set_style_text_color(s_lbl_hardware, lv_color_hex(0xA0A0B0), 0);
+  lv_obj_align(s_lbl_hardware, LV_ALIGN_TOP_MID, 0, 64);
+
+  s_lbl_radio = lv_label_create(scr);
+  lv_obj_set_style_text_color(s_lbl_radio, lv_color_hex(0x60E060), 0);
+  lv_obj_set_style_text_font(s_lbl_radio, &lv_font_montserrat_20, 0);
+  lv_label_set_text(s_lbl_radio, "Radio: booting...");
+  lv_obj_align(s_lbl_radio, LV_ALIGN_CENTER, 0, -20);
+
+  s_lbl_uptime = lv_label_create(scr);
+  lv_obj_set_style_text_color(s_lbl_uptime, lv_color_hex(0xC0C0C0), 0);
+  lv_label_set_text(s_lbl_uptime, "Uptime: 0 s");
+  lv_obj_align(s_lbl_uptime, LV_ALIGN_CENTER, 0, 20);
+
+  s_lbl_touch = lv_label_create(scr);
+  lv_obj_set_style_text_color(s_lbl_touch, lv_color_hex(0xFFC060), 0);
+  lv_label_set_text(s_lbl_touch, "Touch: (tap anywhere)");
+  lv_obj_align(s_lbl_touch, LV_ALIGN_CENTER, 0, 60);
+
+  s_lbl_wifi = lv_label_create(scr);
+  lv_obj_set_style_text_color(s_lbl_wifi, lv_color_hex(0x60B0FF), 0);
+  lv_label_set_text(s_lbl_wifi, "WiFi: connecting...");
+  lv_obj_align(s_lbl_wifi, LV_ALIGN_CENTER, 0, 100);
+
+  // Small yellow dot that tracks the last touch point.
+  s_touch_dot = lv_obj_create(scr);
+  lv_obj_set_size(s_touch_dot, 16, 16);
+  lv_obj_set_style_radius(s_touch_dot, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(s_touch_dot, lv_color_hex(0xFFE000), 0);
+  lv_obj_set_style_border_width(s_touch_dot, 0, 0);
+  lv_obj_add_flag(s_touch_dot, LV_OBJ_FLAG_HIDDEN);
+
+  // Route press/release events on the root screen into our touch handler.
+  lv_obj_add_event_cb(scr, screen_touch_event_cb, LV_EVENT_PRESSING, nullptr);
+  lv_obj_add_event_cb(scr, screen_touch_event_cb, LV_EVENT_RELEASED, nullptr);
+
+  lvgl_unlock();
+}
+
+static void ui_set_radio_text(const char* text) {
+  if (!s_lbl_radio) return;
+  if (!lvgl_lock(100)) return;
+  lv_label_set_text(s_lbl_radio, text);
+  lvgl_unlock();
+}
+
+static void ui_set_wifi_text(const char* text) {
+  if (!s_lbl_wifi) return;
+  if (!lvgl_lock(100)) return;
+  lv_label_set_text(s_lbl_wifi, text);
+  lvgl_unlock();
+}
+
+static const char* wifi_status_name(wl_status_t s) {
+  switch (s) {
+    case WL_IDLE_STATUS:      return "IDLE";
+    case WL_NO_SSID_AVAIL:    return "NO_SSID_AVAIL";
+    case WL_SCAN_COMPLETED:   return "SCAN_COMPLETED";
+    case WL_CONNECTED:        return "CONNECTED";
+    case WL_CONNECT_FAILED:   return "CONNECT_FAILED (bad password?)";
+    case WL_CONNECTION_LOST:  return "CONNECTION_LOST";
+    case WL_DISCONNECTED:     return "DISCONNECTED";
+    default:                  return "UNKNOWN";
+  }
+}
+
+// Track the most recent STA_DISCONNECTED reason so we can react after the
+// connect loop times out (specifically reason=8 = ESP-Hosted host/slave
+// protocol mismatch → try the C6 upgrade).
+static volatile uint8_t s_wifi_last_disc_reason = 0;
+
+// Arduino-esp32 WiFi event callback — logs key transitions.
+static void wifi_event_cb(arduino_event_id_t ev, arduino_event_info_t info) {
+  switch (ev) {
+    case ARDUINO_EVENT_WIFI_READY:             Serial.println("[evt] WIFI_READY"); break;
+    case ARDUINO_EVENT_WIFI_STA_START:         Serial.println("[evt] STA_START"); break;
+    case ARDUINO_EVENT_WIFI_STA_STOP:          Serial.println("[evt] STA_STOP"); break;
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:     Serial.println("[evt] STA_CONNECTED"); break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      s_wifi_last_disc_reason = info.wifi_sta_disconnected.reason;
+      Serial.printf("[evt] STA_DISCONNECTED reason=%d\n", (int)s_wifi_last_disc_reason);
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.printf("[evt] GOT_IP %s\n",
+                    IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str());
+      break;
+    case ARDUINO_EVENT_WIFI_STA_LOST_IP:       Serial.println("[evt] LOST_IP"); break;
+    default: break;
+  }
+}
+
+// Bring up the ESP32-C6 WiFi over ESP-Hosted (SDIO) and join the configured AP.
+static void wifi_bringup() {
+  Serial.printf("WiFi: connecting to \"%s\"...\n", WIFI_SSID);
+  ui_set_wifi_text("WiFi: connecting...");
+
+  // CrowPanel P4 routes ESP-Hosted SDIO to the on-board C6 on non-default pins;
+  // must be set before WiFi.mode()/WiFi.begin() or SDIO init times out.
+  WiFi.setPins(
+    WIFI_HOSTED_SDIO_PIN_CLK,
+    WIFI_HOSTED_SDIO_PIN_CMD,
+    WIFI_HOSTED_SDIO_PIN_D0,
+    WIFI_HOSTED_SDIO_PIN_D1,
+    WIFI_HOSTED_SDIO_PIN_D2,
+    WIFI_HOSTED_SDIO_PIN_D3,
+    WIFI_HOSTED_SDIO_PIN_RESET);
+
+  WiFi.onEvent(wifi_event_cb);
+  WiFi.mode(WIFI_STA);
+  delay(500);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  const uint32_t t_end = millis() + 30000;
+  wl_status_t last = WL_IDLE_STATUS;
+  while (WiFi.status() != WL_CONNECTED && millis() < t_end) {
+    wl_status_t cur = WiFi.status();
+    if (cur != last) {
+      Serial.printf("WiFi: status -> %d (%s)\n", (int)cur, wifi_status_name(cur));
+      last = cur;
+    }
+    delay(250);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    IPAddress ip = WiFi.localIP();
+    int8_t rssi = WiFi.RSSI();
+    char buf[96];
+    snprintf(buf, sizeof(buf), "WiFi OK  %s  RSSI %d dBm", ip.toString().c_str(), (int)rssi);
+    Serial.println(buf);
+    ui_set_wifi_text(buf);
+  } else {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "WiFi FAILED (status=%d, %s)",
+             (int)WiFi.status(), wifi_status_name(WiFi.status()));
+    Serial.println(buf);
+    ui_set_wifi_text(buf);
+
+    // reason=8 (ASSOC_LEAVE) on ESP-Hosted is the signature of a host/slave
+    // firmware protocol mismatch. Try the C6 upgrade now:
+    //   - If tools/esp32c6-v*.bin is embedded, c6_upgrade_if_needed() flashes
+    //     it and reboots; on the next boot WiFi should associate cleanly.
+    //   - If no image is embedded, print the exact URL to download so the user
+    //     can drop it into tools/ and rebuild.
+    if (s_wifi_last_disc_reason == 8) {
+      Serial.println("[c6up] reason=8 suggests ESP-Hosted protocol mismatch, trying upgrade...");
+      ui_set_wifi_text("WiFi: attempting C6 upgrade...");
+      if (c6_upgrade_if_needed()) return;   // unreachable — reboot on success
+      c6_print_update_hint();               // no embedded image → show URL
+    }
+  }
+}
+
+static void ui_tick_uptime() {
+  if (!s_lbl_uptime) return;
+  char buf[48];
+  snprintf(buf, sizeof(buf), "Uptime: %lu s",
+           (unsigned long)(millis() / 1000));
+  if (!lvgl_lock(50)) return;
+  lv_label_set_text(s_lbl_uptime, buf);
+  lvgl_unlock();
+}
+
+// Root-screen event callback — fires for pressing/released via LVGL's indev.
+// Called from the LVGL task, so the mutex is already held by the caller.
+static void screen_touch_event_cb(lv_event_t* e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_PRESSING || code == LV_EVENT_PRESSED) {
+    lv_indev_t* idv = lv_indev_get_act();
+    if (!idv) return;
+    lv_point_t p;
+    lv_indev_get_point(idv, &p);
+    char buf[48];
+    snprintf(buf, sizeof(buf), "Touch: %d, %d", (int)p.x, (int)p.y);
+    lv_label_set_text(s_lbl_touch, buf);
+    lv_obj_clear_flag(s_touch_dot, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_pos(s_touch_dot, p.x - 8, p.y - 8);
+  } else if (code == LV_EVENT_RELEASED) {
+    lv_obj_add_flag(s_touch_dot, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println();
+  Serial.println("=== MeshCore CrowPanel DHE04005D (Phase 1) ===");
+
+  if (!display_init()) {
+    Serial.println("display_init FAILED — halting");
+    while (true) delay(1000);
+  }
+
+  // Crank up the backlight via the STC8 coprocessor (default duty is low).
+  stc8_set_pwm_duty(STC8_PWM_LCD_BL_EN, 100);
+
+  build_status_screen();
+
+  // Bring up GT911 touch as an LVGL input device. STC8 must already be up.
+  if (!display_touch_attach()) {
+    Serial.println("touch attach failed — continuing without touch");
+  }
+
+  Serial.println("Initialising SX1262...");
+  if (radio_init()) {
+    radio_set_params(kLoraFreqMhz, kLoraBwKhz, kLoraSf, kLoraCr);
+    radio_set_tx_power(kLoraTxDbm);
+    char buf[96];
+    snprintf(buf, sizeof(buf),
+             "Radio OK  %.3f MHz  BW %.1f kHz  SF%u  CR%u  %d dBm",
+             kLoraFreqMhz, kLoraBwKhz, kLoraSf, kLoraCr, (int)kLoraTxDbm);
+    Serial.println(buf);
+    ui_set_radio_text(buf);
+  } else {
+    Serial.println("Radio init FAILED");
+    ui_set_radio_text("Radio: INIT FAILED");
+  }
+
+  // --- WiFi (P4 host talks to on-board C6 via ESP-Hosted over SDIO) ---
+  wifi_bringup();
+}
+
+void loop() {
+  // LVGL has its own service task. This loop just refreshes the uptime label.
+  // Touch updates the label + dot directly via the LVGL screen event callback.
+  if (millis() - s_last_ui_ms > 500) {
+    s_last_ui_ms = millis();
+    ui_tick_uptime();
+  }
+  delay(20);
+}
