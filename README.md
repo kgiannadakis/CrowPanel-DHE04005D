@@ -39,7 +39,7 @@
 
 ## RTC Module (you need to provide one)
 
-This board has **no on-board real-time clock**, so to keep accurate wall-clock time across power-downs you must add an external **DS3231** RTC module — a TCXO-stabilised, DS1307-compatible chip at I2C address `0x68` — fitted with a backup battery (CR2032). Without it the clock resets on every power loss and only recovers once the device re-syncs from a mesh peer's packet timestamp or NTP over WiFi.
+This board has **no real-time clock**, so to keep clock time across power-downs you must add an external **DS3231** RTC module at I2C address `0x68` — fitted with a backup battery (CR2032). Without it the clock resets on every power loss and only recovers once the device re-syncs from a mesh peer's packet timestamp or NTP over WiFi.
 
 Wire the module to the board's **I2C expansion header** (the PH2.0-4P connector) — the same I2C bus the touch controller uses:
 
