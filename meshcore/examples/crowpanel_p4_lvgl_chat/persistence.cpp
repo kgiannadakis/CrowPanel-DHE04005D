@@ -414,7 +414,13 @@ void update_tx_status_by_msg_ts(const String& key, uint32_t msg_ts, char status)
 #endif
 }
 
-static const int MAX_DISPLAY_MESSAGES = 30;
+// Maximum messages held in the in-memory ring while loading a chat.
+// Bumped from 30 to 2000 so a chat shows ~7 days of history even on busy
+// channels (the on-disk file is already pruned to that window by
+// kChatHistoryKeepSeconds, so this is effectively "show everything we
+// kept"). The ring is allocated on the heap (see std::vector below) so
+// the larger size does not blow the LVGL/loop task stack.
+static const int MAX_DISPLAY_MESSAGES = 2000;
 
 // Time-based retention: keep chat lines from the last 7 days.
 // This survives reboot/power loss because messages are persisted on disk
@@ -508,7 +514,9 @@ void load_chat_from_file(const String& key) {
   // MAX_DISPLAY_MESSAGES in a ring. Previously this was two full-file
   // reads (count, then seek(0) and parse) — the ring collapses that
   // to one pass, ~halving chat-open latency on large files.
-  String ring[MAX_DISPLAY_MESSAGES];
+  // Heap allocation — at MAX_DISPLAY_MESSAGES = 2000 a stack array would
+  // be ~32 KB of String headers and would overflow the task stack.
+  std::vector<String> ring(MAX_DISPLAY_MESSAGES);
   int   ring_head  = 0;
   int   ring_count = 0;
   int   total      = 0;
