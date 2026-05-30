@@ -46,7 +46,10 @@ constexpr int kRebuildEdgeMarginPx = 24;
 constexpr int kMaxTileSlots = 40;
 constexpr int kDesiredTilePad = 1;
 constexpr int kMaxMarkerSlots = 40;
-constexpr int kMarkerMinZoom = 9; // speed-first: no marker pipeline on low zooms
+// Companions are gated off below this zoom — at z7/z8 a city-wide view
+// would crowd the map with hundreds of chat-node dots. Repeaters are
+// infrastructure and render at every zoom (kMinZoom..kMaxZoom).
+constexpr int kCompanionMinZoom = 9;
 
 enum MarkerFilter {
   FILTER_ALL = 0,
@@ -421,9 +424,8 @@ static int rebuild_map(bool include_markers) {
 
   int drawn_pins = 0;
   int hidden_pins = 0;
-  const bool markers_allowed = (s.zoom >= kMarkerMinZoom);
 
-  if (include_markers && markers_allowed && g_mesh) {
+  if (include_markers && g_mesh) {
 #if defined(ESP32)
     bool locked = true;
     if (g_mesh_mutex) locked = (xSemaphoreTake(g_mesh_mutex, pdMS_TO_TICKS(10)) == pdTRUE);
@@ -456,6 +458,9 @@ static int rebuild_map(bool include_markers) {
       if (!is_companion && !is_repeater) continue;
       if (s.filter == FILTER_COMPANIONS && !is_companion) continue;
       if (s.filter == FILTER_REPEATERS && !is_repeater) continue;
+      // Companions only render at z9+; repeaters render at every zoom
+      // (name labels are still gated to z11/z12 further down).
+      if (!is_repeater && s.zoom < kCompanionMinZoom) continue;
       if (ci.gps_lat == 0 && ci.gps_lon == 0) continue;
 
       const double lat = (double)ci.gps_lat / 1.0e6;
@@ -527,11 +532,7 @@ static int rebuild_map(bool include_markers) {
 #endif
   }
 
-  if (!markers_allowed) {
-    update_overlay_labels(loaded_tiles, total_tiles, 0, 0);
-  } else {
-    update_overlay_labels(loaded_tiles, total_tiles, drawn_pins, hidden_pins);
-  }
+  update_overlay_labels(loaded_tiles, total_tiles, drawn_pins, hidden_pins);
   return loaded_tiles;
 }
 
