@@ -752,6 +752,16 @@ protected:
              time_string_now().c_str(), safeName.c_str(), safeText.c_str());
     append_chat_to_file(key_for_contact(contact.id), false, bubble, 0, sig.c_str());
 
+    // Translate immediately on receive (when auto-translate + WiFi are on),
+    // so the translation lands in the bubble before the user opens the chat.
+    // Without this, the on-chat-open backfill would queue a translate for
+    // every untranslated RX line — a long backlog floods the 6-slot queue
+    // and crashes the device on low memory.
+    if (g_auto_translate_enabled && g_wifi_connected && safeText.length()) {
+        translate_request_to_file(safeText.c_str(),
+                                  key_for_contact(contact.id).c_str());
+    }
+
     char target_key[11];
     snprintf(target_key, sizeof(target_key), "c:%02x%02x%02x%02x",
              contact.id.pub_key[0], contact.id.pub_key[1],
@@ -1048,6 +1058,18 @@ protected:
     char bubble[512];
     snprintf(bubble, sizeof(bubble), "[%s] %s", time_string_now().c_str(), safeText.c_str());
     append_chat_to_file(key_for_channel(idx), false, bubble, 0, sig.c_str());
+
+    // Translate immediately on receive (see PM RX path for rationale). Strip
+    // the "SenderName: " prefix that channel messages carry so we only push
+    // the body to Google Translate, matching the on-chat-open backfill.
+    if (g_auto_translate_enabled && g_wifi_connected && safeText.length()) {
+        int sep_tr = safeText.indexOf(": ");
+        String body_tr = (sep_tr > 0) ? safeText.substring(sep_tr + 2) : safeText;
+        if (body_tr.length()) {
+            translate_request_to_file(body_tr.c_str(),
+                                      key_for_channel(idx).c_str());
+        }
+    }
 
     // Split "SenderName: message" for Telegram bridge
     {

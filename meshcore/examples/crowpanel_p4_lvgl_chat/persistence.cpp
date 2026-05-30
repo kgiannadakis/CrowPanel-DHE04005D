@@ -553,6 +553,21 @@ void load_chat_from_file(const String& key) {
   lv_obj_t* new_msg_divider = nullptr;   // captured for post-load scroll
   g_loading_history = true;
 
+  // Bounded backfill window for auto-translate on chat open. New messages
+  // are translated at receive time (see RX paths in main.cpp), so the chat
+  // file is normally already fully translated. This window only catches
+  // the edge case where the user has just enabled auto-translate and the
+  // last few RX messages predate that — we re-translate the most recent N.
+  // Capping at 3 prevents the 6-slot translate queue from flooding when
+  // the chat has hundreds of untranslated lines (which used to crash the
+  // device with "queue full, dropped oldest" → low-memory abort).
+  extern bool g_wifi_connected;
+  const int kMaxBackfillOnOpen = 3;
+  String backfill_ring[kMaxBackfillOnOpen];
+  int    backfill_head  = 0;
+  int    backfill_count = 0;
+  const bool backfill_enabled = g_auto_translate_enabled && g_wifi_connected;
+
   // Iterate the ring in insertion order. Oldest entry sits at ring_head
   // when the ring is full; otherwise entries start at index 0.
   const int start = (ring_count == MAX_DISPLAY_MESSAGES) ? ring_head : 0;
@@ -647,20 +662,32 @@ void load_chat_from_file(const String& key) {
 
     chat_add(out, body.c_str(), false, status, sig_info.length() ? sig_info.c_str() : nullptr, repeat_count, nullptr, trans.length() ? trans.c_str() : nullptr);
 
-    // Layer C: auto-translate on re-entry, but only for RX lines that
-    // never carried a {{TR}} marker at all — those messages arrived
-    // while Wi-Fi was down (or before translate landed) and have never
-    // been attempted. Lines with a marker, even an empty one, are
-    // considered "already handled" and are left alone, so re-opening
-    // a chat doesn't spam translate.googleapis.com with re-requests
-    // for every visible message on every entry.
-    extern bool g_wifi_connected;
-    if (!out && g_auto_translate_enabled && g_wifi_connected && tr_pos < 0 && body.length()) {
+    // Layer C: auto-translate on re-entry. Only RX lines that never
+    // carried a {{TR}} marker are eligible — lines with a marker (even
+    // an empty one) are considered "already handled". We store the most
+    // recent eligible bodies in a sliding window and drain it AFTER the
+    // ring loop, so at most kMaxBackfillOnOpen translate requests get
+    // queued no matter how many untranslated lines exist.
+    if (backfill_enabled && !out && tr_pos < 0 && body.length()) {
       String bare = strip_chat_body_prefix(body);
-      if (bare.length()) translate_request_to_file(bare.c_str(), key.c_str());
+      if (bare.length()) {
+        backfill_ring[backfill_head] = bare;
+        backfill_head = (backfill_head + 1) % kMaxBackfillOnOpen;
+        if (backfill_count < kMaxBackfillOnOpen) backfill_count++;
+      }
     }
   }
   g_loading_history = false;
+
+  // Drain the bounded auto-translate backfill window in chronological
+  // order (oldest in window first).
+  if (backfill_count > 0) {
+    const int bf_start = (backfill_count == kMaxBackfillOnOpen) ? backfill_head : 0;
+    for (int i = 0; i < backfill_count; i++) {
+      String& t = backfill_ring[(bf_start + i) % kMaxBackfillOnOpen];
+      if (t.length()) translate_request_to_file(t.c_str(), key.c_str());
+    }
+  }
 
   read_pos_set(key.c_str(), total);
 

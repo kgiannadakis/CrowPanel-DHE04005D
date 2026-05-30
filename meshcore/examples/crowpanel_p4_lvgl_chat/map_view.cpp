@@ -257,7 +257,9 @@ static void ensure_marker_slots() {
     MarkerSlot& m = s_marker_slots[i];
     m.dot = lv_obj_create(s.pan_layer);
     lv_obj_set_size(m.dot, 8, 8);
-    lv_obj_set_style_radius(m.dot, 0, 0);
+    // LV_RADIUS_CIRCLE adapts to whatever size rebuild_map sets later,
+    // so both repeater (8 px) and companion (6 px) dots render as circles.
+    lv_obj_set_style_radius(m.dot, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_opa(m.dot, LV_OPA_COVER, 0);
     lv_obj_set_style_border_opa(m.dot, LV_OPA_TRANSP, 0);
     lv_obj_set_style_shadow_opa(m.dot, LV_OPA_TRANSP, 0);
@@ -265,9 +267,14 @@ static void ensure_marker_slots() {
     lv_obj_add_flag(m.dot, LV_OBJ_FLAG_HIDDEN);
 
     m.lbl = lv_label_create(s.pan_layer);
-    lv_obj_set_style_text_color(m.lbl, lv_color_black(), 0);
+    // Gray pill behind the name so it reads clearly against any tile.
+    lv_obj_set_style_text_color(m.lbl, lv_color_white(), 0);
     lv_obj_set_style_text_font(m.lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_bg_opa(m.lbl, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_bg_color(m.lbl, lv_color_hex(0x5A5A5A), 0);
+    lv_obj_set_style_bg_opa(m.lbl, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(m.lbl, 3, 0);
+    lv_obj_set_style_pad_hor(m.lbl, 3, 0);
+    lv_obj_set_style_pad_ver(m.lbl, 1, 0);
     lv_obj_clear_flag(m.lbl, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(m.lbl, LV_OBJ_FLAG_HIDDEN);
     m.name[0] = 0;
@@ -466,15 +473,26 @@ static int rebuild_map(bool include_markers) {
       const int cx = (screen_x + marker_cell) / marker_cell;
       const int cy = (screen_y + marker_cell) / marker_cell;
       if (cx < 0 || cy < 0 || cx >= cell_cols || cy >= cell_rows) continue;
-      if (cx < max_cols && cy < max_rows) {
-        const int idx = cy * max_cols + cx;
-        if (used[idx]) continue;
-        used[idx] = 1;
-      }
 
-      if (drawn_pins >= marker_cap) {
-        hidden_pins++;
-        continue;
+      // Companion markers are throttled by cell-dedup + a soft cap so a
+      // dense cluster doesn't paint over itself. Repeater markers are
+      // infrastructure (and the user expects them visible at all times),
+      // so they bypass both throttles — they're still bounded by the hard
+      // slot limit (kMaxMarkerSlots) below. This fixes red markers
+      // "disappearing at random" between rebuilds: previously the marker_cap
+      // (18-34) was reached and which markers got dropped depended on
+      // ContactsIterator order, which isn't stable across rebuilds.
+      if (!is_repeater) {
+        if (cx < max_cols && cy < max_rows) {
+          const int idx = cy * max_cols + cx;
+          if (used[idx]) continue;
+          used[idx] = 1;
+        }
+
+        if (drawn_pins >= marker_cap) {
+          hidden_pins++;
+          continue;
+        }
       }
 
       if (drawn_pins >= kMaxMarkerSlots) {
