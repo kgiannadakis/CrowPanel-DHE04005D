@@ -188,6 +188,12 @@ python -m esptool --chip esp32p4 --port <PORT> --baud 921600 write-flash \
 
 Replace `<PORT>` with your serial port (e.g. `COM20` on Windows, `/dev/ttyUSB0` on Linux, `/dev/cu.usbserial` on macOS).
 
+### Post-installation - Emoji support
+
+For the emoji symbols to properly appear:
+1. Create a folder named "emoji" in the root of your sd card
+2. Copy the files "emoji_atlas_20.bin" and "emoji_atlas_32.bin" found in docs section. 
+
 ### Download Map Tiles (optional)
 
 Both **MeshCore** and **Meshtastic** render their **Maps** screen from OpenStreetMap tiles on a microSD card — the tiles are **not** bundled with the firmware, so you generate them yourself with the helper scripts in [`meshcore/tools/`](meshcore/tools/). The same tile set works for both firmwares (identical `/sdcard/tiles/` layout):
