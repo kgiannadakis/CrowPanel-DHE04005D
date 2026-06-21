@@ -831,9 +831,11 @@ void AdminModule::handleSetConfig(const meshtastic_Config &c)
 #endif
             config.lora.tx_enabled = true;
             initRegion();
+#if !defined(CROWPANEL_DHE04005D)
             if (myRegion->dutyCycle < 100) {
                 config.lora.ignore_mqtt = true; // Ignore MQTT by default if region has a duty cycle limit
             }
+#endif
             //  Compare the entire string, we are sure of the length as a topic has never been set
             if (strcmp(moduleConfig.mqtt.root, default_mqtt_root) == 0) {
                 sprintf(moduleConfig.mqtt.root, "%s/%s", default_mqtt_root, myRegion->name);

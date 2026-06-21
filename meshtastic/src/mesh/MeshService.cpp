@@ -30,42 +30,6 @@
 #include "PortduinoGlue.h"
 #endif
 
-namespace
-{
-static uint32_t s_mqttToPhoneBackpressureDrops = 0;
-static uint32_t s_mqttToPhoneBackpressureLastLogMs = 0;
-
-bool shouldAlwaysKeepForPhone(const meshtastic_MeshPacket *p)
-{
-    if (!p) {
-        return false;
-    }
-    if (isToUs(p)) {
-        return true;
-    }
-    if (p->which_payload_variant != meshtastic_MeshPacket_decoded_tag) {
-        return false;
-    }
-    if (MeshService::isTextPayload(p)) {
-        return true;
-    }
-    return IS_ONE_OF(p->decoded.portnum, meshtastic_PortNum_NODEINFO_APP, meshtastic_PortNum_ADMIN_APP,
-                     meshtastic_PortNum_ROUTING_APP, meshtastic_PortNum_TRACEROUTE_APP);
-}
-
-void logMqttToPhoneBackpressureDrop()
-{
-    s_mqttToPhoneBackpressureDrops++;
-    const uint32_t now = millis();
-    if ((now - s_mqttToPhoneBackpressureLastLogMs) < 5000) {
-        return;
-    }
-    LOG_WARN("MQTT->phone backpressure: dropped=%u low-priority packets", (unsigned)s_mqttToPhoneBackpressureDrops);
-    s_mqttToPhoneBackpressureDrops = 0;
-    s_mqttToPhoneBackpressureLastLogMs = now;
-}
-} // namespace
-
 /*
 receivedPacketQueue - this is a queue of messages we've received from the mesh, which we are keeping to deliver to the phone.
 It is implemented with a FreeRTos queue (wrapped with a little RTQueue class) of pointers to MeshPacket protobufs (which were
@@ -129,12 +93,13 @@ int MeshService::handleFromRadio(const meshtastic_MeshPacket *mp)
     bool isPreferredRebroadcaster =
         IS_ONE_OF(config.device.role, meshtastic_Config_DeviceConfig_Role_ROUTER, meshtastic_Config_DeviceConfig_Role_ROUTER_LATE,
                   meshtastic_Config_DeviceConfig_Role_CLIENT_BASE);
-    if (mp->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
-        mp->decoded.portnum == meshtastic_PortNum_TELEMETRY_APP && mp->decoded.request_id > 0) {
+    const bool isDecoded = mp->which_payload_variant == meshtastic_MeshPacket_decoded_tag;
+    const meshtastic_NodeInfoLite *fromNode = isDecoded ? nodeDB->getMeshNode(mp->from) : nullptr;
+
+    if (isDecoded && mp->decoded.portnum == meshtastic_PortNum_TELEMETRY_APP && mp->decoded.request_id > 0) {
         LOG_DEBUG("Received telemetry response. Skip sending our NodeInfo");
         //  ignore our request for its NodeInfo
-    } else if (mp->which_payload_variant == meshtastic_MeshPacket_decoded_tag && !nodeDB->getMeshNode(mp->from)->has_user &&
-               nodeInfoModule && !isPreferredRebroadcaster && !nodeDB->isFull()) {
+    } else if (isDecoded && fromNode && !fromNode->has_user && nodeInfoModule && !isPreferredRebroadcaster && !nodeDB->isFull()) {
         if (airTime->isTxAllowedChannelUtil(true)) {
             const int8_t hopsUsed = getHopsAway(*mp, config.lora.hop_limit);
             if (hopsUsed > (int32_t)(config.lora.hop_limit + 2)) {
@@ -146,6 +111,8 @@ int MeshService::handleFromRadio(const meshtastic_MeshPacket *mp)
         } else {
             LOG_DEBUG("Skip sending NodeInfo > 25%% ch. util");
         }
+    } else if (isDecoded && mp->via_mqtt && !fromNode) {
+        LOG_DEBUG("Skip send NodeInfo for unknown MQTT node 0x%x", mp->from);
     }
 
     printPacket("Forwarding to phone", mp);
@@ -351,17 +318,6 @@ bool MeshService::trySendPosition(NodeNum dest, bool wantReplies)
 void MeshService::sendToPhone(meshtastic_MeshPacket *p)
 {
     perhapsDecode(p);
-
-    // Do real ingress shaping for public MQTT firehose traffic before queue saturation:
-    // keep important packets (DM/text/admin/nodeinfo/routing), shed low-value MQTT noise.
-    if (p->via_mqtt && !shouldAlwaysKeepForPhone(p)) {
-        if (api_state == STATE_DISCONNECTED || toPhoneQueue.numFree() <= 1) {
-            logMqttToPhoneBackpressureDrop();
-            releaseToPool(p);
-            fromNum++;
-            return;
-        }
-    }
 
 #ifdef ARCH_ESP32
 #if !MESHTASTIC_EXCLUDE_STOREFORWARD

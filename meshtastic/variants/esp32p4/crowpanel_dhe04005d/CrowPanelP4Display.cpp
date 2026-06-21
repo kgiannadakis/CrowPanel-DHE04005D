@@ -208,7 +208,6 @@ bool display_init()
     size_t buf_sz = 0;
     void* lvgl_buf_a = nullptr;
     void* lvgl_buf_b = nullptr;
-    bool lvgl_bufs_in_psram = false;
 
     // Prefer PSRAM buffers on CrowPanel so INTERNAL DMA-capable memory remains
     // available for WiFi hosted transport and AES/GDMA descriptor allocations.
@@ -221,7 +220,6 @@ bool display_init()
         if (a && b) {
             lvgl_buf_a = a;
             lvgl_buf_b = b;
-            lvgl_bufs_in_psram = true;
             draw_rows = rows;
             buf_sz = try_sz;
             break;
@@ -232,7 +230,6 @@ bool display_init()
 
     // Fallback to INTERNAL only if PSRAM could not satisfy minimum rows.
     if (!lvgl_buf_a || !lvgl_buf_b) {
-        lvgl_bufs_in_psram = false;
         for (int rows = draw_rows; rows >= kDrawRowsMin; rows -= kDrawRowsStep) {
             const size_t try_px = (size_t)s_lvgl_w * (size_t)rows;
             const size_t try_sz = try_px * sizeof(lv_color_t);
@@ -255,8 +252,7 @@ bool display_init()
         return false;
     }
 
-    ESP_LOGI(TAG, "LVGL draw rows=%u, width=%d (%s)", (unsigned)draw_rows, s_lvgl_w,
-             lvgl_bufs_in_psram ? "PSRAM" : "INTERNAL");
+    ESP_LOGI(TAG, "LVGL draw rows=%u, width=%d", (unsigned)draw_rows, s_lvgl_w);
 
     // Reserve the image-decode PSRAM arena now, while the system PSRAM heap is
     // still clean. esp_lcd_panel_init() (below) corrupts that heap's free-list,

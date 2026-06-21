@@ -8,7 +8,11 @@
 #include <esp_log.h>
 #include <WiFi.h>
 #include <esp32-hal-hosted.h>
-#include "../variants/esp32p4/crowpanel_dhe04005d/board_config.h"
+#include "board_config.h"
+#if HAS_TFT && USE_MCUI
+#include "graphics/mcui/McEmojiAtlas.h"
+#include "graphics/mcui/McEmojiFont.h"
+#endif
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -117,6 +121,7 @@ static void backlight_task(void *) {
         if (to != UINT32_MAX && s_screen_on) {
             uint32_t elapsed = millis() - s_last_activity_ms;
             if (elapsed >= to * 1000U) {
+                ESP_LOGW("crowpanel", "backlight timeout after %u seconds", (unsigned)to);
                 _bl_cmd(BL_OFF);
                 s_screen_on = false;
             }
@@ -127,6 +132,12 @@ static void backlight_task(void *) {
 }
 
 extern "C" void initVariant() {
+
+    // The public MQTT downlink path can trigger repeated esp-aes allocation
+    // errors inside prebuilt IDF/WiFi code on this P4 RGB board. Those packets
+    // are already dropped by upper layers; printing every failure makes mcui
+    // and LoRa feel sluggish, so keep the noisy IDF tag silent in normal builds.
+    esp_log_level_set("esp-aes", ESP_LOG_NONE);
 
 #if CROWPANEL_RETURN_TO_BOOT_SELECTOR
     const esp_partition_t *factory = esp_partition_find_first(
@@ -146,9 +157,15 @@ extern "C" void initVariant() {
 #endif
 
     LittleFS.begin(true, "/littlefs", 10, "mtdata");
+#if HAS_TFT && USE_MCUI
+    // Mount /sdcard and load the color-emoji atlas now, before ESP-Hosted WiFi
+    // starts and before the framebuffer touches PSRAM. The SD mount is kept
+    // alive for maps; re-mounting SD after ESP-Hosted is running destabilizes
+    // the hosted SDIO link on this board.
+    emoji_atlas_init();
+    emoji_font_init();
+#endif
 
-    // Prewarm ESP-Hosted + WiFi before RGB/LVGL allocations land in PSRAM.
-    // On this board that avoids scan-time TLSF asserts in hosted/lwip alloc paths.
     WiFi.setPins(WIFI_HOSTED_SDIO_PIN_CLK,
                  WIFI_HOSTED_SDIO_PIN_CMD,
                  WIFI_HOSTED_SDIO_PIN_D0,
@@ -156,6 +173,13 @@ extern "C" void initVariant() {
                  WIFI_HOSTED_SDIO_PIN_D2,
                  WIFI_HOSTED_SDIO_PIN_D3,
                  WIFI_HOSTED_SDIO_PIN_RESET);
+    // Bring ESP-Hosted up during the clean PSRAM window, before
+    // esp_lcd_new_rgb_panel() corrupts the TLSF heap.
+    // This is load-bearing on the RGB board: if hosted init is deferred and
+    // WiFi is disabled at boot, the FIRST hostedInit happens lazily from the
+    // UI WiFi-scan path AFTER the framebuffer, and lwIP/hosted allocation hits
+    // the corrupt heap -> assert block_locate_free. Prewarming here puts the
+    // SDIO pool on the clean heap so a later scan/connect reuses it.
     if (!hostedInitWiFi()) {
         ESP_LOGW("crowpanel", "ESP-Hosted pre-init failed; WiFi may be unstable");
     } else {
@@ -164,7 +188,6 @@ extern "C" void initVariant() {
         WiFi.disconnect();
         ESP_LOGI("crowpanel", "ESP-Hosted prewarmed (STA mode, disconnected)");
     }
-
     i2c1_bus_handle();
     delay(50);
 

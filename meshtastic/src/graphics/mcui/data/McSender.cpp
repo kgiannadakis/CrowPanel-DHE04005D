@@ -45,6 +45,16 @@ static constexpr uint32_t PENDING_TIMEOUT_MS = 120000;
 static PendingAck s_pending[PENDING_ACK_MAX];
 static uint32_t s_last_key_request_ms = 0;
 
+static bool is_mqtt_only_contact(const meshtastic_NodeInfoLite *n)
+{
+#if defined(CROWPANEL_DHE04005D)
+    return n && n->via_mqtt && n->snr == 0.0f && !moduleConfig.mqtt.mqtt_contact_discovery_enabled;
+#else
+    (void)n;
+    return false;
+#endif
+}
+
 static bool direct_key_available(NodeNum node)
 {
 #if !(MESHTASTIC_EXCLUDE_PKI)
@@ -52,6 +62,9 @@ static bool direct_key_available(NodeNum node)
         return true;
     }
     meshtastic_NodeInfoLite *n = nodeDB->getMeshNode(node);
+    if (is_mqtt_only_contact(n)) {
+        return false;
+    }
     return n && n->has_user && n->user.public_key.size == 32;
 #else
     (void)node;
@@ -59,15 +72,22 @@ static bool direct_key_available(NodeNum node)
 #endif
 }
 
-static void request_key_exchange()
+static void request_key_exchange(NodeNum node)
 {
 #if !(MESHTASTIC_EXCLUDE_PKI)
     uint32_t now = millis();
     if (nodeInfoModule && (s_last_key_request_ms == 0 || (now - s_last_key_request_ms) > 60000)) {
-        LOG_INFO("mcui: requesting NodeInfo/public keys for direct messages");
-        nodeInfoModule->sendOurNodeInfo(NODENUM_BROADCAST, true, 0, true);
+        uint8_t channel = 0;
+        meshtastic_NodeInfoLite *n = nodeDB ? nodeDB->getMeshNode(node) : nullptr;
+        if (n && !is_mqtt_only_contact(n)) {
+            channel = n->channel;
+        }
+        LOG_INFO("mcui: requesting NodeInfo/public key for 0x%08x on channel %u", (unsigned)node, (unsigned)channel);
+        nodeInfoModule->sendOurNodeInfo(node ? node : NODENUM_BROADCAST, true, channel, true);
         s_last_key_request_ms = now;
     }
+#else
+    (void)node;
 #endif
 }
 
@@ -153,7 +173,7 @@ static void on_ack_nak_received(NodeNum from, PacketId id, bool isAck)
 static void do_send(const PendingSend &ps)
 {
     if (!router || !service) {
-        LOG_WARN("mcui: send dropped — router/service null");
+        LOG_WARN("mcui: send dropped - router/service null");
 
         if (ps.id.kind == McConvId::DIRECT) {
             messages_mark_last_unsent_as_failed(ps.id);
@@ -162,15 +182,22 @@ static void do_send(const PendingSend &ps)
     }
 
     if (ps.id.kind == McConvId::DIRECT && !direct_key_available((NodeNum)ps.id.value)) {
-        LOG_WARN("mcui: direct send blocked; missing public key for 0x%08x", (unsigned)ps.id.value);
-        request_key_exchange();
-        messages_mark_last_unsent_as_failed(ps.id);
-        return;
+        meshtastic_NodeInfoLite *n = nodeDB ? nodeDB->getMeshNode((NodeNum)ps.id.value) : nullptr;
+        if (is_mqtt_only_contact(n)) {
+            LOG_WARN("mcui: direct send blocked; MQTT-only contact 0x%08x has no public key", (unsigned)ps.id.value);
+            request_key_exchange((NodeNum)ps.id.value);
+            messages_mark_last_unsent_as_failed(ps.id);
+            return;
+        }
+
+        LOG_WARN("mcui: direct send without public key for 0x%08x; using channel encryption fallback",
+                 (unsigned)ps.id.value);
+        request_key_exchange((NodeNum)ps.id.value);
     }
 
     meshtastic_MeshPacket *p = router->allocForSending();
     if (!p) {
-        LOG_WARN("mcui: send dropped — allocForSending returned null");
+        LOG_WARN("mcui: send dropped - allocForSending returned null");
         if (ps.id.kind == McConvId::DIRECT) {
             messages_mark_last_unsent_as_failed(ps.id);
         }

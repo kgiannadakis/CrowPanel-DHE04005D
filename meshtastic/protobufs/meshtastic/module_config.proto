@@ -82,6 +82,12 @@ message ModuleConfig {
      * Settings for reporting information about our node to a map via MQTT
      */
     MapReportSettings map_report_settings = 11;
+
+    /*
+     * If true, accept MQTT packets from unknown MQTT gateways so they can populate the node/contact list.
+     * Disable this on constrained public-MQTT devices to avoid spending CPU and heap on discovery traffic.
+     */
+    bool mqtt_contact_discovery_enabled = 12;
   }
 
   /*

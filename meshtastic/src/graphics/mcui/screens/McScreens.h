@@ -15,6 +15,8 @@ void nodes_screen_tick();
 
 void maps_screen_tick();
 void maps_storage_prewarm();
+void maps_screen_on_show();
+void maps_screen_on_hide();
 
 void settings_screen_tick();
 }

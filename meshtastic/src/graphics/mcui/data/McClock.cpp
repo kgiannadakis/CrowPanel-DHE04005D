@@ -31,7 +31,7 @@ void mcclock_init()
 
     uint32_t utc = 0;
     if (!ds3231_read_unix(&utc) || utc < 1700000000U) {
-        LOG_INFO("mcclock: DS3231 oscillator-halt or pre-2023 timestamp — waiting for NTP / GPS");
+        LOG_INFO("mcclock: DS3231 oscillator-halt or pre-2023 timestamp - waiting for NTP / GPS");
         return;
     }
 
@@ -53,7 +53,7 @@ void mcclock_init()
 void mcclock_save(uint32_t utc_epoch)
 {
     if (!s_rtc_ok) {
-        LOG_DEBUG("mcclock: save skipped — no RTC");
+        LOG_DEBUG("mcclock: save skipped - no RTC");
         return;
     }
     if (utc_epoch < 1700000000) {

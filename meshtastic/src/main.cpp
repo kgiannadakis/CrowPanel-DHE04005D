@@ -962,13 +962,13 @@ void setup()
 #endif
 #if !MESHTASTIC_EXCLUDE_MQTT
     mqttInit();
-    // Open and HOLD the broker TCP socket while the heap is still clean.
-    // PubSubClient keeps it alive afterwards, so the periodic reconnect()
-    // path reuses these lwIP buffers instead of allocating fresh ones on
-    // the (post-framebuffer) corrupted heap. Safe even if WiFi/broker is
-    // down: wantsLink() short-circuits and the attempt is pre-framebuffer.
+    // Open the direct MQTT socket NOW, on the still-clean PSRAM heap, before the
+    // RGB framebuffer corrupts it below. The MQTT OSThread would otherwise make
+    // its first connect() post-framebuffer and assert in TLSF block_locate_free.
+    // mqtt is non-null only when MQTT is enabled; prewarmConnect() itself no-ops
+    // if no link is wanted (proxy mode / WiFi down).
     if (mqtt)
-        (void)mqtt->prewarmConnectNow();
+        mqtt->prewarmConnect();
 #endif
     earlyNetworkInitDone = true;
     // WiFi + MQTT socket are now allocated on the clean heap. Let the mcui

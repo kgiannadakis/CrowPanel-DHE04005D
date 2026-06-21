@@ -100,7 +100,10 @@ template <class T> class MemoryDynamic : public Allocator<T>
     virtual T *alloc(TickType_t maxWait) override
     {
         T *p = (T *)malloc(sizeof(T));
-        assert(p);
+        if (!p) {
+            LOG_WARN("Dynamic pool allocation failed for %u bytes", (unsigned)sizeof(T));
+            return nullptr;
+        }
         return p;
     }
 };

@@ -14,6 +14,15 @@
 #if __has_include(<WiFiClientSecure.h>)
 #include <WiFiClientSecure.h>
 #endif
+#if defined(ARCH_ESP32P4) && defined(CROWPANEL_DHE04005D) && !defined(ARCH_PORTDUINO)
+class CrowPanelMqttClient : public WiFiClient
+{
+  public:
+    size_t write(uint8_t data) override;
+    size_t write(const uint8_t *buf, size_t size) override;
+    using WiFiClient::write;
+};
+#endif
 #endif
 #if HAS_ETHERNET && !defined(USE_WS5500)
 #include <EthernetClient.h>
@@ -48,6 +57,16 @@ class MQTT : private concurrency::OSThread
 
     bool isConnectedDirectly();
 
+    /** Open the direct broker connection immediately, on the calling thread.
+     * Used on ESP32-P4 RGB-panel boards to establish the MQTT socket during the
+     * clean-PSRAM window in setup() — BEFORE esp_lcd_new_rgb_panel() corrupts
+     * the PSRAM TLSF heap. Without it the first connect happens from the MQTT
+     * OSThread post-framebuffer and asserts in block_locate_free. No-op when
+     * MQTT is disabled / proxied / no link is wanted. */
+    void prewarmConnect();
+
+    void pausePublicDownlink(uint32_t durationMs, const char *reason);
+
     bool publish(const char *topic, const char *payload, bool retained);
 
     bool publish(const char *topic, const uint8_t *payload, size_t length, const bool retained);
@@ -63,15 +82,6 @@ class MQTT : private concurrency::OSThread
 
     /// Validate the meshtastic_ModuleConfig_MQTTConfig.
     static bool isValidConfig(const meshtastic_ModuleConfig_MQTTConfig &config) { return isValidConfig(config, nullptr); }
-
-#if defined(ARCH_ESP32P4) && defined(CROWPANEL_DHE04005D)
-    /** CrowPanel P4 only: synchronously attempt ONE direct broker connect,
-     * bypassing the post-WiFi startup-delay throttle. Called by main.cpp's
-     * early-network init so the TCP socket is opened (and then held) while
-     * the PSRAM heap is still clean, i.e. before esp_lcd_new_rgb_panel().
-     * Returns true if connected. */
-    bool prewarmConnectNow();
-#endif
 
   protected:
     struct QueueEntry {
@@ -90,7 +100,11 @@ class MQTT : private concurrency::OSThread
   private:
 #endif
 #if HAS_WIFI
+#if defined(ARCH_ESP32P4) && defined(CROWPANEL_DHE04005D) && !defined(ARCH_PORTDUINO)
+    using MQTTClient = CrowPanelMqttClient;
+#else
     using MQTTClient = WiFiClient;
+#endif
 #if __has_include(<WiFiClientSecure.h>)
     using MQTTClientTLS = WiFiClientSecure;
 #define MQTT_SUPPORTS_TLS 1

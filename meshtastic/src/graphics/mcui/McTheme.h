@@ -2,6 +2,8 @@
 
 #if HAS_TFT && USE_MCUI
 
+#include "McFonts.h"
+
 #define TH_BG           0x0E1621
 #define TH_SURFACE      0x17212B
 #define TH_SURFACE2     0x1E2C3A

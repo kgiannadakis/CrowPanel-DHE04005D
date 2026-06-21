@@ -210,8 +210,8 @@
 
 #ifndef LV_CACHE_DEF_SIZE
 // Map tiles decode to 256 KB ARGB8888 buffers, served from the boot-time PSRAM
-// arena (see PngDecodeArena.cpp, 12 MB). 6 MB caches ~24 decoded tiles — more
-// than the visible portrait viewport — so tiles are not re-decoded on every
+// arena (see PngDecodeArena.cpp, 12 MB). 6 MB caches ~24 decoded tiles - more
+// than the visible portrait viewport - so tiles are not re-decoded on every
 // pan, while leaving the arena room for a tile's decode scratch in flight.
 // The old 128 KB budget rejected every tile (entry > budget), which made
 // decoder_open() destroy the decoded buffer and return LV_RESULT_INVALID.

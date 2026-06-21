@@ -21,6 +21,12 @@ class ESP32CryptoEngine : public CryptoEngine
      */
     virtual void encryptAESCtr(CryptoKey _key, uint8_t *_nonce, size_t numBytes, uint8_t *bytes) override
     {
+#if defined(CROWPANEL_DHE04005D)
+        // ESP32-P4 hosted WiFi is short on internal DMA descriptors while the
+        // display and MQTT are active, so keep mesh packet AES off mbedTLS DMA.
+        CryptoEngine::encryptAESCtr(_key, _nonce, numBytes, bytes);
+        return;
+#endif
         if (_key.length > 0) {
             if (numBytes <= MAX_BLOCKSIZE) {
                 mbedtls_aes_setkey_enc(&aes, _key.bytes, _key.length * 8);

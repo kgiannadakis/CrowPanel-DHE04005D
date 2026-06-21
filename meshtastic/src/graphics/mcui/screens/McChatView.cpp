@@ -233,6 +233,7 @@ static void add_bubble(const McMessage &m)
         lv_obj_t *h = lv_label_create(bubble);
         lv_label_set_text(h, head);
         lv_obj_set_style_text_color(h, lv_color_hex(TH_ACCENT_LIGHT), 0);
+        lv_obj_set_style_text_font(h, MCUI_FONT_16, 0);
     }
 
     lv_obj_t *body = lv_label_create(bubble);
@@ -240,6 +241,7 @@ static void add_bubble(const McMessage &m)
     lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(body, lv_pct(100));
     lv_obj_set_style_text_color(body, lv_color_hex(TH_TEXT), 0);
+    lv_obj_set_style_text_font(body, MCUI_FONT_16, 0);
 
     char foot[48] = {0};
     uint32_t foot_color = TH_TEXT3;
@@ -265,7 +267,7 @@ static void add_bubble(const McMessage &m)
         lv_label_set_text(f, foot);
         lv_obj_set_style_text_color(f, lv_color_hex(foot_color), 0);
 
-        lv_obj_set_style_text_font(f, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(f, MCUI_FONT_16, 0);
     }
 }
 
@@ -280,6 +282,30 @@ static void rebuild_bubbles()
     for (size_t i = 0; i < n; i++) add_bubble(buf[i]);
 
     lv_obj_scroll_to_y(s_bubbles, LV_COORD_MAX, LV_ANIM_OFF);
+
+    // DHE04005D: sending/receiving a message triggers a burst of SPIRAM
+    // allocations (LoRa encode, and an MQTT publish when WiFi is up) on this
+    // board's corrupted PSRAM heap, which can hand back a block overlapping the
+    // RGB framebuffer and leave stuck on-screen corruption (the stomped region
+    // is never re-marked dirty). Force a full-screen repaint after a chat
+    // content change so any such corruption self-heals instead of persisting
+    // until reboot. LVGL allocs are pinned to internal RAM, so the repaint
+    // itself does not touch the corrupt heap.
+    //
+    // But a full-screen repaint is a full PPA rotate + draw_bitmap of the whole
+    // panel, during which the LVGL service task cannot sample touch. Under an
+    // MQTT downlink burst, rebuild_bubbles() fires on every incoming packet, so
+    // an unconditional full-screen invalidate here starves keyboard/touch input
+    // and makes typing feel laggy. Throttle it: at most one full-screen repaint
+    // per window. Stomped regions still self-heal within that window, and the
+    // per-bubble edits below invalidate their own areas normally regardless.
+    static uint32_t s_last_full_invalidate = 0;
+    const uint32_t now = millis();
+    if (s_last_full_invalidate == 0 || (uint32_t)(now - s_last_full_invalidate) >= 1500) {
+        s_last_full_invalidate = now;
+        lv_obj_t *scr = lv_screen_active();
+        if (scr) lv_obj_invalidate(scr);
+    }
 }
 
 lv_obj_t *chatview_create(lv_obj_t *parent)
@@ -362,6 +388,7 @@ lv_obj_t *chatview_create(lv_obj_t *parent)
     lv_textarea_set_placeholder_text(s_textarea, "Message...");
     lv_obj_set_style_bg_color(s_textarea, lv_color_hex(TH_INPUT), 0);
     lv_obj_set_style_text_color(s_textarea, lv_color_hex(TH_TEXT), 0);
+    lv_obj_set_style_text_font(s_textarea, MCUI_FONT_16, 0);
     lv_obj_set_style_border_width(s_textarea, 0, 0);
     lv_obj_set_style_radius(s_textarea, 0, 0);
 
@@ -383,7 +410,7 @@ lv_obj_t *chatview_create(lv_obj_t *parent)
     lv_obj_t *sl = lv_label_create(s_send_btn);
     lv_label_set_text(sl, LV_SYMBOL_OK " Send");
     lv_obj_set_style_text_color(sl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(sl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(sl, MCUI_FONT_16, 0);
     lv_obj_center(sl);
 
     update_chat_frame();

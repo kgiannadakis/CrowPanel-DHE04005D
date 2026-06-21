@@ -67,7 +67,7 @@ bool ds3231_begin(void) {
 
   uint8_t sec = 0, status = 0;
   if (!read_regs(REG_SECONDS, &sec, 1)) {
-    ESP_LOGW(TAG, "No DS3231 at 0x%02X — disabled", RTC_ADDR);
+    ESP_LOGW(TAG, "No DS3231 at 0x%02X - disabled", RTC_ADDR);
     i2c_master_bus_rm_device(s_dev);
     s_dev = nullptr;
     return false;

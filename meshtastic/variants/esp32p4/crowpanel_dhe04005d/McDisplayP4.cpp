@@ -15,7 +15,7 @@ void display_init()
     LOG_INFO("mcui: display_init (P4 backend)");
 
     if (!crowpanel_p4::display_init()) {
-        LOG_ERROR("mcui: P4 display init failed — UI will be invisible");
+        LOG_ERROR("mcui: P4 display init failed - UI will be invisible");
         return;
     }
 

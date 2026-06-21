@@ -76,7 +76,7 @@ lv_obj_t *tabbar_create(lv_obj_t *parent)
         s_icon[i] = lv_label_create(s_btn[i]);
         lv_label_set_text(s_icon[i], tabs[i].icon);
         lv_obj_set_style_text_color(s_icon[i], lv_color_hex(TH_TAB_INACTIVE), 0);
-        lv_obj_set_style_text_font(s_icon[i], &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(s_icon[i], MCUI_FONT_16, 0);
         lv_obj_align(s_icon[i], LV_ALIGN_CENTER, 0, -8);
 
         s_label[i] = lv_label_create(s_btn[i]);

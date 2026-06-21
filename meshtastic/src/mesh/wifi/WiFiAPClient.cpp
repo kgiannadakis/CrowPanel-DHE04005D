@@ -13,6 +13,9 @@
 #if defined(ARCH_ESP32P4) && defined(CROWPANEL_DHE04005D)
 #include "board_config.h"
 #endif
+#if defined(ARCH_ESP32P4) && defined(CROWPANEL_DHE04005D)
+extern "C" void crowpanelHostedRegisterFailureHandler(void);
+#endif
 
 #if HAS_ETHERNET && defined(USE_WS5500)
 #include <ETHClass2.h>
@@ -84,7 +87,7 @@ static constexpr bool kCrowpanelMinimalWifiServices = false;
 static bool s_ntpClientStarted = false;
 #if defined(ARCH_ESP32P4) && defined(CROWPANEL_DHE04005D)
 static uint32_t s_crowpanelWifiConnectedAtMs = 0;
-static constexpr uint32_t kCrowpanelNtpStartDelayMs = 45000;
+static constexpr uint32_t kCrowpanelNtpStartDelayMs = 8000;
 #endif
 #endif
 
@@ -107,7 +110,7 @@ struct IanaToPosix {
     const char *posix;
 };
 
-// Common IANA → POSIX mappings (from nayarsystems/posix_tz_db)
+// Common IANA -> POSIX mappings (from nayarsystems/posix_tz_db)
 static const IanaToPosix tzLookup[] = {
     // Europe
     {"Europe/London", "GMT0BST,M3.5.0/1,M10.5.0"},
@@ -195,7 +198,7 @@ static void posixFromUtcOffset(const char *offset, char *out, size_t outLen)
     if (colon)
         minutes = atoi(colon + 1);
 
-    // POSIX TZ sign is inverted: UTC+2 → "UTC-2"
+    // POSIX TZ sign is inverted: UTC+2 -> "UTC-2"
     int posixSign = -sign;
     if (minutes > 0)
         snprintf(out, outLen, "UTC%c%d:%02d", posixSign > 0 ? '+' : '-', hours, minutes);
@@ -271,7 +274,7 @@ static bool parseTimezoneFromJson(const String &payload, char *out, size_t outLe
             int hours = offsetSec / 3600;
             int mins = abs((offsetSec % 3600) / 60);
             char posixBuf[16];
-            // POSIX sign is inverted: UTC+2 (offset=7200) → "UTC-2"
+            // POSIX sign is inverted: UTC+2 (offset=7200) -> "UTC-2"
             if (mins > 0)
                 snprintf(posixBuf, sizeof(posixBuf), "UTC%+d:%02d", -hours, mins);
             else
@@ -360,7 +363,7 @@ static bool autoDetectTimezone()
         return true;
 
     // Skip if user already has a real timezone configured (set via phone/menu)
-    // "GMT0" and "UTC0" are boot fallbacks, not deliberate user choices — still auto-detect
+    // "GMT0" and "UTC0" are boot fallbacks, not deliberate user choices - still auto-detect
     bool isDefault = (config.device.tzdef[0] == 0) ||
                      (strcmp(config.device.tzdef, "GMT0") == 0) ||
                      (strcmp(config.device.tzdef, "UTC0") == 0);
@@ -575,7 +578,7 @@ static int32_t reconnectWiFi()
     //  - Default Meshtastic behaviour is to re-sync every 12 hours while
     //    WiFi is connected.
     //  - With mcui's on-board RTC (DS3231 on the DHE04005D, battery-backed
-    //    and TCXO-stabilised) we only need to sync ONCE — the chip holds
+    //    and TCXO-stabilised) we only need to sync ONCE - the chip holds
     //    the time across reboots, so subsequent boots restore time from
     //    the chip without touching the internet. Once the chip has been
     //    written (mcclock_save fired below on the first successful sync)
@@ -684,8 +687,9 @@ bool initWifi()
             snprintf(ourHost, sizeof(ourHost), "Meshtastic-%02x%02x", dmac[4], dmac[5]);
 
 #if defined(ARCH_ESP32P4) && defined(CROWPANEL_DHE04005D)
-            // IMPORTANT: pins are already configured during initVariant() prewarm.
-            // Calling WiFi.setPins() again after ESP-Hosted is initialized logs an
+            // IMPORTANT: ESP-Hosted was already brought up (and pins set) during
+            // initVariant()'s prewarm, on the clean pre-framebuffer PSRAM heap.
+            // Re-initializing it here (or calling WiFi.setPins() again) logs an
             // error and can destabilize hosted state on this target.
 #endif
             if (WiFi.getMode() == WIFI_MODE_NULL) {
@@ -697,6 +701,9 @@ bool initWifi()
 #endif
                 WiFi.mode(WIFI_STA);
             }
+#if defined(ARCH_ESP32P4) && defined(CROWPANEL_DHE04005D)
+            crowpanelHostedRegisterFailureHandler();
+#endif
             WiFi.setHostname(ourHost);
 
             if (config.network.address_mode == meshtastic_Config_NetworkConfig_AddressMode_STATIC &&

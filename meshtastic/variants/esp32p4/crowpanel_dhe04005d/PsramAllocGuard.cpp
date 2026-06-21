@@ -5,6 +5,15 @@
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 
+#include <atomic>
+
+namespace {
+
+std::atomic<bool> s_armed{false};
+std::atomic<uint32_t> s_redirected{0};
+
+}
+
 extern "C" {
 
 void *__real_heap_caps_malloc(size_t size, uint32_t caps);
@@ -15,25 +24,22 @@ void __real_free(void *ptr);
 
 bool png_decode_arena_try_free_ptr(void *ptr);
 
-static volatile bool s_armed = false;
-static volatile uint32_t s_redirected = 0;
-
 void psram_alloc_guard_arm()
 {
-    s_armed = true;
+    s_armed.store(true, std::memory_order_release);
     ESP_LOGI("psram_guard", "armed: SPIRAM-only allocs from app-linked code "
                             "fall back to internal RAM (lwip TCP buffers "
-                            "are NOT covered — see header)");
+                            "are NOT covered - see header)");
 }
 
 uint32_t psram_alloc_guard_redirect_count()
 {
-    return s_redirected;
+    return s_redirected.load(std::memory_order_relaxed);
 }
 
 static inline bool should_redirect(uint32_t caps)
 {
-    if (!s_armed) return false;
+    if (!s_armed.load(std::memory_order_acquire)) return false;
     if (!(caps & MALLOC_CAP_SPIRAM)) return false;
     if (caps & MALLOC_CAP_INTERNAL) return false;
     return true;
@@ -50,10 +56,15 @@ static inline uint32_t redirected_caps(uint32_t caps)
     return out;
 }
 
+static inline void note_redirected_alloc()
+{
+    s_redirected.fetch_add(1, std::memory_order_relaxed);
+}
+
 void *__wrap_heap_caps_malloc(size_t size, uint32_t caps)
 {
     if (should_redirect(caps)) {
-        s_redirected++;
+        note_redirected_alloc();
         return __real_heap_caps_malloc(size, redirected_caps(caps));
     }
     return __real_heap_caps_malloc(size, caps);
@@ -62,7 +73,7 @@ void *__wrap_heap_caps_malloc(size_t size, uint32_t caps)
 void *__wrap_heap_caps_calloc(size_t n, size_t size, uint32_t caps)
 {
     if (should_redirect(caps)) {
-        s_redirected++;
+        note_redirected_alloc();
         return __real_heap_caps_calloc(n, size, redirected_caps(caps));
     }
     return __real_heap_caps_calloc(n, size, caps);
@@ -71,7 +82,7 @@ void *__wrap_heap_caps_calloc(size_t n, size_t size, uint32_t caps)
 void *__wrap_heap_caps_realloc(void *ptr, size_t size, uint32_t caps)
 {
     if (should_redirect(caps)) {
-        s_redirected++;
+        note_redirected_alloc();
         return __real_heap_caps_realloc(ptr, size, redirected_caps(caps));
     }
     return __real_heap_caps_realloc(ptr, size, caps);
@@ -80,7 +91,7 @@ void *__wrap_heap_caps_realloc(void *ptr, size_t size, uint32_t caps)
 void *__wrap_heap_caps_aligned_alloc(size_t alignment, size_t size, uint32_t caps)
 {
     if (should_redirect(caps)) {
-        s_redirected++;
+        note_redirected_alloc();
         return __real_heap_caps_aligned_alloc(alignment, size, redirected_caps(caps));
     }
     return __real_heap_caps_aligned_alloc(alignment, size, caps);

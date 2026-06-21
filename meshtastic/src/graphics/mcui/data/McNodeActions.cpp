@@ -9,6 +9,7 @@
 #if !MESHTASTIC_EXCLUDE_TRACEROUTE
 #include "modules/TraceRouteModule.h"
 #endif
+#include "modules/NodeInfoModule.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -21,6 +22,7 @@ enum class NodeActionType : uint8_t {
     Delete,
     SetFavorite,
     TraceRoute,
+    RequestUserInfo,
 };
 
 struct PendingNodeAction {
@@ -120,6 +122,19 @@ class McNodeActionThread : public concurrency::OSThread
             LOG_WARN("mcui: traceroute module excluded");
 #endif
             break;
+        case NodeActionType::RequestUserInfo:
+            if (nodeInfoModule && action.node != 0 && (!nodeDB || action.node != nodeDB->getNodeNum())) {
+                // Send our NodeInfo to the target with want_response set so it replies with its
+                // own User record (long/short name). shorterTimeout marks this as an interactive,
+                // user-initiated request (60s throttle instead of the ~10 min broadcast cadence).
+                const meshtastic_NodeInfoLite *info = nodeDB ? nodeDB->getMeshNode(action.node) : nullptr;
+                uint8_t channel = info ? info->channel : 0;
+                LOG_INFO("mcui: requesting user info from 0x%08x on ch %u", action.node, (unsigned)channel);
+                nodeInfoModule->sendOurNodeInfo(action.node, true /* wantReplies */, channel, true /* shorterTimeout */);
+            } else {
+                LOG_WARN("mcui: nodeinfo request unavailable for 0x%08x", action.node);
+            }
+            break;
         case NodeActionType::None:
             break;
         }
@@ -161,6 +176,12 @@ void node_actions_traceroute(NodeNum node)
 {
     node_actions_init();
     queue_push({NodeActionType::TraceRoute, node, false});
+}
+
+void node_actions_request_user_info(NodeNum node)
+{
+    node_actions_init();
+    queue_push({NodeActionType::RequestUserInfo, node, false});
 }
 
 uint32_t node_actions_change_tick()

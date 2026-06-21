@@ -21,6 +21,7 @@
 #include "mesh/generated/meshtastic/config.pb.h"
 #include "mesh/generated/meshtastic/module_config.pb.h"
 #include "mesh/TypeConversions.h"
+#include "mqtt/MQTT.h"
 #include "modules/PositionModule.h"
 #include "gps/RTC.h"
 
@@ -34,6 +35,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <esp_heap_caps.h>
+#include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
@@ -55,7 +58,7 @@ static lv_obj_t *s_lbl_pending = nullptr;
 static void cfg_show_pending_banner()
 {
     if (s_lbl_pending) {
-        lv_label_set_text(s_lbl_pending, "Changes pending — saving in 5 s...");
+        lv_label_set_text(s_lbl_pending, "Changes pending - saving in 5 s...");
         lv_obj_remove_flag(s_lbl_pending, LV_OBJ_FLAG_HIDDEN);
     }
 }
@@ -90,6 +93,18 @@ static bool cfg_has_pending()
     return s_config_dirty || s_config_save_only_dirty || s_orientation_dirty;
 }
 
+#if defined(CROWPANEL_DHE04005D)
+static void crowpanel_log_heap(const char *where)
+{
+    ESP_LOGW("crowpanel", "mcui heap %s: internal8 free=%u largest=%u dma free=%u largest=%u",
+             where ? where : "?",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
+}
+#endif
+
 class McConfigApplyThread : public concurrency::OSThread
 {
   public:
@@ -123,6 +138,9 @@ class McConfigApplyThread : public concurrency::OSThread
         s_orientation_dirty = false;
         LOG_INFO("mcui: applying pending config (debounce elapsed, cfg_reboot=%d orientation=%d)",
                  reboot_required ? 1 : 0, orientation_change ? 1 : 0);
+#if defined(CROWPANEL_DHE04005D)
+        crowpanel_log_heap("before config apply");
+#endif
         if ((reboot_required || save_only) && nodeDB)
             nodeDB->saveToDisk(SEGMENT_CONFIG);
         if (orientation_change && !orientation_save(target_landscape)) {
@@ -681,7 +699,7 @@ static void tz_apply_to_libc()
     tzset();
     s_tz_offset_now = off;
     s_tz_last_apply_ms = millis();
-    LOG_INFO("mcui: TZ idx=%d (%s) → libc=%s offset=%+d s",
+    LOG_INFO("mcui: TZ idx=%d (%s) -> libc=%s offset=%+d s",
              s_tz_index, TZ_LIST[s_tz_index].label, tz_str, (int)off);
 }
 
@@ -935,13 +953,13 @@ static void orientation_overlay_open()
     lv_obj_t *title = lv_label_create(card);
     lv_label_set_text(title, "Changing orientation");
     lv_obj_set_style_text_color(title, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(title, MCUI_FONT_16, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
 
     s_orientation_overlay_label = lv_label_create(card);
     lv_label_set_text(s_orientation_overlay_label, "Reboot in 3...");
     lv_obj_set_style_text_color(s_orientation_overlay_label, lv_color_hex(TH_TEXT2), 0);
-    lv_obj_set_style_text_font(s_orientation_overlay_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(s_orientation_overlay_label, MCUI_FONT_16, 0);
     lv_obj_align(s_orientation_overlay_label, LV_ALIGN_CENTER, 0, 20);
 
     s_orientation_reboot_at_ms = millis() + 3000;
@@ -954,7 +972,7 @@ static void add_section_header(const char *text)
     lv_obj_t *h = lv_label_create(s_list);
     lv_label_set_text(h, text);
     lv_obj_set_style_text_color(h, lv_color_hex(TH_ACCENT_LIGHT), 0);
-    lv_obj_set_style_text_font(h, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(h, MCUI_FONT_16, 0);
     lv_obj_set_style_pad_top(h, 10, 0);
     lv_obj_set_style_pad_left(h, 6, 0);
 }
@@ -986,13 +1004,13 @@ static lv_obj_t *add_info_row(lv_obj_t *card, const char *label, const char *ini
     lv_obj_t *lbl = lv_label_create(row);
     lv_label_set_text(lbl, label);
     lv_obj_set_style_text_color(lbl, lv_color_hex(TH_TEXT2), 0);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(lbl, MCUI_FONT_16, 0);
     lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 0, 0);
 
     lv_obj_t *val = lv_label_create(row);
     lv_label_set_text(val, initial);
     lv_obj_set_style_text_color(val, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(val, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(val, MCUI_FONT_16, 0);
     lv_obj_align(val, LV_ALIGN_RIGHT_MID, 0, 0);
     return val;
 }
@@ -1009,7 +1027,7 @@ static lv_obj_t *add_switch_row(lv_obj_t *card, const char *label, bool initial,
     lv_obj_t *lbl = lv_label_create(row);
     lv_label_set_text(lbl, label);
     lv_obj_set_style_text_color(lbl, lv_color_hex(TH_TEXT2), 0);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(lbl, MCUI_FONT_16, 0);
     lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 0, 0);
 
     lv_obj_t *sw = lv_switch_create(row);
@@ -1033,7 +1051,7 @@ static lv_obj_t *add_enum_dropdown_row(lv_obj_t *card, const char *label,
     lv_obj_t *lbl = lv_label_create(row);
     lv_label_set_text(lbl, label);
     lv_obj_set_style_text_color(lbl, lv_color_hex(TH_TEXT2), 0);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(lbl, MCUI_FONT_16, 0);
     lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 0, 0);
 
     lv_obj_t *dd = lv_dropdown_create(row);
@@ -1063,7 +1081,7 @@ static lv_obj_t *add_interval_dropdown_row(lv_obj_t *card, const char *label,
     lv_obj_t *lbl = lv_label_create(row);
     lv_label_set_text(lbl, label);
     lv_obj_set_style_text_color(lbl, lv_color_hex(TH_TEXT2), 0);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(lbl, MCUI_FONT_16, 0);
     lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 0, 0);
 
     lv_obj_t *dd = lv_dropdown_create(row);
@@ -1085,7 +1103,7 @@ static void add_card_hint(lv_obj_t *card, const char *text)
     lv_obj_t *h = lv_label_create(card);
     lv_label_set_text(h, text);
     lv_obj_set_style_text_color(h, lv_color_hex(TH_TEXT3), 0);
-    lv_obj_set_style_text_font(h, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(h, MCUI_FONT_16, 0);
     lv_label_set_long_mode(h, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(h, lv_pct(100));
 }
@@ -1168,7 +1186,7 @@ static void text_edit_modal(const char *title, const char *current,
     lv_obj_t *t = lv_label_create(card);
     lv_label_set_text(t, title);
     lv_obj_set_style_text_color(t, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(t, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(t, MCUI_FONT_16, 0);
     lv_obj_align(t, LV_ALIGN_TOP_LEFT, 0, 0);
 
     s_tem_ta = lv_textarea_create(card);
@@ -1179,6 +1197,7 @@ static void text_edit_modal(const char *title, const char *current,
     lv_textarea_set_max_length(s_tem_ta, max_len);
     lv_obj_set_style_bg_color(s_tem_ta, lv_color_hex(TH_INPUT), 0);
     lv_obj_set_style_text_color(s_tem_ta, lv_color_hex(TH_TEXT), 0);
+    lv_obj_set_style_text_font(s_tem_ta, MCUI_FONT_16, 0);
     lv_obj_set_style_border_width(s_tem_ta, 0, 0);
     lv_obj_set_style_radius(s_tem_ta, 0, 0);
     lv_obj_set_style_anim_duration(s_tem_ta, 0, LV_PART_CURSOR);
@@ -1193,7 +1212,7 @@ static void text_edit_modal(const char *title, const char *current,
     lv_obj_t *cl = lv_label_create(cancel);
     lv_label_set_text(cl, "Cancel");
     lv_obj_set_style_text_color(cl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(cl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(cl, MCUI_FONT_16, 0);
     lv_obj_center(cl);
 
     lv_obj_t *ok = lv_button_create(card);
@@ -1205,7 +1224,7 @@ static void text_edit_modal(const char *title, const char *current,
     lv_obj_t *ol = lv_label_create(ok);
     lv_label_set_text(ol, "OK");
     lv_obj_set_style_text_color(ol, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(ol, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(ol, MCUI_FONT_16, 0);
     lv_obj_center(ol);
 
     keyboard_attach(s_tem_ta);
@@ -1266,7 +1285,7 @@ static lv_obj_t *onboarding_label(lv_obj_t *parent, const char *text, int y)
     lv_obj_t *label = lv_label_create(parent);
     lv_label_set_text(label, text);
     lv_obj_set_style_text_color(label, lv_color_hex(TH_TEXT2), 0);
-    lv_obj_set_style_text_font(label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(label, MCUI_FONT_16, 0);
     lv_obj_align(label, LV_ALIGN_TOP_LEFT, 0, y);
     return label;
 }
@@ -1282,6 +1301,7 @@ static lv_obj_t *onboarding_textarea(lv_obj_t *parent, const char *text,
     lv_textarea_set_max_length(ta, max_len);
     lv_obj_set_style_bg_color(ta, lv_color_hex(TH_INPUT), 0);
     lv_obj_set_style_text_color(ta, lv_color_hex(TH_TEXT), 0);
+    lv_obj_set_style_text_font(ta, MCUI_FONT_16, 0);
     lv_obj_set_style_border_width(ta, 0, 0);
     lv_obj_set_style_radius(ta, 0, 0);
     lv_obj_set_style_anim_duration(ta, 0, LV_PART_CURSOR);
@@ -1353,7 +1373,7 @@ void settings_maybe_show_onboarding()
     lv_obj_t *title = lv_label_create(card);
     lv_label_set_text(title, "First setup");
     lv_obj_set_style_text_color(title, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(title, MCUI_FONT_16, 0);
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
 
     lv_obj_t *hint = lv_label_create(card);
@@ -1361,7 +1381,7 @@ void settings_maybe_show_onboarding()
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(hint, lv_pct(100));
     lv_obj_set_style_text_color(hint, lv_color_hex(TH_TEXT3), 0);
-    lv_obj_set_style_text_font(hint, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(hint, MCUI_FONT_16, 0);
     lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 0, 32);
 
     onboarding_label(card, "Long name", 84);
@@ -1393,7 +1413,7 @@ void settings_maybe_show_onboarding()
     lv_label_set_long_mode(s_onboarding_status, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(s_onboarding_status, lv_pct(100));
     lv_obj_set_style_text_color(s_onboarding_status, lv_color_hex(0xE0A030), 0);
-    lv_obj_set_style_text_font(s_onboarding_status, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(s_onboarding_status, MCUI_FONT_16, 0);
     lv_obj_align(s_onboarding_status, LV_ALIGN_TOP_LEFT, 0, 348);
 
     const int onboarding_btn_y = 380;
@@ -1406,7 +1426,7 @@ void settings_maybe_show_onboarding()
     lv_obj_t *ll = lv_label_create(later);
     lv_label_set_text(ll, "Later");
     lv_obj_set_style_text_color(ll, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(ll, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(ll, MCUI_FONT_16, 0);
     lv_obj_center(ll);
 
     lv_obj_t *save = lv_button_create(card);
@@ -1418,7 +1438,7 @@ void settings_maybe_show_onboarding()
     lv_obj_t *sl = lv_label_create(save);
     lv_label_set_text(sl, "Save & reboot");
     lv_obj_set_style_text_color(sl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(sl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(sl, MCUI_FONT_16, 0);
     lv_obj_center(sl);
 
     keyboard_attach(s_onboarding_long);
@@ -1483,7 +1503,7 @@ static void wifi_show_rebooting_overlay()
     lv_obj_t *lbl = lv_label_create(card);
     lv_label_set_text(lbl, "Rebooting...");
     lv_obj_set_style_text_color(lbl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(lbl, MCUI_FONT_16, 0);
     lv_obj_center(lbl);
 }
 
@@ -1548,7 +1568,7 @@ static void wifi_populate_list()
         lv_obj_t *l = lv_label_create(s_wifi_list);
         lv_label_set_text(l, "No networks found.");
         lv_obj_set_style_text_color(l, lv_color_hex(TH_TEXT3), 0);
-        lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(l, MCUI_FONT_16, 0);
         return;
     }
 
@@ -1567,7 +1587,7 @@ static void wifi_populate_list()
                  (int)n.rssi);
         lv_label_set_text(lbl, buf);
         lv_obj_set_style_text_color(lbl, lv_color_hex(TH_TEXT), 0);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(lbl, MCUI_FONT_16, 0);
         lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 0, 0);
 
         lv_obj_add_event_cb(row, wifi_pick_btn_clicked, LV_EVENT_CLICKED,
@@ -1679,13 +1699,13 @@ static void wifi_open_clicked_cb(lv_event_t *)
     lv_obj_t *back_lbl = lv_label_create(back);
     lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Back");
     lv_obj_set_style_text_color(back_lbl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(back_lbl, MCUI_FONT_16, 0);
     lv_obj_center(back_lbl);
 
     lv_obj_t *title = lv_label_create(header);
     lv_label_set_text(title, "WiFi");
     lv_obj_set_style_text_color(title, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(title, MCUI_FONT_16, 0);
     lv_obj_align(title, LV_ALIGN_CENTER, 0, 0);
 
     lv_obj_t *body = lv_obj_create(s_wifi_overlay);
@@ -1713,7 +1733,7 @@ static void wifi_open_clicked_cb(lv_event_t *)
     lv_obj_t *scan_lbl = lv_label_create(scan);
     lv_label_set_text(scan_lbl, LV_SYMBOL_WIFI "  Scan networks");
     lv_obj_set_style_text_color(scan_lbl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(scan_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(scan_lbl, MCUI_FONT_16, 0);
     lv_obj_center(scan_lbl);
 
     lv_obj_t *del = lv_button_create(body);
@@ -1724,13 +1744,13 @@ static void wifi_open_clicked_cb(lv_event_t *)
     lv_obj_t *del_lbl = lv_label_create(del);
     lv_label_set_text(del_lbl, "Delete WiFi credentials");
     lv_obj_set_style_text_color(del_lbl, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(del_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(del_lbl, MCUI_FONT_16, 0);
     lv_obj_center(del_lbl);
 
     s_wifi_status = lv_label_create(body);
     lv_label_set_text(s_wifi_status, "Tap \"Scan networks\" to search.");
     lv_obj_set_style_text_color(s_wifi_status, lv_color_hex(TH_TEXT3), 0);
-    lv_obj_set_style_text_font(s_wifi_status, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(s_wifi_status, MCUI_FONT_16, 0);
     lv_label_set_long_mode(s_wifi_status, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(s_wifi_status, lv_pct(100));
 
@@ -1759,6 +1779,7 @@ static lv_obj_t *s_mqtt_root_ta = nullptr;
 static lv_obj_t *s_mqtt_encrypt_sw = nullptr;
 static lv_obj_t *s_mqtt_json_sw = nullptr;
 static lv_obj_t *s_mqtt_tls_sw = nullptr;
+static lv_obj_t *s_mqtt_contact_discovery_sw = nullptr;
 
 static void mqtt_screen_close()
 {
@@ -1778,6 +1799,7 @@ static void mqtt_screen_close()
     s_mqtt_encrypt_sw = nullptr;
     s_mqtt_json_sw = nullptr;
     s_mqtt_tls_sw = nullptr;
+    s_mqtt_contact_discovery_sw = nullptr;
 }
 
 static void mqtt_screen_back_cb(lv_event_t *) { mqtt_screen_close(); }
@@ -1873,7 +1895,7 @@ static lv_obj_t *mqtt_add_text_field(lv_obj_t *parent, const char *label,
     lv_obj_t *lbl = lv_label_create(row);
     lv_label_set_text(lbl, label);
     lv_obj_set_style_text_color(lbl, lv_color_hex(TH_TEXT2), 0);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(lbl, MCUI_FONT_16, 0);
     lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 0, 0);
 
     lv_obj_t *ta = lv_textarea_create(row);
@@ -1884,6 +1906,7 @@ static lv_obj_t *mqtt_add_text_field(lv_obj_t *parent, const char *label,
     lv_textarea_set_max_length(ta, max_len);
     lv_obj_set_style_bg_color(ta, lv_color_hex(TH_INPUT), 0);
     lv_obj_set_style_text_color(ta, lv_color_hex(TH_TEXT), 0);
+    lv_obj_set_style_text_font(ta, MCUI_FONT_16, 0);
     lv_obj_set_style_border_width(ta, 0, 0);
     lv_obj_set_style_radius(ta, 0, 0);
     lv_obj_set_style_anim_duration(ta, 0, LV_PART_CURSOR);
@@ -1923,11 +1946,15 @@ static void mqtt_make_switch_row_clickable(lv_obj_t *sw)
 
 static void mqtt_screen_save_cb(lv_event_t *)
 {
+    const bool was_mqtt_enabled = moduleConfig.mqtt.enabled;
+
     moduleConfig.has_mqtt = true;
     moduleConfig.mqtt.enabled = s_mqtt_enabled_sw && lv_obj_has_state(s_mqtt_enabled_sw, LV_STATE_CHECKED);
     moduleConfig.mqtt.encryption_enabled = s_mqtt_encrypt_sw && lv_obj_has_state(s_mqtt_encrypt_sw, LV_STATE_CHECKED);
     moduleConfig.mqtt.json_enabled = s_mqtt_json_sw && lv_obj_has_state(s_mqtt_json_sw, LV_STATE_CHECKED);
     moduleConfig.mqtt.tls_enabled = s_mqtt_tls_sw && lv_obj_has_state(s_mqtt_tls_sw, LV_STATE_CHECKED);
+    moduleConfig.mqtt.mqtt_contact_discovery_enabled =
+        s_mqtt_contact_discovery_sw && lv_obj_has_state(s_mqtt_contact_discovery_sw, LV_STATE_CHECKED);
 
     mqtt_copy_text(moduleConfig.mqtt.address, sizeof(moduleConfig.mqtt.address), s_mqtt_addr_ta);
     mqtt_copy_text(moduleConfig.mqtt.username, sizeof(moduleConfig.mqtt.username), s_mqtt_user_ta);
@@ -1966,6 +1993,29 @@ static void mqtt_screen_save_cb(lv_event_t *)
     if (nodeDB) nodeDB->saveToDisk(save_what);
     if (service) service->reloadConfig(save_what);
 
+#if defined(ARCH_ESP32P4) && defined(CROWPANEL_DHE04005D) && !defined(ARCH_PORTDUINO)
+    const bool direct_mqtt_first_enable =
+        moduleConfig.mqtt.enabled && !was_mqtt_enabled && !moduleConfig.mqtt.proxy_to_client_enabled;
+    if (direct_mqtt_first_enable) {
+        LOG_WARN("mcui: MQTT enabled; rebooting so CrowPanel opens MQTT before RGB framebuffer");
+        LOG_INFO("mcui: MQTT settings saved (enabled=%d, primary up=%d, primary down=%d, root=%s)",
+                 moduleConfig.mqtt.enabled ? 1 : 0, pri_up ? 1 : 0, pri_dn ? 1 : 0, moduleConfig.mqtt.root);
+        mqtt_screen_close();
+        delay(300);
+        ESP.restart();
+        return;
+    }
+#endif
+
+    if (moduleConfig.mqtt.enabled) {
+        if (!mqtt) {
+            mqttInit();
+        }
+        if (mqtt) {
+            mqtt->start();
+        }
+    }
+
     LOG_INFO("mcui: MQTT settings saved (enabled=%d, primary up=%d, primary down=%d, root=%s)",
              moduleConfig.mqtt.enabled ? 1 : 0, pri_up ? 1 : 0, pri_dn ? 1 : 0, moduleConfig.mqtt.root);
     mqtt_screen_close();
@@ -1975,8 +2025,15 @@ static void mqtt_open_clicked_cb(lv_event_t *)
 {
     if (s_mqtt_overlay) return;
 
-    // Prefill root topic with saved value, or the standard default.
-    const char *root_initial = (moduleConfig.mqtt.root[0] != '\0') ? moduleConfig.mqtt.root : default_mqtt_root;
+    // Prefill empty MQTT roots with the public regional namespace when the
+    // radio region is known. Saved/custom roots are left untouched.
+    const bool root_is_default =
+        moduleConfig.mqtt.root[0] == '\0' || strcmp(moduleConfig.mqtt.root, default_mqtt_root) == 0;
+    const char *root_initial = moduleConfig.mqtt.root;
+    if (root_is_default) {
+        root_initial =
+            (config.lora.region == meshtastic_Config_LoRaConfig_RegionCode_EU_868) ? "msh/EU_868" : default_mqtt_root;
+    }
 
     meshtastic_Channel ch0 = channels.getByIndex(0);
     bool primary_uplink = ch0.has_settings && ch0.settings.uplink_enabled;
@@ -2011,7 +2068,7 @@ static void mqtt_open_clicked_cb(lv_event_t *)
     lv_obj_t *back_lbl = lv_label_create(back);
     lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Back");
     lv_obj_set_style_text_color(back_lbl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(back_lbl, MCUI_FONT_16, 0);
     lv_obj_center(back_lbl);
 
     lv_obj_t *save = lv_button_create(header);
@@ -2023,13 +2080,13 @@ static void mqtt_open_clicked_cb(lv_event_t *)
     lv_obj_t *save_lbl = lv_label_create(save);
     lv_label_set_text(save_lbl, "Save");
     lv_obj_set_style_text_color(save_lbl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(save_lbl, MCUI_FONT_16, 0);
     lv_obj_center(save_lbl);
 
     lv_obj_t *title = lv_label_create(header);
     lv_label_set_text(title, "MQTT");
     lv_obj_set_style_text_color(title, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(title, MCUI_FONT_16, 0);
     lv_obj_align(title, LV_ALIGN_CENTER, 0, 0);
 
     s_mqtt_body = lv_obj_create(s_mqtt_overlay);
@@ -2064,14 +2121,17 @@ static void mqtt_open_clicked_cb(lv_event_t *)
     s_mqtt_encrypt_sw = add_switch_row(s_mqtt_body, "Encryption enabled", moduleConfig.mqtt.encryption_enabled, nullptr);
     s_mqtt_json_sw = add_switch_row(s_mqtt_body, "JSON output enabled", moduleConfig.mqtt.json_enabled, nullptr);
     s_mqtt_tls_sw = add_switch_row(s_mqtt_body, "TLS enabled", moduleConfig.mqtt.tls_enabled, nullptr);
+    s_mqtt_contact_discovery_sw =
+        add_switch_row(s_mqtt_body, "Discover MQTT contacts", moduleConfig.mqtt.mqtt_contact_discovery_enabled, nullptr);
     mqtt_make_switch_row_clickable(s_mqtt_encrypt_sw);
     mqtt_make_switch_row_clickable(s_mqtt_json_sw);
     mqtt_make_switch_row_clickable(s_mqtt_tls_sw);
+    mqtt_make_switch_row_clickable(s_mqtt_contact_discovery_sw);
 
     lv_obj_t *proxy_note = lv_label_create(s_mqtt_body);
     lv_label_set_text(proxy_note, "Client proxy is disabled on CrowPanel (direct MQTT).");
     lv_obj_set_style_text_color(proxy_note, lv_color_hex(TH_TEXT3), 0);
-    lv_obj_set_style_text_font(proxy_note, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(proxy_note, MCUI_FONT_16, 0);
     lv_label_set_long_mode(proxy_note, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(proxy_note, lv_pct(100));
 
@@ -2086,6 +2146,9 @@ static void region_changed_cb(lv_event_t *e)
     if (sel == config.lora.region) return;
     config.lora.region = sel;
     cfg_mark_dirty();
+#if defined(CROWPANEL_DHE04005D)
+    crowpanel_log_heap("region changed");
+#endif
 }
 static void preset_changed_cb(lv_event_t *e)
 {
@@ -2096,6 +2159,9 @@ static void preset_changed_cb(lv_event_t *e)
     config.lora.use_preset   = true;
     config.lora.modem_preset = sel;
     cfg_mark_dirty();
+#if defined(CROWPANEL_DHE04005D)
+    crowpanel_log_heap("preset changed");
+#endif
 }
 static void hop_limit_changed_cb(lv_event_t *e)
 {
@@ -2197,7 +2263,7 @@ static void timezone_changed_cb(lv_event_t *e)
     time_t now = time(nullptr);
     struct tm lt;
     localtime_r(&now, &lt);
-    LOG_INFO("mcui: timezone picked → %s | local=%02d:%02d:%02d",
+    LOG_INFO("mcui: timezone picked -> %s | local=%02d:%02d:%02d",
              TZ_LIST[idx].label, lt.tm_hour, lt.tm_min, lt.tm_sec);
 }
 
@@ -2428,10 +2494,10 @@ static void position_save_clicked_cb(lv_event_t *)
     s_pos_alt_pending[0] = '\0';
     char msg[80];
     if (have_alt)
-        snprintf(msg, sizeof(msg), "Saved: %.6f, %.6f @ %d m — broadcasting",
+        snprintf(msg, sizeof(msg), "Saved: %.6f, %.6f @ %d m - broadcasting",
                  lat, lon, (int)alt_m);
     else
-        snprintf(msg, sizeof(msg), "Saved: %.6f, %.6f — broadcasting",
+        snprintf(msg, sizeof(msg), "Saved: %.6f, %.6f - broadcasting",
                  lat, lon);
     position_status(msg, true);
     refresh_position_labels();
@@ -2497,7 +2563,7 @@ static void clear_nodes_clicked_cb(lv_event_t *)
     lv_obj_t *title = lv_label_create(card);
     lv_label_set_text(title, "Delete all nodes?");
     lv_obj_set_style_text_color(title, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(title, MCUI_FONT_16, 0);
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
 
     lv_obj_t *body = lv_label_create(card);
@@ -2505,7 +2571,7 @@ static void clear_nodes_clicked_cb(lv_event_t *)
     lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(body, lv_pct(100));
     lv_obj_set_style_text_color(body, lv_color_hex(TH_TEXT2), 0);
-    lv_obj_set_style_text_font(body, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(body, MCUI_FONT_16, 0);
     lv_obj_align(body, LV_ALIGN_TOP_LEFT, 0, 34);
 
     lv_obj_t *cancel = lv_button_create(card);
@@ -2516,7 +2582,7 @@ static void clear_nodes_clicked_cb(lv_event_t *)
     lv_obj_t *cl = lv_label_create(cancel);
     lv_label_set_text(cl, "Cancel");
     lv_obj_set_style_text_color(cl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(cl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(cl, MCUI_FONT_16, 0);
     lv_obj_center(cl);
 
     lv_obj_t *erase = lv_button_create(card);
@@ -2527,7 +2593,7 @@ static void clear_nodes_clicked_cb(lv_event_t *)
     lv_obj_t *el = lv_label_create(erase);
     lv_label_set_text(el, "Delete all");
     lv_obj_set_style_text_color(el, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(el, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(el, MCUI_FONT_16, 0);
     lv_obj_center(el);
 
     lv_obj_add_event_cb(cancel, clear_nodes_confirm_cb, LV_EVENT_CLICKED, erase);
@@ -2574,7 +2640,7 @@ static void regenerate_keys_clicked_cb(lv_event_t *)
     lv_obj_t *title = lv_label_create(card);
     lv_label_set_text(title, "Regenerate private keys?");
     lv_obj_set_style_text_color(title, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(title, MCUI_FONT_16, 0);
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
 
     lv_obj_t *body = lv_label_create(card);
@@ -2584,7 +2650,7 @@ static void regenerate_keys_clicked_cb(lv_event_t *)
     lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(body, lv_pct(100));
     lv_obj_set_style_text_color(body, lv_color_hex(TH_TEXT2), 0);
-    lv_obj_set_style_text_font(body, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(body, MCUI_FONT_16, 0);
     lv_obj_align(body, LV_ALIGN_TOP_LEFT, 0, 34);
 
     lv_obj_t *cancel = lv_button_create(card);
@@ -2595,7 +2661,7 @@ static void regenerate_keys_clicked_cb(lv_event_t *)
     lv_obj_t *cl = lv_label_create(cancel);
     lv_label_set_text(cl, "Cancel");
     lv_obj_set_style_text_color(cl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(cl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(cl, MCUI_FONT_16, 0);
     lv_obj_center(cl);
 
     lv_obj_t *regen = lv_button_create(card);
@@ -2606,7 +2672,7 @@ static void regenerate_keys_clicked_cb(lv_event_t *)
     lv_obj_t *rl = lv_label_create(regen);
     lv_label_set_text(rl, "Regenerate");
     lv_obj_set_style_text_color(rl, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(rl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(rl, MCUI_FONT_16, 0);
     lv_obj_center(rl);
 
     lv_obj_add_event_cb(cancel, regenerate_keys_confirm_cb, LV_EVENT_CLICKED, regen);
@@ -2620,7 +2686,7 @@ static void factory_reset_confirm_cb(lv_event_t *e)
 
     bool do_erase = (btn == (lv_obj_t *)lv_event_get_user_data(e));
     if (do_erase) {
-        LOG_WARN("mcui: factory reset queued — will run on main loop");
+        LOG_WARN("mcui: factory reset queued - will run on main loop");
         ensure_cfg_thread();
         s_factory_reset_req = true;
     }
@@ -2653,7 +2719,7 @@ static void factory_reset_clicked_cb(lv_event_t *)
     lv_obj_t *title = lv_label_create(card);
     lv_label_set_text(title, "Factory reset?");
     lv_obj_set_style_text_color(title, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(title, MCUI_FONT_16, 0);
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
 
     lv_obj_t *body = lv_label_create(card);
@@ -2663,7 +2729,7 @@ static void factory_reset_clicked_cb(lv_event_t *)
     lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(body, lv_pct(100));
     lv_obj_set_style_text_color(body, lv_color_hex(TH_TEXT2), 0);
-    lv_obj_set_style_text_font(body, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(body, MCUI_FONT_16, 0);
     lv_obj_align(body, LV_ALIGN_TOP_LEFT, 0, 32);
 
     lv_obj_t *cancel = lv_button_create(card);
@@ -2674,7 +2740,7 @@ static void factory_reset_clicked_cb(lv_event_t *)
     lv_obj_t *cl = lv_label_create(cancel);
     lv_label_set_text(cl, "Cancel");
     lv_obj_set_style_text_color(cl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(cl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(cl, MCUI_FONT_16, 0);
     lv_obj_center(cl);
 
     lv_obj_t *erase = lv_button_create(card);
@@ -2685,7 +2751,7 @@ static void factory_reset_clicked_cb(lv_event_t *)
     lv_obj_t *el = lv_label_create(erase);
     lv_label_set_text(el, "Erase");
     lv_obj_set_style_text_color(el, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(el, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(el, MCUI_FONT_16, 0);
     lv_obj_center(el);
 
     lv_obj_add_event_cb(cancel, factory_reset_confirm_cb, LV_EVENT_CLICKED, erase);
@@ -2732,7 +2798,7 @@ static void refresh_values()
             if (pct > 100) snprintf(buf, sizeof(buf), "ext");
             else           snprintf(buf, sizeof(buf), "%u%%", (unsigned)pct);
         } else {
-            snprintf(buf, sizeof(buf), "—");
+            snprintf(buf, sizeof(buf), "-");
         }
         lv_label_set_text(s_lbl_battery, buf);
     }
@@ -2744,7 +2810,7 @@ static void refresh_values()
 
             snprintf(buf, sizeof(buf), "%d dBm", (int)lroundf(nf));
         } else {
-            snprintf(buf, sizeof(buf), "—");
+            snprintf(buf, sizeof(buf), "-");
         }
         lv_label_set_text(s_lbl_noise, buf);
     }
@@ -2790,7 +2856,7 @@ static void refresh_values()
             uint32_t remaining =
                 (elapsed >= APPLY_DEBOUNCE_MS) ? 0 : (APPLY_DEBOUNCE_MS - elapsed);
             snprintf(buf, sizeof(buf),
-                     "Changes pending — saving in %u s...",
+                     "Changes pending - saving in %u s...",
                      (unsigned)((remaining + 999) / 1000));
             lv_label_set_text(s_lbl_pending, buf);
             lv_obj_remove_flag(s_lbl_pending, LV_OBJ_FLAG_HIDDEN);
@@ -2821,13 +2887,13 @@ static void rebuild_settings()
         lv_obj_t *l1 = lv_label_create(row_long);
         lv_label_set_text(l1, "Long name");
         lv_obj_set_style_text_color(l1, lv_color_hex(TH_TEXT2), 0);
-        lv_obj_set_style_text_font(l1, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(l1, MCUI_FONT_16, 0);
         lv_obj_align(l1, LV_ALIGN_LEFT_MID, 0, 0);
 
         s_lbl_owner_long = lv_label_create(row_long);
         lv_label_set_text(s_lbl_owner_long, owner.long_name[0] ? owner.long_name : "(tap to set)");
         lv_obj_set_style_text_color(s_lbl_owner_long, lv_color_hex(TH_TEXT), 0);
-        lv_obj_set_style_text_font(s_lbl_owner_long, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(s_lbl_owner_long, MCUI_FONT_16, 0);
         lv_obj_align(s_lbl_owner_long, LV_ALIGN_RIGHT_MID, -4, 0);
     }
     {
@@ -2845,13 +2911,13 @@ static void rebuild_settings()
         lv_obj_t *l2 = lv_label_create(row_short);
         lv_label_set_text(l2, "Short name");
         lv_obj_set_style_text_color(l2, lv_color_hex(TH_TEXT2), 0);
-        lv_obj_set_style_text_font(l2, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(l2, MCUI_FONT_16, 0);
         lv_obj_align(l2, LV_ALIGN_LEFT_MID, 0, 0);
 
         s_lbl_owner_short = lv_label_create(row_short);
         lv_label_set_text(s_lbl_owner_short, owner.short_name[0] ? owner.short_name : "(tap to set)");
         lv_obj_set_style_text_color(s_lbl_owner_short, lv_color_hex(TH_TEXT), 0);
-        lv_obj_set_style_text_font(s_lbl_owner_short, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(s_lbl_owner_short, MCUI_FONT_16, 0);
         lv_obj_align(s_lbl_owner_short, LV_ALIGN_RIGHT_MID, -4, 0);
     }
     add_card_hint(owner_card, "Tap a row to edit. Saves and broadcasts immediately.");
@@ -2859,7 +2925,7 @@ static void rebuild_settings()
     s_lbl_pending = lv_label_create(s_list);
     lv_label_set_text(s_lbl_pending, "");
     lv_obj_set_style_text_color(s_lbl_pending, lv_color_hex(0xE0A030), 0);
-    lv_obj_set_style_text_font(s_lbl_pending, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(s_lbl_pending, MCUI_FONT_16, 0);
     lv_obj_set_style_pad_top(s_lbl_pending, 6, 0);
     lv_obj_set_style_pad_left(s_lbl_pending, 6, 0);
     lv_obj_add_flag(s_lbl_pending, LV_OBJ_FLAG_HIDDEN);
@@ -2924,7 +2990,7 @@ static void rebuild_settings()
         lv_obj_t *lbl = lv_label_create(row);
         lv_label_set_text(lbl, "Timezone");
         lv_obj_set_style_text_color(lbl, lv_color_hex(TH_TEXT2), 0);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(lbl, MCUI_FONT_16, 0);
         lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 0, 0);
 
         lv_obj_t *dd = lv_dropdown_create(row);
@@ -2953,7 +3019,7 @@ static void rebuild_settings()
                       landscape_active() ? "Switch to portrait mode"
                                          : "Switch to landscape mode");
     lv_obj_set_style_text_color(s_btn_orientation_label, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(s_btn_orientation_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(s_btn_orientation_label, MCUI_FONT_16, 0);
     lv_obj_center(s_btn_orientation_label);
     add_card_hint(display, "Orientation changes after save and reboot.");
 
@@ -2970,7 +3036,7 @@ static void rebuild_settings()
         lv_obj_t *bl = lv_label_create(btn);
         lv_label_set_text(bl, LV_SYMBOL_WIFI "  WiFi");
         lv_obj_set_style_text_color(bl, lv_color_hex(TH_TEXT), 0);
-        lv_obj_set_style_text_font(bl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(bl, MCUI_FONT_16, 0);
         lv_obj_center(bl);
     }
     {
@@ -2982,7 +3048,7 @@ static void rebuild_settings()
         lv_obj_t *bl = lv_label_create(btn);
         lv_label_set_text(bl, "MQTT");
         lv_obj_set_style_text_color(bl, lv_color_hex(TH_TEXT), 0);
-        lv_obj_set_style_text_font(bl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(bl, MCUI_FONT_16, 0);
         lv_obj_center(bl);
     }
     add_card_hint(net, "Open WiFi to enable, delete credentials, or scan and connect.");
@@ -3019,13 +3085,13 @@ static void rebuild_settings()
             lv_obj_t *l = lv_label_create(row);
             lv_label_set_text(l, label);
             lv_obj_set_style_text_color(l, lv_color_hex(TH_TEXT2), 0);
-            lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_font(l, MCUI_FONT_16, 0);
             lv_obj_align(l, LV_ALIGN_LEFT_MID, 0, 0);
 
             *out_value_lbl = lv_label_create(row);
             lv_label_set_text(*out_value_lbl, "(tap to set)");
             lv_obj_set_style_text_color(*out_value_lbl, lv_color_hex(TH_TEXT), 0);
-            lv_obj_set_style_text_font(*out_value_lbl, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_font(*out_value_lbl, MCUI_FONT_16, 0);
             lv_obj_align(*out_value_lbl, LV_ALIGN_RIGHT_MID, -4, 0);
         };
         make_pos_row("Latitude",  &s_lbl_pos_lat, position_lat_tap_cb);
@@ -3035,7 +3101,7 @@ static void rebuild_settings()
         s_lbl_pos_status = lv_label_create(pos_card);
         lv_label_set_text(s_lbl_pos_status, "");
         lv_obj_set_style_text_color(s_lbl_pos_status, lv_color_hex(TH_TEXT3), 0);
-        lv_obj_set_style_text_font(s_lbl_pos_status, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(s_lbl_pos_status, MCUI_FONT_16, 0);
         lv_label_set_long_mode(s_lbl_pos_status, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(s_lbl_pos_status, lv_pct(100));
         lv_obj_add_flag(s_lbl_pos_status, LV_OBJ_FLAG_HIDDEN);
@@ -3048,7 +3114,7 @@ static void rebuild_settings()
         lv_obj_t *bs = lv_label_create(btn_save);
         lv_label_set_text(bs, LV_SYMBOL_OK "  Save & broadcast");
         lv_obj_set_style_text_color(bs, lv_color_hex(TH_TEXT), 0);
-        lv_obj_set_style_text_font(bs, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(bs, MCUI_FONT_16, 0);
         lv_obj_center(bs);
 
         lv_obj_t *btn_clear = lv_button_create(pos_card);
@@ -3059,11 +3125,11 @@ static void rebuild_settings()
         lv_obj_t *bc = lv_label_create(btn_clear);
         lv_label_set_text(bc, LV_SYMBOL_TRASH "  Clear position");
         lv_obj_set_style_text_color(bc, lv_color_hex(TH_TEXT), 0);
-        lv_obj_set_style_text_font(bc, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(bc, MCUI_FONT_16, 0);
         lv_obj_center(bc);
     }
     add_card_hint(pos_card,
-                  "Type coordinates from any GPS app (Google Maps: long-press → "
+                  "Type coordinates from any GPS app (Google Maps: long-press -> "
                   "tap the dropped pin to copy lat,lon). Save sets a fixed "
                   "position and broadcasts it immediately. Turn off "
                   "\"Advertise position\" to keep the fix local without "
@@ -3082,7 +3148,7 @@ static void rebuild_settings()
         lv_obj_t *bl = lv_label_create(btn);
         lv_label_set_text(bl, label);
         lv_obj_set_style_text_color(bl, lv_color_hex(TH_TEXT), 0);
-        lv_obj_set_style_text_font(bl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(bl, MCUI_FONT_16, 0);
         lv_obj_center(bl);
         return btn;
     };

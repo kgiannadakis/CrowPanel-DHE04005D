@@ -202,9 +202,11 @@ static void applyLoRaRegion(meshtastic_Config_LoRaConfig_RegionCode region)
 
     initRegion();
 
+#if !defined(CROWPANEL_DHE04005D)
     if (myRegion && myRegion->dutyCycle < 100) {
         config.lora.ignore_mqtt = true;
     }
+#endif
 
     if (strncmp(moduleConfig.mqtt.root, default_mqtt_root, strlen(default_mqtt_root)) == 0) {
         sprintf(moduleConfig.mqtt.root, "%s/%s", default_mqtt_root, myRegion->name);

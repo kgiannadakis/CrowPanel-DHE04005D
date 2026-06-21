@@ -46,9 +46,20 @@ static constexpr uint32_t NODE_FULL_REBUILD_MS = 60000;
 static NodeEntry s_entries[MAX_NODE_CARDS];
 static int s_num_entries = 0;
 
+static bool is_mqtt_only_contact(const meshtastic_NodeInfoLite *n)
+{
+#if defined(CROWPANEL_DHE04005D)
+    return n && n->via_mqtt && n->snr == 0.0f && !moduleConfig.mqtt.mqtt_contact_discovery_enabled;
+#else
+    (void)n;
+    return false;
+#endif
+}
+
 enum class NodeMenuAction : uint8_t {
     ToggleFavorite,
     TraceRoute,
+    RequestUserInfo,
     DeleteNode,
     Close,
 };
@@ -86,10 +97,10 @@ static const char *hw_model_name(meshtastic_HardwareModel m)
 
 static void fmt_last_heard(uint32_t last_heard, char *out, size_t out_sz)
 {
-    if (!last_heard) { snprintf(out, out_sz, "—"); return; }
+    if (!last_heard) { snprintf(out, out_sz, "-"); return; }
     time_t now = time(nullptr);
     if (now < 1700000000 || (uint32_t)now < last_heard) {
-        snprintf(out, out_sz, "—");
+        snprintf(out, out_sz, "-");
         return;
     }
     uint32_t d = (uint32_t)now - last_heard;
@@ -228,14 +239,14 @@ static void traceroute_popup_open(NodeNum node, const char *title)
     lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT);
     lv_obj_set_width(tl, lv_pct(100));
     lv_obj_set_style_text_color(tl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(tl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(tl, MCUI_FONT_16, 0);
 
     s_trace_status_label = lv_label_create(card);
     lv_label_set_long_mode(s_trace_status_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(s_trace_status_label, lv_pct(100));
     lv_obj_set_flex_grow(s_trace_status_label, 1);
     lv_obj_set_style_text_color(s_trace_status_label, lv_color_hex(TH_TEXT2), 0);
-    lv_obj_set_style_text_font(s_trace_status_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(s_trace_status_label, MCUI_FONT_16, 0);
 
     lv_obj_t *close = lv_button_create(card);
     lv_obj_set_size(close, lv_pct(100), 46);
@@ -246,7 +257,7 @@ static void traceroute_popup_open(NodeNum node, const char *title)
     lv_obj_t *l = lv_label_create(close);
     lv_label_set_text(l, "Close");
     lv_obj_set_style_text_color(l, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(l, MCUI_FONT_16, 0);
     lv_obj_center(l);
 
     node_actions_traceroute(node);
@@ -269,6 +280,9 @@ static void node_menu_action_cb(lv_event_t *e)
     case NodeMenuAction::TraceRoute:
         traceroute_popup_open(ent->node_num, ent->title);
         return;
+    case NodeMenuAction::RequestUserInfo:
+        node_actions_request_user_info(ent->node_num);
+        break;
     case NodeMenuAction::DeleteNode:
         node_actions_delete(ent->node_num);
         break;
@@ -290,7 +304,7 @@ static lv_obj_t *add_menu_button(lv_obj_t *parent, const char *label, uint32_t c
     lv_obj_t *l = lv_label_create(btn);
     lv_label_set_text(l, label);
     lv_obj_set_style_text_color(l, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(l, MCUI_FONT_16, 0);
     lv_obj_center(l);
     return btn;
 }
@@ -320,7 +334,7 @@ static void node_card_long_pressed(lv_event_t *e)
 
     lv_obj_t *card = lv_obj_create(s_node_menu_overlay);
     lv_obj_remove_style_all(card);
-    lv_obj_set_size(card, SCR_W - 48, 350);
+    lv_obj_set_size(card, SCR_W - 48, 404);
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, lv_color_hex(TH_SURFACE), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
@@ -337,11 +351,12 @@ static void node_card_long_pressed(lv_event_t *e)
     lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT);
     lv_obj_set_width(tl, lv_pct(100));
     lv_obj_set_style_text_color(tl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(tl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(tl, MCUI_FONT_16, 0);
 
     bool fav = nodeDB && nodeDB->isFavorite(ent->node_num);
     add_menu_button(card, fav ? "Remove from favourite" : "Make favourite", TH_BUBBLE_OUT, ent, NodeMenuAction::ToggleFavorite);
     add_menu_button(card, "Traceroute", TH_ACCENT, ent, NodeMenuAction::TraceRoute);
+    add_menu_button(card, "Request user info", TH_BUBBLE_OUT, ent, NodeMenuAction::RequestUserInfo);
     add_menu_button(card, "Delete node", 0xB83232, ent, NodeMenuAction::DeleteNode);
     add_menu_button(card, "Cancel", TH_INPUT, ent, NodeMenuAction::Close);
 }
@@ -352,9 +367,9 @@ static void fmt_node_metrics(const meshtastic_NodeInfoLite *n, char *out, size_t
     char lh[12];
     fmt_last_heard(n->last_heard, lh, sizeof(lh));
     if (rssi != 0) {
-        snprintf(out, out_sz, "SNR %.1f  RSSI %d  ·  %s", n->snr, (int)rssi, lh);
+        snprintf(out, out_sz, "SNR %.1f  RSSI %d  -  %s", n->snr, (int)rssi, lh);
     } else {
-        snprintf(out, out_sz, "SNR %.1f  ·  %s", n->snr, lh);
+        snprintf(out, out_sz, "SNR %.1f  -  %s", n->snr, lh);
     }
 }
 
@@ -392,13 +407,13 @@ static void add_node_card(NodeEntry *ent, const meshtastic_NodeInfoLite *n)
     lv_obj_t *dl = lv_label_create(dot);
     lv_label_set_text(dl, short_name);
     lv_obj_set_style_text_color(dl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(dl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(dl, MCUI_FONT_16, 0);
     lv_obj_center(dl);
 
     lv_obj_t *tl = lv_label_create(card);
     lv_label_set_text(tl, ent->title);
     lv_obj_set_style_text_color(tl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(tl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(tl, MCUI_FONT_16, 0);
     lv_obj_set_pos(tl, 56, 2);
     lv_obj_set_width(tl, SCR_W - 56 - 20);
     lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT);
@@ -409,7 +424,7 @@ static void add_node_card(NodeEntry *ent, const meshtastic_NodeInfoLite *n)
     lv_obj_t *l2 = lv_label_create(card);
     lv_label_set_text(l2, line2);
     lv_obj_set_style_text_color(l2, lv_color_hex(TH_TEXT2), 0);
-    lv_obj_set_style_text_font(l2, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(l2, MCUI_FONT_16, 0);
     lv_obj_set_pos(l2, 56, 22);
     lv_obj_set_width(l2, SCR_W - 56 - 20);
     lv_label_set_long_mode(l2, LV_LABEL_LONG_DOT);
@@ -422,7 +437,7 @@ static void add_node_card(NodeEntry *ent, const meshtastic_NodeInfoLite *n)
     strncpy(ent->line3_text, line3, sizeof(ent->line3_text) - 1);
     ent->line3_text[sizeof(ent->line3_text) - 1] = '\0';
     lv_obj_set_style_text_color(l3, lv_color_hex(TH_TEXT3), 0);
-    lv_obj_set_style_text_font(l3, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(l3, MCUI_FONT_16, 0);
     lv_obj_set_pos(l3, 56, 44);
     lv_obj_set_width(l3, SCR_W - 56 - 20);
     lv_label_set_long_mode(l3, LV_LABEL_LONG_DOT);
@@ -455,7 +470,7 @@ static void add_section_header(const char *text)
     lv_obj_t *h = lv_label_create(s_nodes_list);
     lv_label_set_text(h, text);
     lv_obj_set_style_text_color(h, lv_color_hex(TH_TEXT3), 0);
-    lv_obj_set_style_text_font(h, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(h, MCUI_FONT_16, 0);
     lv_obj_set_style_pad_top(h, 8, 0);
     lv_obj_set_style_pad_left(h, 12, 0);
 }
@@ -474,6 +489,7 @@ static void rebuild_nodes_list()
             meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(i);
             if (!node) continue;
             if (node->num == ours) continue;
+            if (is_mqtt_only_contact(node)) continue;
             if (node->is_favorite != want_favorite) continue;
             count++;
         }
@@ -487,6 +503,7 @@ static void rebuild_nodes_list()
             meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(i);
             if (!node) continue;
             if (node->num == ours) continue;
+            if (is_mqtt_only_contact(node)) continue;
             if (node->is_favorite != want_favorite) continue;
 
             NodeEntry *ent = &s_entries[s_num_entries++];

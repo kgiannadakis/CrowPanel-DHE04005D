@@ -188,9 +188,11 @@ void menuHandler::LoraRegionPicker(uint32_t duration)
 #endif
             config.lora.tx_enabled = true;
             initRegion();
+#if !defined(CROWPANEL_DHE04005D)
             if (myRegion->dutyCycle < 100) {
                 config.lora.ignore_mqtt = true; // Ignore MQTT by default if region has a duty cycle limit
             }
+#endif
 
             if (strncmp(moduleConfig.mqtt.root, default_mqtt_root, strlen(default_mqtt_root)) == 0) {
                 //  Default broker is in use, so subscribe to the appropriate MQTT root topic for this region

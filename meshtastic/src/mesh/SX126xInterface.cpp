@@ -364,7 +364,7 @@ template <typename T> bool SX126xInterface<T>::isChannelActive()
     int16_t result;
     setTransmitEnable(false);
     setStandby();
-#ifdef CROWPANEL_DHE04005D
+#if defined(CROWPANEL_DHE04005D)
     result = lora.startChannelScan(cfg);
     if (result == RADIOLIB_ERR_NONE) {
         const uint32_t start = millis();

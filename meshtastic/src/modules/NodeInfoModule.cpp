@@ -19,6 +19,15 @@ NodeInfoModule *nodeInfoModule;
 
 static constexpr uint32_t NodeInfoReplySuppressSeconds = USERPREFS_NODEINFO_REPLY_SUPPRESS_SECS;
 
+static bool mqttContactDiscoveryEnabled()
+{
+#if defined(CROWPANEL_DHE04005D) || defined(UNIT_TEST)
+    return moduleConfig.mqtt.mqtt_contact_discovery_enabled;
+#else
+    return true;
+#endif
+}
+
 bool NodeInfoModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshtastic_User *pptr)
 {
     suppressReplyForCurrentRequest = false;
@@ -29,6 +38,11 @@ bool NodeInfoModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, mes
     }
 
     auto p = *pptr;
+
+    if (mp.via_mqtt && !mqttContactDiscoveryEnabled()) {
+        LOG_DEBUG("Ignore MQTT NodeInfo contact from 0x%08x", (unsigned)getFrom(&mp));
+        return false;
+    }
 
     // Suppress replies to senders we've replied to recently (12H window)
     if (mp.decoded.want_response && !isFromUs(&mp)) {

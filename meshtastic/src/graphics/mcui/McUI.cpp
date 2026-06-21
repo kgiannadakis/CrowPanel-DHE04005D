@@ -14,6 +14,9 @@
 #include "data/McObserver.h"
 
 #include "configuration.h"
+#if defined(CROWPANEL_DHE04005D)
+#include "crowpanel_backlight.h"
+#endif
 
 #include <Arduino.h>
 #include <Preferences.h>
@@ -21,7 +24,7 @@
 #include <freertos/task.h>
 #include <lvgl.h>
 
-#ifdef CROWPANEL_DHE04005D
+#if defined(CROWPANEL_DHE04005D)
 namespace crowpanel_p4 {
 bool lvgl_lock(int timeout_ms);
 void lvgl_unlock();
@@ -82,7 +85,7 @@ int page_height()
 
 int keyboard_height()
 {
-    return s_landscape ? 180 : 280;
+    return s_landscape ? 190 : 280;
 }
 
 bool landscape_active()
@@ -133,6 +136,8 @@ void switchTab(int idx)
     if (chatview_is_open())
         chatview_hide();
     if (s_active_tab == idx) return;
+    if (s_active_tab == TAB_MAPS)
+        maps_screen_on_hide();
     for (int i = 0; i < 4; i++) {
         if (!s_pages[i]) continue;
         if (i == idx) {
@@ -142,6 +147,8 @@ void switchTab(int idx)
         }
     }
     s_active_tab = idx;
+    if (s_active_tab == TAB_MAPS)
+        maps_screen_on_show();
     tabbar_set_active(idx);
 }
 
@@ -189,9 +196,9 @@ static void ui_task(void *)
 {
     LOG_INFO("mcui: UI task started on core %d", xPortGetCoreID());
 
-    // Mount map SD storage before display init; after RGB panel bring-up, PSRAM heap
-    // corruption can make IDF-level sdmmc mount paths unstable on this board.
-    maps_storage_prewarm();
+#if defined(CROWPANEL_DHE04005D)
+    backlight_set_timeout_secs(config.display.screen_on_secs);
+#endif
 
     display_init();
 
@@ -200,7 +207,7 @@ static void ui_task(void *)
     observer_init();
 
     build_ui();
-#ifdef CROWPANEL_DHE04005D
+#if defined(CROWPANEL_DHE04005D)
     crowpanel_p4::display_start_lvgl_task();
 #endif
 
@@ -225,7 +232,7 @@ static void ui_task(void *)
             continue;
         }
 
-#ifdef CROWPANEL_DHE04005D
+#if defined(CROWPANEL_DHE04005D)
         if (crowpanel_p4::lvgl_lock(2)) {
             const bool chats_active = (s_active_tab == TAB_CHATS) || chatview_is_open();
             if (s_active_tab == TAB_CHATS) {
@@ -283,13 +290,13 @@ void setup()
 
     mcclock_init();
 
-#ifdef CROWPANEL_DHE04005D
+#if defined(CROWPANEL_DHE04005D)
 
     mcui_tz_apply_at_boot();
 #endif
 
     LOG_INFO("mcui: spawning UI task");
-#ifdef CROWPANEL_DHE04005D
+#if defined(CROWPANEL_DHE04005D)
 
     BaseType_t ok = xTaskCreatePinnedToCore(
         ui_task, "mcui", 24576, nullptr, 1, &s_task, 1);

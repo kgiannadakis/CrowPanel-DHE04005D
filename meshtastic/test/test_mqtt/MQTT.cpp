@@ -75,7 +75,15 @@ class MockMeshService : public MeshService
 class MockNodeDB : public NodeDB
 {
   public:
-    meshtastic_NodeInfoLite *getMeshNode(NodeNum n) override { return &emptyNode; }
+    meshtastic_NodeInfoLite *getMeshNode(NodeNum n) override
+    {
+        if (!knowAllNodes_ && knownNodes_.count(n) == 0)
+            return nullptr;
+        emptyNode.num = n;
+        return &emptyNode;
+    }
+    bool knowAllNodes_ = true;
+    std::set<NodeNum> knownNodes_;
     meshtastic_NodeInfoLite emptyNode = {};
 };
 
@@ -230,6 +238,7 @@ MockPubSubServer *pubsub;
 MockRoutingModule *mockRoutingModule;
 MockMeshService *mockMeshService;
 MockRouter *mockRouter;
+MockNodeDB *mockNodeDB;
 
 // Keep running the loop until either conditionMet returns true or 4 seconds elapse.
 // Returns true if conditionMet returns true, returns false on timeout.
@@ -269,13 +278,14 @@ class MQTTUnitTest : public MQTT
         map_publish_interval_msecs = 0;
         perhapsReportToMap();
     }
-    void publish(const meshtastic_MeshPacket *p, std::string gateway = "!87654321", std::string channel = "test")
+    void publish(const meshtastic_MeshPacket *p, std::string gateway = "!87654321", std::string channel = "test",
+                 bool includeEnvelopeChannel = true, bool includeEnvelopeGateway = true)
     {
         std::stringstream topic;
-        topic << "msh/2/e/" << channel << "/!" << gateway;
+        topic << "msh/2/e/" << channel << "/" << gateway;
         const meshtastic_ServiceEnvelope env = {.packet = const_cast<meshtastic_MeshPacket *>(p),
-                                                .channel_id = const_cast<char *>(channel.c_str()),
-                                                .gateway_id = const_cast<char *>(gateway.c_str())};
+                                                .channel_id = includeEnvelopeChannel ? const_cast<char *>(channel.c_str()) : nullptr,
+                                                .gateway_id = includeEnvelopeGateway ? const_cast<char *>(gateway.c_str()) : nullptr};
         uint8_t bytes[256];
         size_t numBytes = pb_encode_to_bytes(bytes, sizeof(bytes), &meshtastic_ServiceEnvelope_msg, &env);
         mqttCallback(const_cast<char *>(topic.str().c_str()), bytes, numBytes);
@@ -332,6 +342,7 @@ void setUp(void)
 {
     moduleConfig.mqtt =
         meshtastic_ModuleConfig_MQTTConfig{.enabled = true, .map_reporting_enabled = true, .has_map_report_settings = true};
+    moduleConfig.mqtt.mqtt_contact_discovery_enabled = false;
     moduleConfig.mqtt.map_report_settings = meshtastic_ModuleConfig_MapReportSettings{
         .publish_interval_secs = 0, .position_precision = 14, .should_report_location = true};
     channelFile.channels[0] = meshtastic_Channel{
@@ -375,6 +386,25 @@ void test_sendDirectlyConnectedDecoded(void)
     const DecodedServiceEnvelope &env = std::get<DecodedServiceEnvelope>(payload);
     TEST_ASSERT_EQUAL_STRING("msh/2/e/test/!12345678", topic.c_str());
     TEST_ASSERT_TRUE(env.validDecode);
+    TEST_ASSERT_EQUAL(decoded.id, env.packet->id);
+}
+
+// A locally-originated LoRa text message should be uplinked to MQTT.
+void test_loraMessageSentUplinksToMqtt(void)
+{
+    meshtastic_MeshPacket loraEncrypted = encrypted;
+    meshtastic_MeshPacket loraDecoded = decoded;
+    loraEncrypted.via_mqtt = false;
+    loraDecoded.via_mqtt = false;
+
+    mqtt->onSend(loraEncrypted, loraDecoded, 0);
+
+    TEST_ASSERT_EQUAL(1, pubsub->published_.size());
+    const auto &[topic, payload] = pubsub->published_.front();
+    const DecodedServiceEnvelope &env = std::get<DecodedServiceEnvelope>(payload);
+    TEST_ASSERT_EQUAL_STRING("msh/2/e/test/!12345678", topic.c_str());
+    TEST_ASSERT_TRUE(env.validDecode);
+    TEST_ASSERT_FALSE(env.packet->via_mqtt);
     TEST_ASSERT_EQUAL(decoded.id, env.packet->id);
 }
 
@@ -544,6 +574,63 @@ void test_receiveDecodedProto(void)
     TEST_ASSERT_TRUE(p.via_mqtt);
 }
 
+// Valid MQTT messages from a known MQTT gateway should all be delivered, not sampled or throttled.
+void test_receiveAllValidMqttMessagesFromKnownGateway(void)
+{
+    mockNodeDB->knowAllNodes_ = false;
+    mockNodeDB->knownNodes_.insert(0x87654321);
+
+    meshtastic_MeshPacket first = decoded;
+    meshtastic_MeshPacket second = decoded;
+    second.id = decoded.id + 1;
+
+    unitTest->publish(&first, "!87654321");
+    unitTest->publish(&second, "!87654321");
+
+    TEST_ASSERT_EQUAL(2, mockRouter->packets_.size());
+    auto it = mockRouter->packets_.begin();
+    TEST_ASSERT_EQUAL(first.id, it->id);
+    TEST_ASSERT_TRUE(it->via_mqtt);
+    ++it;
+    TEST_ASSERT_EQUAL(second.id, it->id);
+    TEST_ASSERT_TRUE(it->via_mqtt);
+}
+
+// With MQTT contact discovery disabled, real messages from unknown gateways still arrive,
+// but node/contact discovery packets are suppressed after decode.
+void test_receiveMqttUnknownGatewayRequiresDiscovery(void)
+{
+    mockNodeDB->knowAllNodes_ = false;
+    mockNodeDB->knownNodes_.clear();
+
+    TEST_ASSERT_FALSE(moduleConfig.mqtt.mqtt_contact_discovery_enabled);
+
+    unitTest->publish(&decoded, "!87654321");
+    TEST_ASSERT_EQUAL(1, mockRouter->packets_.size());
+    TEST_ASSERT_TRUE(mockRouter->packets_.front().via_mqtt);
+
+    meshtastic_MeshPacket nodeInfo = decoded;
+    nodeInfo.id = decoded.id + 1;
+    nodeInfo.decoded.portnum = meshtastic_PortNum_NODEINFO_APP;
+    unitTest->publish(&nodeInfo, "!87654321");
+    TEST_ASSERT_EQUAL(1, mockRouter->packets_.size());
+
+    moduleConfig.mqtt.mqtt_contact_discovery_enabled = true;
+    unitTest->publish(&nodeInfo, "!87654321");
+    TEST_ASSERT_EQUAL(2, mockRouter->packets_.size());
+}
+
+// A received LoRa packet must not be treated as MQTT traffic by the MQTT receive filters.
+void test_loraMessageReceivedIsNotMarkedViaMqtt(void)
+{
+    meshtastic_MeshPacket p = decoded;
+    p.via_mqtt = false;
+    p.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA;
+
+    TEST_ASSERT_FALSE(p.via_mqtt);
+    TEST_ASSERT_EQUAL(meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA, p.transport_mechanism);
+}
+
 // Test receiving a decoded MeshPacket from the phone proxy.
 void test_receiveDecodedProtoFromProxy(void)
 {
@@ -636,12 +723,20 @@ void test_receiveIgnoresSentMessagesFromOthers(void)
     TEST_ASSERT_TRUE(mockRoutingModule->ackNacks_.empty());
 }
 
-// Decoded MQTT messages should be ignored when encryption is enabled.
+// Official MQTT handling ignores decoded MQTT packets when encryption is enabled.
 void test_receiveIgnoresDecodedWhenEncryptionEnabled(void)
 {
     moduleConfig.mqtt.encryption_enabled = true;
 
     unitTest->publish(&decoded);
+
+    TEST_ASSERT_TRUE(mockRouter->packets_.empty());
+}
+
+// Official MQTT handling requires ServiceEnvelope channel/gateway metadata.
+void test_receiveIgnoresEnvelopeWithoutMetadata(void)
+{
+    unitTest->publish(&decoded, "!87654321", "test", false, false);
 
     TEST_ASSERT_TRUE(mockRouter->packets_.empty());
 }
@@ -884,11 +979,13 @@ void test_configWithTLSEnabled(void)
 void setup()
 {
     initializeTestEnvironment();
-    const std::unique_ptr<MockNodeDB> mockNodeDB(new MockNodeDB());
-    nodeDB = mockNodeDB.get();
+    const std::unique_ptr<MockNodeDB> nodeDBMock(new MockNodeDB());
+    mockNodeDB = nodeDBMock.get();
+    nodeDB = mockNodeDB;
 
     UNITY_BEGIN();
     RUN_TEST(test_sendDirectlyConnectedDecoded);
+    RUN_TEST(test_loraMessageSentUplinksToMqtt);
     RUN_TEST(test_sendDirectlyConnectedEncrypted);
     RUN_TEST(test_proxyToMeshServiceDecoded);
     RUN_TEST(test_proxyToMeshServiceEncrypted);
@@ -900,6 +997,9 @@ void setup()
     RUN_TEST(test_reconnectProxyDoesNotReconnectMqtt);
     RUN_TEST(test_receiveEmptyMeshPacket);
     RUN_TEST(test_receiveDecodedProto);
+    RUN_TEST(test_receiveAllValidMqttMessagesFromKnownGateway);
+    RUN_TEST(test_receiveMqttUnknownGatewayRequiresDiscovery);
+    RUN_TEST(test_loraMessageReceivedIsNotMarkedViaMqtt);
     RUN_TEST(test_receiveDecodedProtoFromProxy);
     RUN_TEST(test_receiveEmptyDataFromProxy);
     RUN_TEST(test_receiveWithoutChannelDownlink);
@@ -908,6 +1008,7 @@ void setup()
     RUN_TEST(test_receiveAcksOwnSentMessages);
     RUN_TEST(test_receiveIgnoresSentMessagesFromOthers);
     RUN_TEST(test_receiveIgnoresDecodedWhenEncryptionEnabled);
+    RUN_TEST(test_receiveIgnoresEnvelopeWithoutMetadata);
     RUN_TEST(test_receiveIgnoresDecodedAdminApp);
     RUN_TEST(test_receiveIgnoresUnexpectedFields);
     RUN_TEST(test_receiveIgnoresInvalidHopLimit);
@@ -930,6 +1031,7 @@ void setup()
     RUN_TEST(test_configWithConnectionFailure);
     RUN_TEST(test_configWithTLSEnabled);
     exit(UNITY_END());
+    mockNodeDB = nullptr;
 }
 #else
 void setup()

@@ -15,14 +15,13 @@
 #include "mqtt/MQTT.h"
 #endif
 #include "Default.h"
-#if ARCH_PORTDUINO
 #include "Throttle.h"
+#if ARCH_PORTDUINO
 #include "platform/portduino/PortduinoGlue.h"
 #endif
 #if ENABLE_JSON_LOGGING || ARCH_PORTDUINO
 #include "serialization/MeshPacketSerializer.h"
 #endif
-#include <pb_decode.h>
 
 #define MAX_RX_FROMRADIO                                                                                                         \
     4 // max number of packets destined to our queue, we dispatch packets quickly so it doesn't need to be big
@@ -58,37 +57,19 @@ Allocator<meshtastic_MeshPacket> &packetPool = staticPool;
 #endif
 
 static uint8_t bytes[MAX_LORA_PAYLOAD_LEN + 1] __attribute__((__aligned__));
-static uint32_t s_mqttDecodeRejectCount = 0;
-static uint32_t s_mqttDecodeRejectLastLogMs = 0;
+static const uint32_t MQTT_DECODE_REJECT_LOG_INTERVAL_MS = 30000;
+static uint32_t lastMqttDecodeRejectLog = 0;
+static uint32_t mqttDecodeRejectCount = 0;
 
-static bool decodeDataQuiet(const uint8_t *srcbuf, size_t srcbufsize, meshtastic_Data *dest_struct)
+static void logMqttDecodeReject(const meshtastic_MeshPacket *p)
 {
-    pb_istream_t stream = pb_istream_from_buffer(srcbuf, srcbufsize);
-    return pb_decode(&stream, &meshtastic_Data_msg, dest_struct);
-}
-
-static bool decodeDataForPacket(const meshtastic_MeshPacket *p, const uint8_t *srcbuf, size_t srcbufsize,
-                                meshtastic_Data *dest_struct)
-{
-    // Public MQTT carries packets we cannot decrypt by design (different PSKs, hash collisions, mixed publishers).
-    // Avoid emitting protobuf ERROR logs for these expected decode misses.
-    if (p && p->via_mqtt) {
-        return decodeDataQuiet(srcbuf, srcbufsize, dest_struct);
+    mqttDecodeRejectCount++;
+    if (lastMqttDecodeRejectLog == 0 || !Throttle::isWithinTimespanMs(lastMqttDecodeRejectLog, MQTT_DECODE_REJECT_LOG_INTERVAL_MS)) {
+        LOG_DEBUG("Dropped undecodable MQTT packets: count=%u latest id=0x%08x hash=0x%x", mqttDecodeRejectCount, p->id,
+                  p->channel);
+        mqttDecodeRejectCount = 0;
+        lastMqttDecodeRejectLog = millis();
     }
-    return pb_decode_from_bytes(srcbuf, srcbufsize, &meshtastic_Data_msg, dest_struct);
-}
-
-static void logMqttDecodeReject(PacketId packetId)
-{
-    s_mqttDecodeRejectCount++;
-    const uint32_t now = millis();
-    if ((now - s_mqttDecodeRejectLastLogMs) < 5000) {
-        return;
-    }
-    LOG_WARN("MQTT decode rejects (likely foreign/bad PSK): count=%u latest=0x%08x", (unsigned)s_mqttDecodeRejectCount,
-             (unsigned)packetId);
-    s_mqttDecodeRejectCount = 0;
-    s_mqttDecodeRejectLastLogMs = now;
 }
 
 /**
@@ -402,6 +383,9 @@ ErrorCode Router::send(meshtastic_MeshPacket *p)
 #if !MESHTASTIC_EXCLUDE_MQTT
         // Only publish to MQTT if we're the original transmitter of the packet
         if (moduleConfig.mqtt.enabled && isFromUs(p) && mqtt) {
+#if defined(ARCH_ESP32P4) && defined(CROWPANEL_DHE04005D) && !defined(ARCH_PORTDUINO)
+            mqtt->pausePublicDownlink(15000, "local LoRa TX");
+#endif
             mqtt->onSend(*p, *p_decoded, chIndex);
         }
 #endif
@@ -478,7 +462,7 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
             meshtastic_Data decodedtmp;
             memset(&decodedtmp, 0, sizeof(decodedtmp));
             rawSize -= MESHTASTIC_PKC_OVERHEAD;
-            if (decodeDataForPacket(p, bytes, rawSize, &decodedtmp) &&
+            if (pb_decode_from_bytes(bytes, rawSize, &meshtastic_Data_msg, &decodedtmp) &&
                 decodedtmp.portnum != meshtastic_PortNum_UNKNOWN_APP) {
                 decrypted = true;
                 LOG_INFO("Packet decrypted using PKI!");
@@ -514,20 +498,12 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
                 // Take those raw bytes and convert them back into a well structured protobuf we can understand
                 meshtastic_Data decodedtmp;
                 memset(&decodedtmp, 0, sizeof(decodedtmp));
-                if (!decodeDataForPacket(p, bytes, rawSize, &decodedtmp)) {
-                    if (p->via_mqtt) {
-                        LOG_DEBUG("Invalid protobuf in MQTT packet id=0x%08x (bad psk?)", p->id);
-                        logMqttDecodeReject(p->id);
-                    } else {
+                if (!pb_decode_from_bytes(bytes, rawSize, &meshtastic_Data_msg, &decodedtmp)) {
+                    if (!p->via_mqtt)
                         LOG_ERROR("Invalid protobufs in received mesh packet id=0x%08x (bad psk?)!", p->id);
-                    }
                 } else if (decodedtmp.portnum == meshtastic_PortNum_UNKNOWN_APP) {
-                    if (p->via_mqtt) {
-                        LOG_DEBUG("Invalid portnum in MQTT packet (bad psk?)");
-                        logMqttDecodeReject(p->id);
-                    } else {
+                    if (!p->via_mqtt)
                         LOG_ERROR("Invalid portnum (bad psk?)!");
-                    }
 #if !(MESHTASTIC_EXCLUDE_PKI)
                 } else if (!owner.is_licensed && isToUs(p) && decodedtmp.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP) {
                     LOG_WARN("Rejecting legacy DM");
@@ -569,7 +545,17 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
             p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
         } */
 
-        printPacket("decoded message", p);
+#if defined(CROWPANEL_DHE04005D)
+        const bool quietMqttContactPacket =
+            p->via_mqtt && IS_ONE_OF(p->decoded.portnum,
+                                     meshtastic_PortNum_NODEINFO_APP,
+                                     meshtastic_PortNum_POSITION_APP,
+                                     meshtastic_PortNum_TELEMETRY_APP,
+                                     meshtastic_PortNum_NEIGHBORINFO_APP,
+                                     meshtastic_PortNum_MAP_REPORT_APP);
+        if (!quietMqttContactPacket)
+#endif
+            printPacket("decoded message", p);
 #if ENABLE_JSON_LOGGING
         LOG_TRACE("%s", MeshPacketSerializer::JsonSerialize(p, false).c_str());
 #elif ARCH_PORTDUINO
@@ -602,11 +588,10 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
 #endif
         return DecodeState::DECODE_SUCCESS;
     } else {
-        if (p->via_mqtt) {
-            LOG_DEBUG("No suitable channel found for decoding MQTT hash=0x%x", p->channel);
-        } else {
+        if (p->via_mqtt)
+            logMqttDecodeReject(p);
+        else
             LOG_WARN("No suitable channel found for decoding, hash was 0x%x!", p->channel);
-        }
         return DecodeState::DECODE_FAILURE;
     }
 }
@@ -696,20 +681,39 @@ meshtastic_Routing_Error perhapsEncode(meshtastic_MeshPacket *p)
                 return meshtastic_Routing_Error_TOO_LARGE;
             // Check for a known public key for the destination
             if (node == nullptr || node->user.public_key.size != 32) {
+#if defined(CROWPANEL_DHE04005D)
+                if (p->pki_encrypted == true) {
+                    LOG_WARN("Unknown public key for destination node 0x%08x (portnum %d), PKI requested", p->to,
+                             p->decoded.portnum);
+                    return meshtastic_Routing_Error_PKI_SEND_FAIL_PUBLIC_KEY;
+                }
+
+                LOG_WARN("Unknown public key for destination node 0x%08x (portnum %d), using channel-encrypted DM",
+                         p->to, p->decoded.portnum);
+                hash = channels.setActiveByIndex(chIndex);
+                p->channel = hash;
+                if (hash < 0) {
+                    return meshtastic_Routing_Error_NO_CHANNEL;
+                }
+                crypto->encryptPacket(getFrom(p), p->id, numbytes, bytes);
+                memcpy(p->encrypted.bytes, bytes, numbytes);
+#else
                 LOG_WARN("Unknown public key for destination node 0x%08x (portnum %d), refusing to send legacy DM", p->to,
                          p->decoded.portnum);
                 return meshtastic_Routing_Error_PKI_SEND_FAIL_PUBLIC_KEY;
+#endif
+            } else {
+                if (p->pki_encrypted && !memfll(p->public_key.bytes, 0, 32) &&
+                    memcmp(p->public_key.bytes, node->user.public_key.bytes, 32) != 0) {
+                    LOG_WARN("Client public key differs from requested: 0x%02x, stored key begins 0x%02x", *p->public_key.bytes,
+                             *node->user.public_key.bytes);
+                    return meshtastic_Routing_Error_PKI_FAILED;
+                }
+                crypto->encryptCurve25519(p->to, getFrom(p), node->user.public_key, p->id, numbytes, bytes, p->encrypted.bytes);
+                numbytes += MESHTASTIC_PKC_OVERHEAD;
+                p->channel = 0;
+                p->pki_encrypted = true;
             }
-            if (p->pki_encrypted && !memfll(p->public_key.bytes, 0, 32) &&
-                memcmp(p->public_key.bytes, node->user.public_key.bytes, 32) != 0) {
-                LOG_WARN("Client public key differs from requested: 0x%02x, stored key begins 0x%02x", *p->public_key.bytes,
-                         *node->user.public_key.bytes);
-                return meshtastic_Routing_Error_PKI_FAILED;
-            }
-            crypto->encryptCurve25519(p->to, getFrom(p), node->user.public_key, p->id, numbytes, bytes, p->encrypted.bytes);
-            numbytes += MESHTASTIC_PKC_OVERHEAD;
-            p->channel = 0;
-            p->pki_encrypted = true;
         } else {
             if (p->pki_encrypted == true) {
                 // Client specifically requested PKI encryption

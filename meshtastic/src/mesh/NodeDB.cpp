@@ -44,6 +44,24 @@
 #include <soc/soc.h>
 #endif
 
+static uint32_t newNodeSaveIntervalMs()
+{
+#if defined(CROWPANEL_DHE04005D)
+    return 120000;
+#else
+    return 5000;
+#endif
+}
+
+static bool mqttContactDiscoveryEnabled()
+{
+#if defined(CROWPANEL_DHE04005D) || defined(UNIT_TEST)
+    return moduleConfig.mqtt.mqtt_contact_discovery_enabled;
+#else
+    return true;
+#endif
+}
+
 #ifdef ARCH_PORTDUINO
 #include "modules/StoreForwardModule.h"
 #include "platform/portduino/PortduinoGlue.h"
@@ -900,7 +918,9 @@ void NodeDB::installDefaultModuleConfig()
 #ifdef USERPREFS_MQTT_ROOT_TOPIC
     strncpy(moduleConfig.mqtt.root, USERPREFS_MQTT_ROOT_TOPIC, sizeof(moduleConfig.mqtt.root));
 #else
-    strncpy(moduleConfig.mqtt.root, default_mqtt_root, sizeof(moduleConfig.mqtt.root));
+    const char *mqttRoot =
+        (config.lora.region == meshtastic_Config_LoRaConfig_RegionCode_EU_868) ? "msh/EU_868" : default_mqtt_root;
+    strncpy(moduleConfig.mqtt.root, mqttRoot, sizeof(moduleConfig.mqtt.root));
 #endif
     moduleConfig.mqtt.root[sizeof(moduleConfig.mqtt.root) - 1] = '\0';
 #ifdef USERPREFS_MQTT_ENCRYPTION_ENABLED
@@ -913,6 +933,7 @@ void NodeDB::installDefaultModuleConfig()
 #else
     moduleConfig.mqtt.tls_enabled = default_mqtt_tls_enabled;
 #endif
+    moduleConfig.mqtt.mqtt_contact_discovery_enabled = false;
 
     moduleConfig.has_neighbor_info = true;
     moduleConfig.neighbor_info.enabled = false;
@@ -1892,9 +1913,19 @@ bool NodeDB::updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelInde
         // We just changed something about a User. Persist aggressively for newly discovered
         // nodes (to survive quick reboot/power loss), but keep a slower cadence for updates
         // to existing nodes to reduce flash churn.
-        const uint32_t saveInterval = isNewNode ? NEW_NODE_SAVE_INTERVAL_MS : ONE_MINUTE_MS;
+        uint32_t saveInterval = isNewNode ? newNodeSaveIntervalMs() : ONE_MINUTE_MS;
         uint32_t &lastSaveRef = isNewNode ? lastNodeDbNewNodeSave : lastNodeDbSave;
-        if (!Throttle::isWithinTimespanMs(lastSaveRef, saveInterval)) {
+#if defined(CROWPANEL_DHE04005D)
+        // The CrowPanel P4 boards reboot/crash often, and the throttled new-node cadence
+        // (plus the first-boot window where lastSaveRef==0 suppresses writes for a full
+        // interval) was losing freshly learned node NAMES, so a discovered contact reverted
+        // to "!hexid" after restart. Learning a node's name is a rare, discrete event (MQTT
+        // contact-discovery NodeInfo is already dropped upstream when that setting is off),
+        // so persist it immediately. Updates to existing nodes keep the slower cadence.
+        if (isNewNode)
+            saveInterval = 0;
+#endif
+        if (saveInterval == 0 || !Throttle::isWithinTimespanMs(lastSaveRef, saveInterval)) {
             saveToDisk(SEGMENT_NODEDATABASE);
             const uint32_t now = millis();
             lastSaveRef = now;
@@ -1918,6 +1949,11 @@ void NodeDB::updateFrom(const meshtastic_MeshPacket &mp)
         return;
     }
     if (mp.which_payload_variant == meshtastic_MeshPacket_decoded_tag && mp.from) {
+        if (mp.via_mqtt && !mqttContactDiscoveryEnabled()) {
+            LOG_DEBUG("Skip MQTT contact update from 0x%x", mp.from);
+            return;
+        }
+
         LOG_DEBUG("Update DB node 0x%x, rx_time=%u", mp.from, mp.rx_time);
 
         meshtastic_NodeInfoLite *info = getOrCreateMeshNode(getFrom(&mp));
@@ -1931,7 +1967,14 @@ void NodeDB::updateFrom(const meshtastic_MeshPacket &mp)
         if (mp.rx_snr)
             info->snr = mp.rx_snr; // keep the most recent SNR we received for this node.
 
-        info->via_mqtt = mp.via_mqtt; // Store if we received this packet via MQTT
+        if (mp.via_mqtt) {
+            // Keep LoRa-learned contacts independent from MQTT. A later MQTT text packet
+            // must not turn an existing LoRa contact into an MQTT-only contact.
+            if (info->via_mqtt || !info->has_user)
+                info->via_mqtt = true;
+        } else {
+            info->via_mqtt = false;
+        }
 
         // If hopStart was set and there wasn't someone messing with the limit in the middle, add hopsAway
         const int8_t hopsAway = getHopsAway(mp);
@@ -2133,7 +2176,7 @@ meshtastic_NodeInfoLite *NodeDB::getOrCreateMeshNode(NodeNum n)
         // Persist newly discovered nodes promptly, even if they first arrive via
         // telemetry/position and user info comes later. This helps node discovery
         // survive quick reboot/power loss without waiting for periodic saves.
-        if (n != getNodeNum() && !Throttle::isWithinTimespanMs(lastNodeDbNewNodeSave, NEW_NODE_SAVE_INTERVAL_MS)) {
+        if (n != getNodeNum() && !Throttle::isWithinTimespanMs(lastNodeDbNewNodeSave, newNodeSaveIntervalMs())) {
             saveToDisk(SEGMENT_NODEDATABASE);
             const uint32_t now = millis();
             lastNodeDbNewNodeSave = now;

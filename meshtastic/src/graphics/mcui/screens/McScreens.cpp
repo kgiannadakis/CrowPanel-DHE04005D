@@ -14,6 +14,8 @@
 #include "mesh/generated/meshtastic/channel.pb.h"
 
 #include <Arduino.h>
+#include <Preferences.h>
+#include <esp_heap_caps.h>
 #include <esp_random.h>
 #include <mbedtls/base64.h>
 #include <cmath>
@@ -21,7 +23,7 @@
 #include <cstring>
 #include <sys/stat.h>
 #include <draw/lv_image_decoder.h>
-#if defined(ARCH_ESP32) && defined(CROWPANEL_DHE04005D)
+#if defined(ARCH_ESP32) && defined(CROWPANEL_DHE04005D) && !defined(CROWPANEL_DISABLE_MAPS)
 #include <esp_err.h>
 #include <esp_vfs_fat.h>
 #include <driver/sdmmc_host.h>
@@ -219,7 +221,7 @@ static void chat_card_long_pressed(lv_event_t *e)
     if (is_primary) {
         snprintf(title, sizeof(title), "Clear chat history?\n%s", ent->title);
         body_text = "Deletes the message history for this primary channel. "
-                    "The channel itself stays — you keep receiving messages on it.";
+                    "The channel itself stays - you keep receiving messages on it.";
         delete_label = "Clear history";
     } else if (is_secondary) {
         snprintf(title, sizeof(title), "Delete channel?\n%s", ent->title);
@@ -258,7 +260,7 @@ static void chat_card_long_pressed(lv_event_t *e)
     lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT);
     lv_obj_set_width(tl, lv_pct(100));
     lv_obj_set_style_text_color(tl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(tl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(tl, MCUI_FONT_16, 0);
     lv_obj_align(tl, LV_ALIGN_TOP_LEFT, 0, 0);
 
     lv_obj_t *body = lv_label_create(card);
@@ -266,7 +268,7 @@ static void chat_card_long_pressed(lv_event_t *e)
     lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(body, lv_pct(100));
     lv_obj_set_style_text_color(body, lv_color_hex(TH_TEXT2), 0);
-    lv_obj_set_style_text_font(body, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(body, MCUI_FONT_16, 0);
     lv_obj_align(body, LV_ALIGN_TOP_LEFT, 0, 64);
 
     lv_obj_t *cancel = lv_button_create(card);
@@ -277,7 +279,7 @@ static void chat_card_long_pressed(lv_event_t *e)
     lv_obj_t *cl = lv_label_create(cancel);
     lv_label_set_text(cl, "Cancel");
     lv_obj_set_style_text_color(cl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(cl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(cl, MCUI_FONT_16, 0);
     lv_obj_center(cl);
 
     lv_obj_t *delete_btn = lv_button_create(card);
@@ -288,7 +290,7 @@ static void chat_card_long_pressed(lv_event_t *e)
     lv_obj_t *dl = lv_label_create(delete_btn);
     lv_label_set_text(dl, delete_label);
     lv_obj_set_style_text_color(dl, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(dl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(dl, MCUI_FONT_16, 0);
     lv_obj_center(dl);
 
     lv_obj_add_event_cb(cancel, chat_delete_confirm_cb, LV_EVENT_CLICKED, delete_btn);
@@ -355,7 +357,7 @@ static lv_obj_t *chcreate_add_switch_row(lv_obj_t *card, const char *label, int 
     lv_obj_t *lbl = lv_label_create(row);
     lv_label_set_text(lbl, label);
     lv_obj_set_style_text_color(lbl, lv_color_hex(TH_TEXT2), 0);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(lbl, MCUI_FONT_16, 0);
     lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 0, 0);
 
     lv_obj_t *sw = lv_switch_create(row);
@@ -486,7 +488,7 @@ static void chcreate_open()
     lv_obj_t *title = lv_label_create(card);
     lv_label_set_text(title, "New / join channel");
     lv_obj_set_style_text_color(title, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(title, MCUI_FONT_16, 0);
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, y);
     y += 28;
 
@@ -498,6 +500,7 @@ static void chcreate_open()
     lv_textarea_set_placeholder_text(s_chcreate_name, "Channel name (max 11 chars)");
     lv_obj_set_style_bg_color(s_chcreate_name, lv_color_hex(TH_INPUT), 0);
     lv_obj_set_style_text_color(s_chcreate_name, lv_color_hex(TH_TEXT), 0);
+    lv_obj_set_style_text_font(s_chcreate_name, MCUI_FONT_16, 0);
     lv_obj_set_style_border_width(s_chcreate_name, 0, 0);
     lv_obj_set_style_radius(s_chcreate_name, 0, 0);
     lv_obj_set_style_anim_duration(s_chcreate_name, 0, LV_PART_CURSOR);
@@ -512,7 +515,7 @@ static void chcreate_open()
     lv_label_set_long_mode(psk_hint, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(psk_hint, lv_pct(100));
     lv_obj_set_style_text_color(psk_hint, lv_color_hex(TH_TEXT3), 0);
-    lv_obj_set_style_text_font(psk_hint, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(psk_hint, MCUI_FONT_16, 0);
     lv_obj_align(psk_hint, LV_ALIGN_TOP_LEFT, 0, y);
     y += 56;
 
@@ -524,6 +527,7 @@ static void chcreate_open()
     lv_textarea_set_placeholder_text(s_chcreate_psk, "(optional)  e.g. 1PG7OiApB1nwvP+rz05pAQ==");
     lv_obj_set_style_bg_color(s_chcreate_psk, lv_color_hex(TH_INPUT), 0);
     lv_obj_set_style_text_color(s_chcreate_psk, lv_color_hex(TH_TEXT), 0);
+    lv_obj_set_style_text_font(s_chcreate_psk, MCUI_FONT_16, 0);
     lv_obj_set_style_border_width(s_chcreate_psk, 0, 0);
     lv_obj_set_style_radius(s_chcreate_psk, 0, 0);
     lv_obj_set_style_anim_duration(s_chcreate_psk, 0, LV_PART_CURSOR);
@@ -540,7 +544,7 @@ static void chcreate_open()
     lv_obj_set_width(s_chcreate_status, lv_pct(100));
     lv_label_set_long_mode(s_chcreate_status, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_color(s_chcreate_status, lv_color_hex(TH_TEXT3), 0);
-    lv_obj_set_style_text_font(s_chcreate_status, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(s_chcreate_status, MCUI_FONT_16, 0);
     lv_obj_align(s_chcreate_status, LV_ALIGN_TOP_LEFT, 0, y);
 
     lv_obj_t *cancel = lv_button_create(card);
@@ -552,7 +556,7 @@ static void chcreate_open()
     lv_obj_t *cl = lv_label_create(cancel);
     lv_label_set_text(cl, "Cancel");
     lv_obj_set_style_text_color(cl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(cl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(cl, MCUI_FONT_16, 0);
     lv_obj_center(cl);
 
     lv_obj_t *ok = lv_button_create(card);
@@ -564,7 +568,7 @@ static void chcreate_open()
     lv_obj_t *ol = lv_label_create(ok);
     lv_label_set_text(ol, "Create / join");
     lv_obj_set_style_text_color(ol, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(ol, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(ol, MCUI_FONT_16, 0);
     lv_obj_center(ol);
 
     // Tap anywhere outside a text field (incl. the dimmed backdrop) to dismiss
@@ -600,7 +604,7 @@ static void add_section_header(const char *text)
     lv_obj_t *h = lv_label_create(s_chats_list);
     lv_label_set_text(h, text);
     lv_obj_set_style_text_color(h, lv_color_hex(TH_TEXT3), 0);
-    lv_obj_set_style_text_font(h, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(h, MCUI_FONT_16, 0);
     lv_obj_set_style_pad_top(h, 6, 0);
     lv_obj_set_style_pad_left(h, 12, 0);
 }
@@ -648,7 +652,7 @@ static void add_chat_card(ChatEntry *ent, const char *subtitle, uint16_t unread,
     lv_obj_t *tl = lv_label_create(card);
     lv_label_set_text(tl, ent->title);
     lv_obj_set_style_text_color(tl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(tl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(tl, MCUI_FONT_16, 0);
     lv_obj_set_pos(tl, 52, 2);
     lv_obj_set_width(tl, SCR_W - 52 - 20 - 40);
     lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT);
@@ -657,7 +661,7 @@ static void add_chat_card(ChatEntry *ent, const char *subtitle, uint16_t unread,
         lv_obj_t *sl = lv_label_create(card);
         lv_label_set_text(sl, subtitle);
         lv_obj_set_style_text_color(sl, lv_color_hex(TH_TEXT2), 0);
-        lv_obj_set_style_text_font(sl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(sl, MCUI_FONT_16, 0);
         lv_obj_set_pos(sl, 52, 24);
         lv_obj_set_width(sl, SCR_W - 52 - 20 - 40);
         lv_label_set_long_mode(sl, LV_LABEL_LONG_DOT);
@@ -706,6 +710,16 @@ static void conv_gather_cb(const McConvId &id, void *ctx)
     }
 }
 
+static bool is_mqtt_only_contact(const meshtastic_NodeInfoLite *n)
+{
+#if defined(CROWPANEL_DHE04005D)
+    return n && n->via_mqtt && n->snr == 0.0f && !moduleConfig.mqtt.mqtt_contact_discovery_enabled;
+#else
+    (void)n;
+    return false;
+#endif
+}
+
 static void rebuild_chats_list()
 {
     if (!s_chats_list) return;
@@ -739,6 +753,8 @@ static void rebuild_chats_list()
     bool any_direct = false;
     for (int i = 0; i < g.n; i++) {
         if (g.ids[i].kind != McConvId::DIRECT) continue;
+        meshtastic_NodeInfoLite *n = nodeDB ? nodeDB->getMeshNode((NodeNum)g.ids[i].value) : nullptr;
+        if (is_mqtt_only_contact(n)) continue;
         any_direct = true;
         break;
     }
@@ -748,20 +764,19 @@ static void rebuild_chats_list()
 
     for (int i = 0; i < g.n && s_num_entries < (int)(sizeof(s_entries)/sizeof(s_entries[0])); i++) {
         if (g.ids[i].kind != McConvId::DIRECT) continue;
+        meshtastic_NodeInfoLite *n = nodeDB ? nodeDB->getMeshNode((NodeNum)g.ids[i].value) : nullptr;
+        if (is_mqtt_only_contact(n)) continue;
 
         ChatEntry *ent = &s_entries[s_num_entries++];
         ent->id = g.ids[i];
 
         const char *title = nullptr;
         char fallback[16];
-        if (nodeDB) {
-            auto *n = nodeDB->getMeshNode((NodeNum)g.ids[i].value);
-            if (n && n->has_user) {
-                if (n->user.long_name[0])
-                    title = n->user.long_name;
-                else if (n->user.short_name[0])
-                    title = n->user.short_name;
-            }
+        if (n && n->has_user) {
+            if (n->user.long_name[0])
+                title = n->user.long_name;
+            else if (n->user.short_name[0])
+                title = n->user.short_name;
         }
         if (!title) {
             snprintf(fallback, sizeof(fallback), "!%08x", (unsigned)g.ids[i].value);
@@ -808,7 +823,7 @@ lv_obj_t *chats_screen_create(lv_obj_t *parent)
     lv_obj_t *fab_lbl = lv_label_create(fab);
     lv_label_set_text(fab_lbl, LV_SYMBOL_PLUS);
     lv_obj_set_style_text_color(fab_lbl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(fab_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(fab_lbl, MCUI_FONT_16, 0);
     lv_obj_center(fab_lbl);
 
     s_chats_last_tick = 0xFFFFFFFFu;
@@ -848,8 +863,8 @@ struct MapState {
     lv_obj_t *pan = nullptr;
     lv_obj_t *status = nullptr;
     lv_obj_t *zoom_lbl = nullptr;
-    double center_lat = 48.8566;
-    double center_lon = 2.3522;
+    double center_lat = 51.21075;
+    double center_lon = 4.43384;
     int zoom = 11;
     int drag_dx = 0;
     int drag_dy = 0;
@@ -862,19 +877,26 @@ static constexpr int kMapTilePx = 256;
 static constexpr int kMapMarkerDotPx = 6;
 static constexpr int kMapLocalDotPx = 9;
 static constexpr int kMapMinZoom = 7;
-static constexpr int kMapMaxZoom = 14;
-static constexpr int kMapTilePad = 1;
-static constexpr int kMapMaxTileSlots = 30;
+static constexpr int kMapMaxZoom = 12;
+static constexpr int kMapDesiredTilePad = 1;
+static constexpr int kMapMaxTileSlots = 40;
 static constexpr int kMapMaxMarkerSlots = 40;
 static constexpr uint32_t kMapNodeRefreshMs = 4000;
+static constexpr uint32_t kMapMarkerRestoreDelayMs = 120;
+static constexpr int kMapRebuildEdgeMarginPx = 24;
 static MapState s_map;
 static MapTileSlot s_map_tiles[kMapMaxTileSlots];
 static MapMarkerSlot s_map_markers[kMapMaxMarkerSlots];
+static bool s_map_markers_hidden = false;
+static bool s_map_blocked_by_wifi = false;
+static uint32_t s_map_marker_restore_ms = 0;
+static uint32_t s_map_last_diag_ms = 0;
 
-#if defined(ARCH_ESP32) && defined(CROWPANEL_DHE04005D)
+#if defined(ARCH_ESP32) && defined(CROWPANEL_DHE04005D) && !defined(CROWPANEL_DISABLE_MAPS)
 static sdmmc_card_t *s_map_sd_card = nullptr;
 static bool s_map_sd_ready = false;
 static bool s_map_sd_attempted = false;
+static bool s_map_sd_own_mount = false;
 static volatile uint8_t s_map_sd_mount_state = 0; // 0=idle, 1=ready, 2=failed
 #endif
 
@@ -905,12 +927,58 @@ static void maps_status_set(const char *text)
     if (s_map.status) lv_label_set_text(s_map.status, text ? text : "");
 }
 
+static bool maps_wifi_conflicts_with_sd()
+{
+#if defined(ARCH_ESP32P4) && defined(CROWPANEL_DHE04005D)
+    struct stat st = {};
+    if (stat("/sdcard", &st) == 0 && (st.st_mode & S_IFDIR))
+        return false;
+    return config.network.wifi_enabled && config.network.wifi_ssid[0] != '\0';
+#else
+    return false;
+#endif
+}
+
 static void maps_zoom_set_label()
 {
     if (!s_map.zoom_lbl) return;
     char buf[24];
     snprintf(buf, sizeof(buf), "Z%d", s_map.zoom);
     lv_label_set_text(s_map.zoom_lbl, buf);
+}
+
+static void maps_viewport_save_now()
+{
+    Preferences prefs;
+    if (!prefs.begin("map", false))
+        return;
+    prefs.putInt("lat_e6", (int32_t)lround(s_map.center_lat * 1.0e6));
+    prefs.putInt("lon_e6", (int32_t)lround(s_map.center_lon * 1.0e6));
+    prefs.putUChar("zoom", (uint8_t)s_map.zoom);
+    prefs.end();
+}
+
+static bool maps_viewport_load()
+{
+    Preferences prefs;
+    if (!prefs.begin("map", true))
+        return false;
+    const int32_t lat_e6 = prefs.getInt("lat_e6", INT32_MIN);
+    const int32_t lon_e6 = prefs.getInt("lon_e6", INT32_MIN);
+    uint8_t zoom = prefs.getUChar("zoom", 0xFF);
+    prefs.end();
+
+    if (lat_e6 == INT32_MIN || lon_e6 == INT32_MIN || zoom == 0xFF)
+        return false;
+    if (zoom < kMapMinZoom)
+        zoom = kMapMinZoom;
+    if (zoom > kMapMaxZoom)
+        zoom = kMapMaxZoom;
+
+    s_map.center_lat = (double)lat_e6 / 1.0e6;
+    s_map.center_lon = (double)lon_e6 / 1.0e6;
+    s_map.zoom = (int)zoom;
+    return true;
 }
 
 static bool maps_center_from_local_node()
@@ -948,7 +1016,13 @@ static bool maps_extract_node_latlon(const meshtastic_NodeInfoLite *node, double
     return true;
 }
 
-#if defined(ARCH_ESP32) && defined(CROWPANEL_DHE04005D)
+#if defined(CROWPANEL_DISABLE_MAPS)
+void maps_storage_prewarm() {}
+static bool maps_ensure_sd_mounted()
+{
+    return false;
+}
+#elif defined(ARCH_ESP32) && defined(CROWPANEL_DHE04005D)
 void maps_storage_prewarm()
 {
     if (s_map_sd_ready || s_map_sd_attempted) return;
@@ -956,6 +1030,7 @@ void maps_storage_prewarm()
     struct stat st = {};
     if (stat("/sdcard", &st) == 0 && (st.st_mode & S_IFDIR)) {
         s_map_sd_ready = true;
+        s_map_sd_own_mount = false;
         s_map_sd_mount_state = 1;
         LOG_INFO("mcui: maps SD already mounted");
         return;
@@ -969,7 +1044,7 @@ void maps_storage_prewarm()
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.slot = SDMMC_HOST_SLOT_0;
-    host.max_freq_khz = 25000;
+    host.max_freq_khz = 10000;
 
     sdmmc_slot_config_t slot_cfg = SDMMC_SLOT_CONFIG_DEFAULT();
     slot_cfg.clk = (gpio_num_t)SD_GPIO_MMC_CLK;
@@ -981,6 +1056,7 @@ void maps_storage_prewarm()
     esp_err_t err = esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot_cfg, &mount_cfg, &s_map_sd_card);
     if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
         s_map_sd_ready = true;
+        s_map_sd_own_mount = (err == ESP_OK);
         s_map_sd_mount_state = 1;
         LOG_INFO("mcui: maps SD mount ready");
     } else {
@@ -996,9 +1072,12 @@ static bool maps_ensure_sd_mounted()
     struct stat st = {};
     if (stat("/sdcard", &st) == 0 && (st.st_mode & S_IFDIR)) {
         s_map_sd_ready = true;
+        s_map_sd_own_mount = false;
         s_map_sd_mount_state = 1;
         return true;
     }
+    maps_storage_prewarm();
+    if (s_map_sd_ready) return true;
     return false;
 }
 #else
@@ -1048,6 +1127,35 @@ static bool maps_load_tile(MapTileSlot &ts, int z, int x, int y)
     return true;
 }
 
+static void maps_clear_all_tiles()
+{
+    for (int i = 0; i < kMapMaxTileSlots; i++) {
+        MapTileSlot &ts = s_map_tiles[i];
+        ts.src[0] = '\0';
+        if (ts.img) {
+            lv_image_set_src(ts.img, nullptr);
+            lv_obj_add_flag(ts.img, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (ts.placeholder)
+            lv_obj_add_flag(ts.placeholder, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void maps_storage_release()
+{
+#if defined(ARCH_ESP32) && defined(CROWPANEL_DHE04005D) && !defined(CROWPANEL_DISABLE_MAPS)
+    if (s_map_sd_own_mount && s_map_sd_card) {
+        esp_vfs_fat_sdcard_unmount("/sdcard", s_map_sd_card);
+        LOG_INFO("mcui: maps SD unmounted");
+    }
+    s_map_sd_card = nullptr;
+    s_map_sd_ready = false;
+    s_map_sd_attempted = false;
+    s_map_sd_own_mount = false;
+    s_map_sd_mount_state = 0;
+#endif
+}
+
 static void maps_hide_all_markers()
 {
     for (int i = 0; i < kMapMaxMarkerSlots; i++) {
@@ -1055,6 +1163,27 @@ static void maps_hide_all_markers()
         if (s_map_markers[i].dot) lv_obj_add_flag(s_map_markers[i].dot, LV_OBJ_FLAG_HIDDEN);
         if (s_map_markers[i].tag) lv_obj_add_flag(s_map_markers[i].tag, LV_OBJ_FLAG_HIDDEN);
     }
+}
+
+static void maps_set_marker_visibility(bool visible)
+{
+    for (int i = 0; i < kMapMaxMarkerSlots; i++) {
+        MapMarkerSlot &m = s_map_markers[i];
+        if (!m.active) continue;
+        if (m.dot) {
+            if (visible)
+                lv_obj_clear_flag(m.dot, LV_OBJ_FLAG_HIDDEN);
+            else
+                lv_obj_add_flag(m.dot, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (m.tag) {
+            if (visible)
+                lv_obj_clear_flag(m.tag, LV_OBJ_FLAG_HIDDEN);
+            else
+                lv_obj_add_flag(m.tag, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    s_map_markers_hidden = !visible;
 }
 
 static void maps_node_short_name(const meshtastic_NodeInfoLite *node, char *out, size_t out_sz)
@@ -1124,10 +1253,10 @@ static void maps_show_marker_slot(MapMarkerSlot &slot, const meshtastic_NodeInfo
     slot.active = true;
 }
 
-static void maps_draw_markers(int base_x, int base_y, int pan_w, int pan_h)
+static int maps_draw_markers(int base_x, int base_y, int pan_w, int pan_h)
 {
     maps_hide_all_markers();
-    if (!nodeDB || !s_map.pan) return;
+    if (!nodeDB || !s_map.pan) return 0;
 
     const uint32_t local_num = nodeDB->getNodeNum();
     bool local_drawn = false;
@@ -1149,14 +1278,48 @@ static void maps_draw_markers(int base_x, int base_y, int pan_w, int pan_h)
         if (maps_slot_position_from_node(local, base_x, base_y, pan_w, pan_h, &mx, &my))
             maps_show_marker_slot(s_map_markers[marker_idx], local, true, mx, my);
     }
+    return marker_idx;
 }
 
-static int maps_rebuild(bool allow_zoom_fallback)
+static bool maps_should_rebuild_after_drag()
+{
+    if (!s_map.content || !s_map.pan) return true;
+    const int view_w = lv_obj_get_width(s_map.content);
+    const int view_h = lv_obj_get_height(s_map.content);
+    const int x = lv_obj_get_x(s_map.pan);
+    const int y = lv_obj_get_y(s_map.pan);
+    const int w = lv_obj_get_width(s_map.pan);
+    const int h = lv_obj_get_height(s_map.pan);
+    if (w <= 0 || h <= 0) return true;
+
+    const bool cover_x = (x <= kMapRebuildEdgeMarginPx) && (x + w >= view_w - kMapRebuildEdgeMarginPx);
+    const bool cover_y = (y <= kMapRebuildEdgeMarginPx) && (y + h >= view_h - kMapRebuildEdgeMarginPx);
+    return !(cover_x && cover_y);
+}
+
+static void maps_schedule_marker_restore()
+{
+    s_map_marker_restore_ms = millis() + kMapMarkerRestoreDelayMs;
+}
+
+static int maps_rebuild(bool allow_zoom_fallback, bool include_markers = true)
 {
     if (!s_map.pan || !s_map.content) return 0;
+    const uint32_t start_ms = millis();
+
+    if (maps_wifi_conflicts_with_sd()) {
+        s_map_blocked_by_wifi = true;
+        maps_status_set("Maps require WiFi off");
+        maps_clear_all_tiles();
+        maps_hide_all_markers();
+        return 0;
+    }
+    s_map_blocked_by_wifi = false;
 
     if (!maps_ensure_sd_mounted()) {
-#if defined(ARCH_ESP32) && defined(CROWPANEL_DHE04005D)
+#if defined(CROWPANEL_DISABLE_MAPS)
+        maps_status_set("Maps disabled");
+#elif defined(ARCH_ESP32) && defined(CROWPANEL_DHE04005D)
         if (s_map_sd_mount_state == 2)
             maps_status_set("SD mount failed");
         else
@@ -1183,10 +1346,22 @@ static int maps_rebuild(bool allow_zoom_fallback)
     const int vis_y0 = (int)floor(origin_y / kMapTilePx);
     const int vis_x1 = (int)floor((origin_x + view_w - 1) / kMapTilePx);
     const int vis_y1 = (int)floor((origin_y + view_h - 1) / kMapTilePx);
-    const int x0 = vis_x0 - kMapTilePad;
-    const int y0 = vis_y0 - kMapTilePad;
-    const int x1 = vis_x1 + kMapTilePad;
-    const int y1 = vis_y1 + kMapTilePad;
+    const int vis_cols = vis_x1 - vis_x0 + 1;
+    const int vis_rows = vis_y1 - vis_y0 + 1;
+
+    int tile_pad = kMapDesiredTilePad;
+    while (tile_pad > 0) {
+        const int cols_try = vis_cols + 2 * tile_pad;
+        const int rows_try = vis_rows + 2 * tile_pad;
+        if (cols_try * rows_try <= kMapMaxTileSlots)
+            break;
+        tile_pad--;
+    }
+
+    const int x0 = vis_x0 - tile_pad;
+    const int y0 = vis_y0 - tile_pad;
+    const int x1 = vis_x1 + tile_pad;
+    const int y1 = vis_y1 + tile_pad;
 
     const int cols = x1 - x0 + 1;
     const int rows = y1 - y0 + 1;
@@ -1201,6 +1376,7 @@ static int maps_rebuild(bool allow_zoom_fallback)
     const int tile_max = 1 << s_map.zoom;
     int slot = 0;
     int loaded = 0;
+    int total = 0;
     for (int ty = y0; ty <= y1; ty++) {
         for (int tx = x0; tx <= x1; tx++) {
             if (slot >= kMapMaxTileSlots) continue;
@@ -1216,6 +1392,7 @@ static int maps_rebuild(bool allow_zoom_fallback)
                 lv_obj_add_flag(ts.img, LV_OBJ_FLAG_HIDDEN);
                 continue;
             }
+            total++;
 
             if (maps_load_tile(ts, s_map.zoom, tx, ty)) {
                 lv_obj_move_foreground(ts.img);
@@ -1234,19 +1411,37 @@ static int maps_rebuild(bool allow_zoom_fallback)
         if (s_map_tiles[i].placeholder) lv_obj_add_flag(s_map_tiles[i].placeholder, LV_OBJ_FLAG_HIDDEN);
     }
 
-    maps_draw_markers(x0 * kMapTilePx, y0 * kMapTilePx, pan_w, pan_h);
+    int markers = 0;
+    if (include_markers) {
+        markers = maps_draw_markers(x0 * kMapTilePx, y0 * kMapTilePx, pan_w, pan_h);
+        s_map_markers_hidden = false;
+        s_map_marker_restore_ms = 0;
+    } else {
+        maps_hide_all_markers();
+        s_map_markers_hidden = true;
+    }
 
     char status[88];
-    snprintf(status, sizeof(status), "Map z%d @ %.5f,%.5f",
-             s_map.zoom, s_map.center_lat, s_map.center_lon);
+    snprintf(status, sizeof(status), "Z%d  %d/%d tiles  %d pins",
+             s_map.zoom, loaded, total, markers);
     maps_status_set(status);
+
+    const uint32_t elapsed_ms = millis() - start_ms;
+    if (elapsed_ms > 150 && (s_map_last_diag_ms == 0 || (uint32_t)(millis() - s_map_last_diag_ms) > 5000)) {
+#if !defined(DEBUG_MUTE)
+        const size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        LOG_WARN("mcui: map rebuild slow %u ms, tiles=%d/%d, largest_internal=%u",
+                 (unsigned)elapsed_ms, loaded, total, (unsigned)largest_internal);
+#endif
+        s_map_last_diag_ms = millis();
+    }
 
     if (loaded == 0 && allow_zoom_fallback && s_map.zoom > kMapMinZoom) {
         int start_zoom = s_map.zoom;
         for (int z = start_zoom - 1; z >= kMapMinZoom; z--) {
             s_map.zoom = z;
             maps_zoom_set_label();
-            if (maps_rebuild(false) > 0) return 1;
+            if (maps_rebuild(false, include_markers) > 0) return 1;
         }
         s_map.zoom = start_zoom;
         maps_zoom_set_label();
@@ -1260,6 +1455,8 @@ static void maps_apply_drag_and_rebuild()
 {
     if (s_map.drag_dx == 0 && s_map.drag_dy == 0) return;
 
+    const double old_lat = s_map.center_lat;
+    const double old_lon = s_map.center_lon;
     double cwx = 0.0, cwy = 0.0;
     maps_latlon_to_world(s_map.center_lat, s_map.center_lon, s_map.zoom, &cwx, &cwy);
     cwx -= s_map.drag_dx;
@@ -1274,7 +1471,19 @@ static void maps_apply_drag_and_rebuild()
 
     s_map.drag_dx = 0;
     s_map.drag_dy = 0;
-    maps_rebuild(false);
+
+    if (maps_should_rebuild_after_drag()) {
+        if (maps_rebuild(false, false) <= 0) {
+            s_map.center_lat = old_lat;
+            s_map.center_lon = old_lon;
+            maps_rebuild(true, true);
+            return;
+        }
+        maps_schedule_marker_restore();
+    } else {
+        maps_set_marker_visibility(true);
+    }
+    maps_viewport_save_now();
 }
 
 static void maps_on_pressing(lv_event_t *)
@@ -1285,6 +1494,9 @@ static void maps_on_pressing(lv_event_t *)
     lv_indev_get_vect(indev, &v);
     if (v.x == 0 && v.y == 0) return;
 
+    if (!s_map_markers_hidden)
+        maps_set_marker_visibility(false);
+    s_map_marker_restore_ms = 0;
     s_map.drag_dx += v.x;
     s_map.drag_dy += v.y;
     lv_obj_set_pos(s_map.pan, lv_obj_get_x(s_map.pan) + v.x, lv_obj_get_y(s_map.pan) + v.y);
@@ -1303,7 +1515,8 @@ static void maps_zoom_delta(int delta)
     s_map.drag_dx = 0;
     s_map.drag_dy = 0;
     maps_zoom_set_label();
-    maps_rebuild(true);
+    maps_rebuild(true, true);
+    maps_viewport_save_now();
 }
 
 static void maps_btn_plus_cb(lv_event_t *) { maps_zoom_delta(+1); }
@@ -1311,7 +1524,8 @@ static void maps_btn_minus_cb(lv_event_t *) { maps_zoom_delta(-1); }
 static void maps_btn_center_cb(lv_event_t *)
 {
     if (maps_center_from_local_node()) {
-        maps_rebuild(true);
+        maps_rebuild(true, true);
+        maps_viewport_save_now();
     } else {
         maps_status_set("No local position yet");
     }
@@ -1396,7 +1610,7 @@ lv_obj_t *maps_screen_create(lv_obj_t *parent)
         s_map_markers[i].tag_label = lv_label_create(s_map_markers[i].tag);
         lv_label_set_text(s_map_markers[i].tag_label, "");
         lv_obj_set_style_text_color(s_map_markers[i].tag_label, lv_color_hex(0x000000), 0);
-        lv_obj_set_style_text_font(s_map_markers[i].tag_label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(s_map_markers[i].tag_label, MCUI_FONT_16, 0);
         lv_obj_center(s_map_markers[i].tag_label);
 
         s_map_markers[i].active = false;
@@ -1417,13 +1631,13 @@ lv_obj_t *maps_screen_create(lv_obj_t *parent)
     s_map.status = lv_label_create(topbar);
     lv_label_set_text(s_map.status, "Maps: init");
     lv_obj_set_style_text_color(s_map.status, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(s_map.status, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(s_map.status, MCUI_FONT_16, 0);
     lv_obj_align(s_map.status, LV_ALIGN_LEFT_MID, 0, 0);
 
     s_map.zoom_lbl = lv_label_create(topbar);
     lv_label_set_text(s_map.zoom_lbl, "Z11");
     lv_obj_set_style_text_color(s_map.zoom_lbl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(s_map.zoom_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(s_map.zoom_lbl, MCUI_FONT_16, 0);
     lv_obj_align(s_map.zoom_lbl, LV_ALIGN_RIGHT_MID, -6, 0);
 
     lv_obj_t *btn_plus = lv_button_create(s_map.content);
@@ -1436,7 +1650,7 @@ lv_obj_t *maps_screen_create(lv_obj_t *parent)
     lv_obj_t *plus_lbl = lv_label_create(btn_plus);
     lv_label_set_text(plus_lbl, "+");
     lv_obj_set_style_text_color(plus_lbl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(plus_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(plus_lbl, MCUI_FONT_16, 0);
     lv_obj_center(plus_lbl);
 
     lv_obj_t *btn_minus = lv_button_create(s_map.content);
@@ -1449,7 +1663,7 @@ lv_obj_t *maps_screen_create(lv_obj_t *parent)
     lv_obj_t *minus_lbl = lv_label_create(btn_minus);
     lv_label_set_text(minus_lbl, "-");
     lv_obj_set_style_text_color(minus_lbl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(minus_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(minus_lbl, MCUI_FONT_16, 0);
     lv_obj_center(minus_lbl);
 
     lv_obj_t *btn_center = lv_button_create(s_map.content);
@@ -1462,29 +1676,92 @@ lv_obj_t *maps_screen_create(lv_obj_t *parent)
     lv_obj_t *center_lbl = lv_label_create(btn_center);
     lv_label_set_text(center_lbl, LV_SYMBOL_GPS);
     lv_obj_set_style_text_color(center_lbl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(center_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(center_lbl, MCUI_FONT_16, 0);
     lv_obj_center(center_lbl);
 
     if (!s_map.initialized) {
-        maps_center_from_local_node();
+        if (!maps_viewport_load())
+            maps_center_from_local_node();
         s_map.initialized = true;
     }
     maps_zoom_set_label();
+#if defined(CROWPANEL_DISABLE_MAPS)
+    maps_status_set("Maps disabled");
+    s_map.first_render_pending = false;
+#else
     maps_status_set("Open map tab to load tiles");
     s_map.first_render_pending = true;
+#endif
     s_map.last_nodes_refresh_ms = millis();
 
     return s_map.page;
 }
 
+void maps_screen_on_show()
+{
+#if !defined(CROWPANEL_DISABLE_MAPS)
+    if (!s_map.page) return;
+    if (maps_wifi_conflicts_with_sd()) {
+        s_map.first_render_pending = false;
+        s_map_marker_restore_ms = 0;
+        if (!s_map_blocked_by_wifi) {
+            maps_clear_all_tiles();
+            maps_hide_all_markers();
+            maps_storage_release();
+        }
+        s_map_blocked_by_wifi = true;
+        maps_status_set("Maps require WiFi off");
+        return;
+    }
+    s_map_blocked_by_wifi = false;
+    s_map.first_render_pending = true;
+    s_map_marker_restore_ms = 0;
+    maps_status_set("Open map tab to load tiles");
+#endif
+}
+
+void maps_screen_on_hide()
+{
+#if !defined(CROWPANEL_DISABLE_MAPS)
+    s_map.drag_dx = 0;
+    s_map.drag_dy = 0;
+    s_map_marker_restore_ms = 0;
+    maps_hide_all_markers();
+    maps_clear_all_tiles();
+    maps_storage_release();
+#endif
+}
+
 void maps_screen_tick()
 {
+#if defined(CROWPANEL_DISABLE_MAPS)
+    return;
+#else
     if (!s_map.page || !s_map.pan) return;
 
     uint32_t now = millis();
+    if (maps_wifi_conflicts_with_sd()) {
+        if (!s_map_blocked_by_wifi) {
+            maps_screen_on_hide();
+            s_map_blocked_by_wifi = true;
+        }
+        maps_status_set("Maps require WiFi off");
+        s_map.first_render_pending = false;
+        s_map.last_nodes_refresh_ms = now;
+        return;
+    }
+    s_map_blocked_by_wifi = false;
+
     if (s_map.first_render_pending) {
         s_map.first_render_pending = false;
-        maps_rebuild(true);
+        maps_rebuild(true, true);
+        s_map.last_nodes_refresh_ms = now;
+        return;
+    }
+
+    if (s_map_marker_restore_ms != 0 && (int32_t)(now - s_map_marker_restore_ms) >= 0) {
+        s_map_marker_restore_ms = 0;
+        maps_rebuild(false, true);
         s_map.last_nodes_refresh_ms = now;
         return;
     }
@@ -1492,9 +1769,10 @@ void maps_screen_tick()
     if ((uint32_t)(now - s_map.last_nodes_refresh_ms) >= kMapNodeRefreshMs) {
         s_map.last_nodes_refresh_ms = now;
         if (s_map.drag_dx == 0 && s_map.drag_dy == 0) {
-            maps_rebuild(false);
+            maps_rebuild(false, true);
         }
     }
+#endif
 }
 
 }

@@ -10,12 +10,15 @@
 #include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <lvgl.h>
 
 namespace mcui {
 
 static volatile bool s_dirty = false;
 static uint32_t s_last_save_ms = 0;
+static uint32_t s_save_retry_after_ms = 0;
 static constexpr uint32_t PERSIST_MIN_INTERVAL_MS = 2000;
+static constexpr uint32_t PERSIST_OOM_RETRY_MS = 30000;
 static const char *PERSIST_PATH = "/prefs/mcui_msgs.bin";
 static constexpr uint32_t PERSIST_MAGIC = 0x4D43554D;
 
@@ -33,6 +36,75 @@ static ConvEntry *s_convs = nullptr;
 static int s_num_convs = 0;
 static SemaphoreHandle_t s_lock = nullptr;
 static volatile uint32_t s_change_tick = 0;
+
+static bool utf8_decode_one(const unsigned char *s, size_t len, size_t *used)
+{
+    if (!s || len == 0 || !used)
+        return false;
+
+    const unsigned char c0 = s[0];
+    if (c0 < 0x80) {
+        *used = 1;
+        return true;
+    }
+    if (c0 < 0xC2)
+        return false;
+
+    uint32_t cp = 0;
+    size_t need = 0;
+    if ((c0 & 0xE0) == 0xC0) {
+        need = 2;
+        cp = c0 & 0x1F;
+    } else if ((c0 & 0xF0) == 0xE0) {
+        need = 3;
+        cp = c0 & 0x0F;
+    } else if ((c0 & 0xF8) == 0xF0) {
+        need = 4;
+        cp = c0 & 0x07;
+    } else {
+        return false;
+    }
+    if (len < need)
+        return false;
+    for (size_t i = 1; i < need; i++) {
+        if ((s[i] & 0xC0) != 0x80)
+            return false;
+        cp = (cp << 6) | (s[i] & 0x3F);
+    }
+    if ((need == 3 && cp < 0x800) || (need == 4 && cp < 0x10000))
+        return false;
+    if (cp >= 0xD800 && cp <= 0xDFFF)
+        return false;
+    if (cp > 0x10FFFF)
+        return false;
+    *used = need;
+    return true;
+}
+
+static void sanitize_utf8_in_place(char *text, size_t cap)
+{
+    if (!text || cap == 0)
+        return;
+
+    char clean[sizeof(((McMessage *)nullptr)->text)] = {};
+    size_t out = 0;
+    const unsigned char *src = reinterpret_cast<const unsigned char *>(text);
+    const size_t in_len = strnlen(text, cap - 1);
+    for (size_t in = 0; in < in_len && out + 1 < sizeof(clean);) {
+        size_t used = 0;
+        if (utf8_decode_one(src + in, in_len - in, &used) && out + used < sizeof(clean)) {
+            memcpy(clean + out, src + in, used);
+            out += used;
+            in += used;
+        } else {
+            clean[out++] = '?';
+            in++;
+        }
+    }
+    clean[out] = '\0';
+    strncpy(text, clean, cap - 1);
+    text[cap - 1] = '\0';
+}
 
 static ConvEntry *find_or_create_locked(const McConvId &id)
 {
@@ -72,16 +144,23 @@ void messages_init()
     if (!s_convs) {
         size_t bytes = sizeof(ConvEntry) * MC_MAX_CONVERSATIONS;
 
-        s_convs = (ConvEntry *)heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (!s_convs) {
-            s_convs = (ConvEntry *)heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL);
-        }
+        // Keep the chat ring out of internal/DMA RAM. On CrowPanel P4 that RAM
+        // is needed by ESP-Hosted/WPA AES while public MQTT downlink is active.
+        // LVGL's heap is a fixed PSRAM pool, so this does not touch the
+        // framebuffer-corrupted system PSRAM allocator at runtime.
+        s_convs = (ConvEntry *)lv_malloc(bytes);
         if (!s_convs) {
             LOG_ERROR("mcui: failed to allocate %u bytes for message store",
                       (unsigned)bytes);
             return;
         }
         memset(s_convs, 0, bytes);
+#if defined(CROWPANEL_DHE04005D)
+        LOG_WARN("mcui: message store uses LVGL heap (%u bytes); internal8 free=%u largest=%u",
+                 (unsigned)bytes,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+#endif
     }
     s_num_convs = 0;
     s_change_tick = 0;
@@ -94,10 +173,14 @@ void messages_init()
 void messages_append(const McConvId &id, const McMessage &msg)
 {
     if (!s_lock || !s_convs) return;
+    McMessage safe = msg;
+    safe.text[sizeof(safe.text) - 1] = '\0';
+    sanitize_utf8_in_place(safe.text, sizeof(safe.text));
+
     xSemaphoreTake(s_lock, portMAX_DELAY);
     ConvEntry *c = find_or_create_locked(id);
     if (c) {
-        c->ring[c->head] = msg;
+        c->ring[c->head] = safe;
         c->head = (c->head + 1) % MC_MAX_MSGS_PER_CONV;
         if (c->count < MC_MAX_MSGS_PER_CONV) c->count++;
         if (!msg.outgoing) c->unread++;
@@ -349,8 +432,9 @@ void messages_save()
         total += (size_t)c->count * sizeof(McMessage);
     }
 
-    uint8_t *buf = (uint8_t *)heap_caps_malloc(total, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    uint8_t *buf = (uint8_t *)lv_malloc(total);
     if (!buf) {
+        s_save_retry_after_ms = millis() + PERSIST_OOM_RETRY_MS;
         xSemaphoreGive(s_lock);
         LOG_ERROR("mcui: messages_save: OOM (%u bytes)", (unsigned)total);
         return;
@@ -390,13 +474,13 @@ void messages_save()
     auto f = FSCom.open(tmp, FILE_O_WRITE);
     if (!f) {
         LOG_ERROR("mcui: messages_save: cannot open %s for write", tmp);
-        free(buf);
+        lv_free(buf);
 
         return;
     }
     size_t written = f.write(buf, total);
     f.close();
-    free(buf);
+    lv_free(buf);
 
     if (written != total) {
         LOG_ERROR("mcui: messages_save: short write %u/%u", (unsigned)written, (unsigned)total);
@@ -412,9 +496,10 @@ void messages_save()
     if (s_change_tick == snapshot_tick) {
         s_dirty = false;
     }
+    s_save_retry_after_ms = 0;
     xSemaphoreGive(s_lock);
 
-    LOG_INFO("mcui: saved %u bytes of chat history", (unsigned)total);
+    LOG_DEBUG("mcui: saved %u bytes of chat history", (unsigned)total);
 #endif
 }
 
@@ -436,7 +521,7 @@ void messages_load()
             f.close();
             return;
         }
-        buf = (uint8_t *)heap_caps_malloc(total, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        buf = (uint8_t *)lv_malloc(total);
         if (!buf) {
             LOG_ERROR("mcui: messages_load: OOM (%u bytes)", (unsigned)total);
             f.close();
@@ -446,7 +531,7 @@ void messages_load()
         f.close();
         if (got != total) {
             LOG_WARN("mcui: messages_load: short read %u/%u", (unsigned)got, (unsigned)total);
-            free(buf);
+            lv_free(buf);
             return;
         }
     }
@@ -455,13 +540,13 @@ void messages_load()
     uint8_t *end = buf + total;
     auto need = [&](size_t n) { return (size_t)(end - p) >= n; };
 
-    if (!need(8)) { free(buf); return; }
+    if (!need(8)) { lv_free(buf); return; }
     uint32_t magic; memcpy(&magic, p, 4); p += 4;
     uint16_t ver;   memcpy(&ver,   p, 2); p += 2;
     uint16_t nconv; memcpy(&nconv, p, 2); p += 2;
     if (magic != PERSIST_MAGIC || ver != PERSIST_VERSION) {
         LOG_WARN("mcui: messages_load: magic/version mismatch %08x/%u", (unsigned)magic, (unsigned)ver);
-        free(buf);
+        lv_free(buf);
         return;
     }
 
@@ -491,7 +576,7 @@ void messages_load()
     s_change_tick++;
     s_dirty = false;
     xSemaphoreGive(s_lock);
-    free(buf);
+    lv_free(buf);
 
     LOG_INFO("mcui: loaded %u conversations from flash", (unsigned)s_num_convs);
 #endif
@@ -501,6 +586,7 @@ void messages_save_tick()
 {
     if (!s_dirty) return;
     uint32_t now = millis();
+    if (s_save_retry_after_ms != 0 && (int32_t)(s_save_retry_after_ms - now) > 0) return;
     if (s_last_save_ms != 0 && (now - s_last_save_ms) < PERSIST_MIN_INTERVAL_MS) return;
     s_last_save_ms = now;
     messages_save();
