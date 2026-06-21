@@ -17,6 +17,7 @@ void mesh_send_zero_hop_advert(int delay_ms);
 uint32_t mesh_send_discover_repeaters();
 void mesh_rename_if_non_empty(const char* name);
 int  mesh_join_hashtag_channel(const String& raw);
+int  mesh_join_private_channel(const String& name, const String& hex_key);
 void mesh_purge_contacts_and_repeaters();
 int  mesh_current_channel_idx();
 bool mesh_select_contact_by_pubkey(const uint8_t* pub_key);
@@ -44,8 +45,8 @@ struct _lv_obj_t;
 bool mesh_resend_pm_by_bubble_label(struct _lv_obj_t* status_label);
 const char* mesh_get_node_name();
 void mesh_get_fixed_position(double* lat, double* lon);
-void mesh_set_fixed_position(double lat, double lon);
-void mesh_clear_fixed_position();
+bool mesh_set_fixed_position(double lat, double lon);
+bool mesh_clear_fixed_position();
 
 void mesh_populate_repeater_list();
 

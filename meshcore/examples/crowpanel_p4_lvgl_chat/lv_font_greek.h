@@ -27,6 +27,15 @@ extern lv_font_t lv_font_greek_18;
 extern lv_font_t lv_font_greek_20;
 extern lv_font_t lv_font_greek_22;
 
+// German/Latin supplement fonts (generated from DejaVu Sans)
+extern lv_font_t lv_font_latin_de_10;
+extern lv_font_t lv_font_latin_de_12;
+extern lv_font_t lv_font_latin_de_14;
+extern lv_font_t lv_font_latin_de_16;
+extern lv_font_t lv_font_latin_de_18;
+extern lv_font_t lv_font_latin_de_20;
+extern lv_font_t lv_font_latin_de_22;
+
 // Writable font copies (Montserrat + Greek fallback)
 extern lv_font_t lv_font_mg_10;
 extern lv_font_t lv_font_mg_12;

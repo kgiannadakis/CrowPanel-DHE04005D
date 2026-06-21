@@ -1,7 +1,7 @@
-// lv_font_greek_init.c — Reversed font chain with color-emoji tail
+// lv_font_greek_init.c — Reversed font chain with Latin/emoji tail
 //
 // Chain semantics (primary -> fallback -> fallback ...):
-//   lv_font_mg_XX  =  Greek_XX  ->  emoji_color(size-appropriate)  ->  Montserrat_XX
+//   lv_font_mg_XX  =  Greek_XX  ->  German Latin  ->  emoji_color(size-appropriate)  ->  Montserrat_XX
 //
 // Greek is primary because in some LVGL builds Montserrat has partial
 // Greek coverage with wrong glyphs; leaving Montserrat primary broke
@@ -31,6 +31,15 @@ extern lv_font_t lv_font_greek_16;
 extern lv_font_t lv_font_greek_18;
 extern lv_font_t lv_font_greek_20;
 extern lv_font_t lv_font_greek_22;
+
+// German Latin supplement fonts (generated from DejaVu Sans)
+extern lv_font_t lv_font_latin_de_10;
+extern lv_font_t lv_font_latin_de_12;
+extern lv_font_t lv_font_latin_de_14;
+extern lv_font_t lv_font_latin_de_16;
+extern lv_font_t lv_font_latin_de_18;
+extern lv_font_t lv_font_latin_de_20;
+extern lv_font_t lv_font_latin_de_22;
 
 // Writable emoji-font copies. lv_imgfont_create returns an
 // lv_font_t* with NO metrics -- we adjust line_height / base_line
@@ -92,6 +101,13 @@ static lv_font_t * emoji_link(lv_font_t * out, lv_font_t * imgfont,
     return out;
 }
 
+// Insert the tiny German Latin supplement before the rest of the chain.
+static lv_font_t * latin_de_link(lv_font_t * latin, lv_font_t * next) {
+    adopt_metrics(latin, next);
+    latin->fallback = next;
+    return latin;
+}
+
 // Assemble the final chain for one size.
 // Greek gets its line metrics set to Montserrat's so multi-font
 // labels layout consistently; its fallback points at the
@@ -114,31 +130,38 @@ void lv_font_greek_init(void) {
     lv_font_t * const imgfont_small = g_emoji_font_small;
     lv_font_t * const imgfont_big   = g_emoji_font_big;
 
-    // 10 pt: Greek -> Montserrat (no emoji; too small to render usefully)
-    setup_font(&lv_font_mg_10, &lv_font_greek_10, (lv_font_t *)&lv_font_montserrat_10);
+    // 10 pt: Greek -> German Latin -> Montserrat (no emoji; too small to render usefully)
+    setup_font(&lv_font_mg_10, &lv_font_greek_10,
+               latin_de_link(&lv_font_latin_de_10, (lv_font_t *)&lv_font_montserrat_10));
 
-    // 12 pt: Greek -> emoji(small) -> Montserrat
+    // 12 pt: Greek -> German Latin -> emoji(small) -> Montserrat
     setup_font(&lv_font_mg_12, &lv_font_greek_12,
-               emoji_link(&s_emoji_12, imgfont_small, &lv_font_montserrat_12));
+               latin_de_link(&lv_font_latin_de_12,
+                             emoji_link(&s_emoji_12, imgfont_small, &lv_font_montserrat_12)));
 
-    // 14 pt: Greek -> emoji(small) -> Montserrat  (keyboard default)
+    // 14 pt: Greek -> German Latin -> emoji(small) -> Montserrat  (keyboard default)
     setup_font(&lv_font_mg_14, &lv_font_greek_14,
-               emoji_link(&s_emoji_14, imgfont_small, &lv_font_montserrat_14));
+               latin_de_link(&lv_font_latin_de_14,
+                             emoji_link(&s_emoji_14, imgfont_small, &lv_font_montserrat_14)));
 
-    // 16 pt: Greek -> emoji(small) -> Montserrat  (chat body)
+    // 16 pt: Greek -> German Latin -> emoji(small) -> Montserrat  (chat body)
     setup_font(&lv_font_mg_16, &lv_font_greek_16,
-               emoji_link(&s_emoji_16, imgfont_small, &lv_font_montserrat_16));
+               latin_de_link(&lv_font_latin_de_16,
+                             emoji_link(&s_emoji_16, imgfont_small, &lv_font_montserrat_16)));
 
-    // 18 pt: Greek -> emoji(small) -> Montserrat  (section headers)
+    // 18 pt: Greek -> German Latin -> emoji(small) -> Montserrat  (section headers)
     setup_font(&lv_font_mg_18, &lv_font_greek_18,
-               emoji_link(&s_emoji_18, imgfont_small, &lv_font_montserrat_18));
+               latin_de_link(&lv_font_latin_de_18,
+                             emoji_link(&s_emoji_18, imgfont_small, &lv_font_montserrat_18)));
 
-    // 20 pt (chat header title): Greek -> emoji(big) -> Montserrat
+    // 20 pt (chat header title): Greek -> German Latin -> emoji(big) -> Montserrat
     setup_font(&lv_font_mg_20, &lv_font_greek_20,
-               emoji_link(&s_emoji_20, imgfont_big, &lv_font_montserrat_20));
+               latin_de_link(&lv_font_latin_de_20,
+                             emoji_link(&s_emoji_20, imgfont_big, &lv_font_montserrat_20)));
 
-    // 22 pt: Greek -> Montserrat (rarely used; skip emoji to keep metrics clean)
-    setup_font(&lv_font_mg_22, &lv_font_greek_22, (lv_font_t *)&lv_font_montserrat_22);
+    // 22 pt: Greek -> German Latin -> Montserrat (rarely used; skip emoji to keep metrics clean)
+    setup_font(&lv_font_mg_22, &lv_font_greek_22,
+               latin_de_link(&lv_font_latin_de_22, (lv_font_t *)&lv_font_montserrat_22));
 
     // Plain (no-fallback) copies of raw Montserrat for text-heavy
     // ASCII-only widgets. This file does NOT include lv_font_greek.h,

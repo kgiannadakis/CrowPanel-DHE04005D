@@ -28,6 +28,7 @@
 #include "ui_homescreen.h"
 #include "repeater_ui.h"
 
+#include <Arduino.h>
 #include <cstring>
 
 #include <esp_err.h>
@@ -35,6 +36,7 @@
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_rgb.h>
 #include <esp_log.h>
+#include <esp_task_wdt.h>
 #include <esp_timer.h>
 #include <driver/ppa.h>
 
@@ -379,7 +381,10 @@ static void lvgl_task(void*) {
 }
 
 bool display_init(void) {
+  Serial.println("display_init: direct esp_lcd RGB path");
+  Serial.flush();
   ESP_LOGI(TAG, "esp_lcd_new_rgb_panel()");
+  esp_task_wdt_reset();
 
   esp_lcd_rgb_panel_config_t cfg = {};
   cfg.data_width       = 16;
@@ -434,17 +439,34 @@ bool display_init(void) {
   esp_err_t err = esp_lcd_new_rgb_panel(&cfg, &s_panel);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "esp_lcd_new_rgb_panel failed: %d", (int)err);
+    Serial.printf("display_init: esp_lcd_new_rgb_panel failed: %d\n", (int)err);
     return false;
   }
+  Serial.println("display_init: RGB panel handle created");
+  Serial.flush();
+  esp_task_wdt_reset();
+
   esp_lcd_panel_reset(s_panel);
+  Serial.println("display_init: panel reset done");
+  Serial.flush();
+  esp_task_wdt_reset();
+
   esp_lcd_panel_init(s_panel);
+  Serial.println("display_init: panel init done");
+  Serial.flush();
+  esp_task_wdt_reset();
 
   void* raw_fbs[kFrameBufferMax] = {};
   err = esp_lcd_rgb_panel_get_frame_buffer(s_panel, cfg.num_fbs, &raw_fbs[0], &raw_fbs[1], &raw_fbs[2]);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "esp_lcd_rgb_panel_get_frame_buffer failed: %d", (int)err);
+    Serial.printf("display_init: get framebuffer failed: %d\n", (int)err);
     return false;
   }
+  Serial.printf("display_init: framebuffers ready count=%d fb0=%p fb1=%p\n",
+                (int)cfg.num_fbs, raw_fbs[0], raw_fbs[1]);
+  Serial.flush();
+  esp_task_wdt_reset();
 
   s_panel_fb_count = cfg.num_fbs;
   for (size_t i = 0; i < s_panel_fb_count; ++i) {

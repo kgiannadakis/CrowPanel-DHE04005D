@@ -12,6 +12,7 @@
 #include "repeater_ui.h"
 #include "features_ui.h"
 #include "app_globals.h"
+#include "lv_font_greek.h"
 
 #include <extra/widgets/keyboard/lv_keyboard.h>
 
@@ -104,6 +105,24 @@ static lv_color_t *buf0, *buf1;
 #define _KB_CTRL (LV_BTNMATRIX_CTRL_NO_REPEAT | LV_BTNMATRIX_CTRL_CLICK_TRIG | LV_BTNMATRIX_CTRL_CHECKED)
 #define _KB_SHFT (LV_BTNMATRIX_CTRL_NO_REPEAT | LV_BTNMATRIX_CTRL_CHECKABLE | 2)
 
+enum {
+  KB_LANG_EN = 0,
+  KB_LANG_EL = 1,
+  KB_LANG_DE = 2
+};
+
+static void kb_set_language(uint8_t lang) {
+  g_kb_lang = lang;
+  g_kb_greek = (lang == KB_LANG_EL);
+}
+
+#define KB_DE_A_LC "\xC3\xA4"
+#define KB_DE_O_LC "\xC3\xB6"
+#define KB_DE_U_LC "\xC3\xBC"
+#define KB_DE_A_UC "\xC3\x84"
+#define KB_DE_O_UC "\xC3\x96"
+#define KB_DE_U_UC "\xC3\x9C"
+
 static const char * const kb_en_lc[] = {
     "1","2","3","4","5","6","7","8","9","0", LV_SYMBOL_BACKSPACE, "\n",
     "q","w","e","r","t","y","u","i","o","p", "\n",
@@ -118,19 +137,33 @@ static const char * const kb_en_uc[] = {
     "Z","X","C","V","B","N","M",".",",","!", "\n",
     "Aa","EL","1#"," ","?", LV_SYMBOL_OK, ""
 };
+static const char * const kb_de_lc[] = {
+    "1","2","3","4","5","6","7","8","9","0", "\n",
+    "q","w","e","r","t","z","u","i","o","p",KB_DE_U_LC, "\n",
+    "a","s","d","f","g","h","j","k","l",KB_DE_O_LC,KB_DE_A_LC, "\n",
+    "y","x","c","v","b","n","m", LV_SYMBOL_BACKSPACE, "\n",
+    "Aa","EN","1#"," ","?", LV_SYMBOL_OK, ""
+};
+static const char * const kb_de_uc[] = {
+    "1","2","3","4","5","6","7","8","9","0", "\n",
+    "Q","W","E","R","T","Z","U","I","O","P",KB_DE_U_UC, "\n",
+    "A","S","D","F","G","H","J","K","L",KB_DE_O_UC,KB_DE_A_UC, "\n",
+    "Y","X","C","V","B","N","M", LV_SYMBOL_BACKSPACE, "\n",
+    "Aa","EN","1#"," ","?", LV_SYMBOL_OK, ""
+};
 static const char * const kb_gr_lc[] = {
     "1","2","3","4","5","6","7","8","9","0", LV_SYMBOL_BACKSPACE, "\n",
     ";","\xCF\x82","\xCE\xB5","\xCF\x81","\xCF\x84","\xCF\x85","\xCE\xB8","\xCE\xB9","\xCE\xBF","\xCF\x80", "\n",
     "\xCE\xB1","\xCF\x83","\xCE\xB4","\xCF\x86","\xCE\xB3","\xCE\xB7","\xCE\xBE","\xCE\xBA","\xCE\xBB", LV_SYMBOL_NEW_LINE, "\n",
     "\xCE\xB6","\xCF\x87","\xCF\x88","\xCF\x89","\xCE\xB2","\xCE\xBD","\xCE\xBC",".",",","!", "\n",
-    "Aa","EN","1#"," ","?", LV_SYMBOL_OK, ""
+    "Aa","DE","1#"," ","?", LV_SYMBOL_OK, ""
 };
 static const char * const kb_gr_uc[] = {
     "1","2","3","4","5","6","7","8","9","0", LV_SYMBOL_BACKSPACE, "\n",
     ":","\xCE\xA3","\xCE\x95","\xCE\xA1","\xCE\xA4","\xCE\xA5","\xCE\x98","\xCE\x99","\xCE\x9F","\xCE\xA0", "\n",
     "\xCE\x91","\xCE\xA3","\xCE\x94","\xCE\xA6","\xCE\x93","\xCE\x97","\xCE\x9E","\xCE\x9A","\xCE\x9B", LV_SYMBOL_NEW_LINE, "\n",
     "\xCE\x96","\xCE\xA7","\xCE\xA8","\xCE\xA9","\xCE\x92","\xCE\x9D","\xCE\x9C",".",",","!", "\n",
-    "Aa","EN","1#"," ","?", LV_SYMBOL_OK, ""
+    "Aa","DE","1#"," ","?", LV_SYMBOL_OK, ""
 };
 
 static const lv_btnmatrix_ctrl_t kb_ctrl_lc[] = {
@@ -145,6 +178,20 @@ static const lv_btnmatrix_ctrl_t kb_ctrl_uc[] = {
     _KB_LC,_KB_LC,_KB_LC,_KB_LC,_KB_LC,_KB_LC,_KB_LC,_KB_LC,_KB_LC,_KB_LC,
     _KB_SM,_KB_SM,_KB_SM,_KB_SM,_KB_SM,_KB_SM,_KB_SM,_KB_SM,_KB_SM, LV_BTNMATRIX_CTRL_CHECKED|7,
     _KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,
+    _KB_SHFT|LV_BTNMATRIX_CTRL_CHECKED, _KB_CTRL, _KB_CTRL, LV_BTNMATRIX_CTRL_NO_REPEAT|5, _KB_N, _KB_CTRL|2
+};
+static const lv_btnmatrix_ctrl_t kb_ctrl_de_lc[] = {
+    _KB_N,_KB_N,_KB_N,_KB_N,_KB_N,_KB_N,_KB_N,_KB_N,_KB_N,_KB_N,
+    _KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,
+    _KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,
+    _KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS, LV_BTNMATRIX_CTRL_CHECKED|2,
+    _KB_SHFT, _KB_CTRL, _KB_CTRL, LV_BTNMATRIX_CTRL_NO_REPEAT|5, _KB_N, _KB_CTRL|2
+};
+static const lv_btnmatrix_ctrl_t kb_ctrl_de_uc[] = {
+    _KB_N,_KB_N,_KB_N,_KB_N,_KB_N,_KB_N,_KB_N,_KB_N,_KB_N,_KB_N,
+    _KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,
+    _KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,
+    _KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS,_KB_XS, LV_BTNMATRIX_CTRL_CHECKED|2,
     _KB_SHFT|LV_BTNMATRIX_CTRL_CHECKED, _KB_CTRL, _KB_CTRL, LV_BTNMATRIX_CTRL_NO_REPEAT|5, _KB_N, _KB_CTRL|2
 };
 
@@ -205,9 +252,13 @@ static const lv_btnmatrix_ctrl_t kb_ctrl_emoji[] = {
 // ---- Keyboard functions ----
 void kb_apply_language(lv_obj_t* kb) {
   if (!kb) return;
-  if (g_kb_greek) {
+  if (g_kb_greek && g_kb_lang != KB_LANG_EL) g_kb_lang = KB_LANG_EL;
+  if (g_kb_lang == KB_LANG_EL) {
     lv_keyboard_set_map(kb, LV_KEYBOARD_MODE_TEXT_LOWER, (const char**)kb_gr_lc, kb_ctrl_lc);
     lv_keyboard_set_map(kb, LV_KEYBOARD_MODE_TEXT_UPPER, (const char**)kb_gr_uc, kb_ctrl_uc);
+  } else if (g_kb_lang == KB_LANG_DE) {
+    lv_keyboard_set_map(kb, LV_KEYBOARD_MODE_TEXT_LOWER, (const char**)kb_de_lc, kb_ctrl_de_lc);
+    lv_keyboard_set_map(kb, LV_KEYBOARD_MODE_TEXT_UPPER, (const char**)kb_de_uc, kb_ctrl_de_uc);
   } else {
     lv_keyboard_set_map(kb, LV_KEYBOARD_MODE_TEXT_LOWER, (const char**)kb_en_lc, kb_ctrl_lc);
     lv_keyboard_set_map(kb, LV_KEYBOARD_MODE_TEXT_UPPER, (const char**)kb_en_uc, kb_ctrl_uc);
@@ -215,6 +266,17 @@ void kb_apply_language(lv_obj_t* kb) {
   lv_keyboard_set_map(kb, LV_KEYBOARD_MODE_SPECIAL, (const char**)custom_kb_map_sym, custom_kb_ctrl_sym);
   // Emoji page 1 as default
   lv_keyboard_set_map(kb, LV_KEYBOARD_MODE_NUMBER, (const char**)kb_emoji_1, kb_ctrl_emoji);
+}
+
+static void kb_apply_language_all(lv_obj_t* active_kb) {
+  lv_obj_t* keyboards[] = { ui_Keyboard1, ui_Keyboard2, ui_Keyboard3, ui_FeaturesKB };
+  for (lv_obj_t* candidate : keyboards) {
+    if (candidate) kb_apply_language(candidate);
+  }
+  if (active_kb) {
+    lv_keyboard_set_mode(active_kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+    lv_obj_invalidate(active_kb);
+  }
 }
 
 static void cb_kb_value_changed(lv_event_t* e) {
@@ -253,23 +315,18 @@ static void cb_kb_value_changed(lv_event_t* e) {
         return;
     }
     if (strcmp(txt, "EL") == 0) {
-        g_kb_greek = true;
-        kb_apply_language(kb);
-        if (kb != ui_Keyboard1 && ui_Keyboard1) kb_apply_language(ui_Keyboard1);
-        if (kb != ui_Keyboard2 && ui_Keyboard2) kb_apply_language(ui_Keyboard2);
-        if (kb != ui_Keyboard3 && ui_Keyboard3) kb_apply_language(ui_Keyboard3);
-        if (kb != ui_FeaturesKB && ui_FeaturesKB) kb_apply_language(ui_FeaturesKB);
-        lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+        kb_set_language(KB_LANG_EL);
+        kb_apply_language_all(kb);
+        return;
+    }
+    if (strcmp(txt, "DE") == 0) {
+        kb_set_language(KB_LANG_DE);
+        kb_apply_language_all(kb);
         return;
     }
     if (strcmp(txt, "EN") == 0) {
-        g_kb_greek = false;
-        kb_apply_language(kb);
-        if (kb != ui_Keyboard1 && ui_Keyboard1) kb_apply_language(ui_Keyboard1);
-        if (kb != ui_Keyboard2 && ui_Keyboard2) kb_apply_language(ui_Keyboard2);
-        if (kb != ui_Keyboard3 && ui_Keyboard3) kb_apply_language(ui_Keyboard3);
-        if (kb != ui_FeaturesKB && ui_FeaturesKB) kb_apply_language(ui_FeaturesKB);
-        lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+        kb_set_language(KB_LANG_EN);
+        kb_apply_language_all(kb);
         return;
     }
 
@@ -349,6 +406,7 @@ void kb_hide(lv_obj_t* kb, lv_obj_t* ta) {
 
 void kb_show(lv_obj_t* kb, lv_obj_t* ta) {
   if (!kb || !ta) return;
+  kb_apply_language(kb);
   lv_keyboard_set_textarea(kb, ta);
   lv_obj_clear_flag(kb, LV_OBJ_FLAG_HIDDEN);
   lv_obj_move_foreground(kb);

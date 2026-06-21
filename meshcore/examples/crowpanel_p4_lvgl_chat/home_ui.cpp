@@ -9,6 +9,7 @@
 #include "display.h"
 #include "app_globals.h"
 #include "mesh_api.h"
+#include "settings_cb.h"
 
 #include "ui.h"
 #include "ui_homescreen.h"
@@ -516,6 +517,7 @@ void enter_chat_mode(TargetKind kind, int ch_idx, const uint8_t* pub_key) {
   if (ui_textsendtype) {
     lv_obj_clear_flag(ui_textsendtype, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_y(ui_textsendtype, TEXTSEND_Y_DEFAULT);
+    textsend_counter_show();
   }
   // Wire the keyboard to the text field so once the user taps and the
   // keyboard appears, typing routes to ui_textsendtype without a
@@ -546,6 +548,7 @@ void exit_chat_mode() {
     lv_obj_set_y(ui_textsendtype, TEXTSEND_Y_DEFAULT);
     lv_obj_add_flag(ui_textsendtype, LV_OBJ_FLAG_HIDDEN);
   }
+  textsend_counter_hide();
   if (ui_backbutton) lv_obj_add_flag(ui_backbutton, LV_OBJ_FLAG_HIDDEN);
   if (ui_mutebutton) lv_obj_add_flag(ui_mutebutton, LV_OBJ_FLAG_HIDDEN);
   if (g_chat_header_label) { lv_obj_del(g_chat_header_label); g_chat_header_label = nullptr; }

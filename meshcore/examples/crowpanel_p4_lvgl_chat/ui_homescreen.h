@@ -18,6 +18,7 @@ extern lv_obj_t * ui_mutebutton;
 extern lv_obj_t * ui_mutelabel;
 extern lv_obj_t * ui_searchfield;
 extern lv_obj_t * ui_textsendtype;
+extern lv_obj_t * ui_textsend_counter;
 extern lv_obj_t * ui_backbutton;
 extern lv_obj_t * ui_backlabel;
 extern lv_obj_t * ui_timelabel;

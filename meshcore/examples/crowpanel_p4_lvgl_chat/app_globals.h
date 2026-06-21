@@ -118,7 +118,7 @@ static const uint8_t REQ_TYPE_GET_PKT_RECEIPT = 0x08;
 #define FLOOD_SEND_TIMEOUT_FACTOR         20.0f
 #define DIRECT_SEND_PERHOP_FACTOR         6.0f
 #define DIRECT_SEND_PERHOP_EXTRA_MILLIS   250
-#define TEXTSEND_MAX_CHARS                150
+#define TEXTSEND_MAX_CHARS                139
 #define PUBLIC_GROUP_PSK  "izOH6cXN6mrJ5e26oRXNcg=="
 
 // Layout constants are declared in ui_theme.h (C linkage)
@@ -228,6 +228,10 @@ extern bool g_auto_contact_enabled;
 extern bool g_auto_repeater_enabled;
 extern bool g_packet_forward_enabled;
 extern bool g_position_advert_enabled;
+extern bool g_fixed_position_valid;
+extern bool g_fixed_position_apply_pending;
+extern double g_fixed_position_lat;
+extern double g_fixed_position_lon;
 extern bool g_auto_translate_enabled;
 extern int  g_translate_lang_idx;
 extern uint8_t g_text_header_bytes;  // 1..3
@@ -349,6 +353,7 @@ extern lv_obj_t* g_pkt_fwd_btn;
 
 // Keyboard
 extern bool g_kb_greek;
+extern uint8_t g_kb_lang;
 
 // Confirm action
 enum class ConfirmAction : uint8_t { NONE=0, PURGE_DATA=4 };

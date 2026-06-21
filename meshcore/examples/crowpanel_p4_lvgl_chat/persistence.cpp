@@ -6,12 +6,14 @@
 #include "app_globals.h"
 #include "utils.h"
 #include <vector>
+#include <new>
 #if defined(ESP32)
 #include <esp_task_wdt.h>
 #endif
 #include "chat_ui.h"
 #include "settings_cb.h"
 #include "translate.h"
+#include <math.h>
 
 #include "ui_homescreen.h"
 
@@ -414,13 +416,16 @@ void update_tx_status_by_msg_ts(const String& key, uint32_t msg_ts, char status)
 #endif
 }
 
-// Maximum messages held in the in-memory ring while loading a chat.
-// Bumped from 30 to 2000 so a chat shows ~7 days of history even on busy
-// channels (the on-disk file is already pruned to that window by
-// kChatHistoryKeepSeconds, so this is effectively "show everything we
-// kept"). The ring is allocated on the heap (see std::vector below) so
-// the larger size does not blow the LVGL/loop task stack.
-static const int MAX_DISPLAY_MESSAGES = 2000;
+// Maximum messages rendered when opening a chat. Disk history still keeps
+// the full 7-day window below; this only bounds how many LVGL bubble trees
+// are created at once. Rendering thousands of messages can exhaust internal
+// heap and abort while opening a busy channel. Keep this intentionally
+// modest: chat entry is a latency-sensitive path, and each message can
+// create several LVGL objects.
+static const int MAX_DISPLAY_MESSAGES = 96;
+static const int kBackfillTranslateHistoryLimit = 48;
+static const size_t kChatTailReadChunk = 2048;
+static const size_t kPruneOnOpenMaxBytes = 64 * 1024;
 
 // Time-based retention: keep chat lines from the last 7 days.
 // This survives reboot/power loss because messages are persisted on disk
@@ -429,6 +434,82 @@ static const uint32_t kChatHistoryKeepDays    = 7;
 static const uint32_t kChatHistoryKeepSeconds = kChatHistoryKeepDays * 24UL * 60UL * 60UL;
 
 #if defined(ESP32)
+static bool chat_line_is_valid(const String& line) {
+  return line.startsWith("TX|") || line.startsWith("RX|");
+}
+
+static uint16_t unread_count_for_chat_key(const String& key) {
+  if (key.startsWith("ch_")) {
+    return notify_channel_get(atoi(key.c_str() + 3));
+  }
+  return 0;
+}
+
+static int read_chat_tail(File& f, String* ring, int max_lines, bool* out_truncated) {
+  if (out_truncated) *out_truncated = false;
+  if (!ring || max_lines <= 0) return 0;
+
+  String* newest_first = new (std::nothrow) String[max_lines];
+  if (!newest_first) return -1;
+  char* chunk = new (std::nothrow) char[kChatTailReadChunk + 1];
+  if (!chunk) {
+    delete[] newest_first;
+    return -1;
+  }
+
+  const size_t file_size = f.size();
+  size_t pos = file_size;
+  String carry;
+  int found = 0;
+
+  while (pos > 0 && found < max_lines) {
+    size_t read_len = (pos > kChatTailReadChunk) ? kChatTailReadChunk : pos;
+    size_t start = pos - read_len;
+    f.seek(start);
+
+    String data;
+    data.reserve(read_len + carry.length() + 1);
+    size_t got = f.readBytes(chunk, read_len);
+    chunk[got] = '\0';
+    data.concat(chunk, got);
+    data += carry;
+
+    int end = (int)data.length();
+    while (end > 0 && found < max_lines) {
+      int nl = data.lastIndexOf('\n', end - 1);
+      int line_start = nl + 1;
+      String line = data.substring(line_start, end);
+      line.trim();
+      if (chat_line_is_valid(line)) {
+        newest_first[found++] = line;
+      }
+      if (nl < 0) {
+        end = 0;
+        break;
+      }
+      end = nl;
+    }
+
+    carry = (end > 0) ? data.substring(0, end) : String();
+    pos = start;
+  }
+
+  if (found < max_lines && carry.length()) {
+    carry.trim();
+    if (chat_line_is_valid(carry)) newest_first[found++] = carry;
+    carry = String();
+  }
+
+  if (out_truncated) *out_truncated = (pos > 0 || carry.length() > 0);
+
+  for (int i = 0; i < found; i++) {
+    ring[i] = newest_first[found - 1 - i];
+  }
+  delete[] chunk;
+  delete[] newest_first;
+  return found;
+}
+
 // Prune `path` to TX/RX lines newer than (now - keep_seconds), where now
 // comes from RTC. If clock is not valid yet, keep file unchanged.
 // Returns the number of kept TX/RX lines after pruning.
@@ -510,29 +591,33 @@ void load_chat_from_file(const String& key) {
   File f = LittleFS.open(path, FILE_READ);
   if (!f) return;
 
-  // Single-pass: count all valid lines AND keep the newest
-  // MAX_DISPLAY_MESSAGES in a ring. Previously this was two full-file
-  // reads (count, then seek(0) and parse) — the ring collapses that
-  // to one pass, ~halving chat-open latency on large files.
-  // Heap allocation — at MAX_DISPLAY_MESSAGES = 2000 a stack array would
-  // be ~32 KB of String headers and would overflow the task stack.
-  std::vector<String> ring(MAX_DISPLAY_MESSAGES);
-  int   ring_head  = 0;
-  int   ring_count = 0;
-  int   total      = 0;
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    line.trim();
-    if (!line.startsWith("TX|") && !line.startsWith("RX|")) continue;
-    ring[ring_head] = line;
-    ring_head = (ring_head + 1) % MAX_DISPLAY_MESSAGES;
-    if (ring_count < MAX_DISPLAY_MESSAGES) ring_count++;
-    total++;
+  // Read only the newest display window. Long-lived channel files can be
+  // many thousands of lines; scanning the whole file here makes a channel
+  // tap wait on flash I/O before the room appears.
+  String* ring = new (std::nothrow) String[MAX_DISPLAY_MESSAGES];
+  if (!ring) {
+    f.close();
+    Serial.println("Chat open failed: not enough heap for history window");
+    chat_add(false, "Chat history is too large to open right now.", false);
+    return;
   }
+  const size_t file_size = f.size();
+  bool history_truncated = false;
+  int ring_count = read_chat_tail(f, ring, MAX_DISPLAY_MESSAGES, &history_truncated);
   f.close();
+  if (ring_count < 0) {
+    delete[] ring;
+    Serial.println("Chat open failed: not enough heap for tail window");
+    chat_add(false, "Chat history is too large to open right now.", false);
+    return;
+  }
+  if (history_truncated) {
+    Serial.printf("Chat open: %s showing newest=%d of long history\n",
+                  path.c_str(), ring_count);
+  }
 
   int last_read = read_pos_get(key.c_str());
-  int skip = total - ring_count;            // messages NOT in the ring
+  uint16_t unread_count = unread_count_for_chat_key(key);
   // divider_at is the display-position (post-skip) where the "NEW
   // MESSAGES" divider goes. If last_read is unknown or all messages
   // are already read, no divider. If last_read is BEFORE the start
@@ -540,12 +625,12 @@ void load_chat_from_file(const String& key) {
   // out by MAX_DISPLAY_MESSAGES), clamp to 0 so the divider sits
   // at the very top: every displayed message is unread.
   int divider_at;
-  if (last_read < 0 || last_read >= total) {
-    divider_at = -1;                      // no unread → no divider
-  } else if (last_read < skip) {
-    divider_at = 0;                       // all visible are unread
+  if (unread_count > 0) {
+    divider_at = (unread_count >= ring_count) ? 0 : (ring_count - unread_count);
+  } else if (history_truncated || last_read < 0 || last_read >= ring_count) {
+    divider_at = -1;
   } else {
-    divider_at = last_read - skip;
+    divider_at = last_read;
   }
 
   int display_idx = 0;
@@ -566,13 +651,18 @@ void load_chat_from_file(const String& key) {
   String backfill_ring[kMaxBackfillOnOpen];
   int    backfill_head  = 0;
   int    backfill_count = 0;
-  const bool backfill_enabled = g_auto_translate_enabled && g_wifi_connected;
+  const bool backfill_enabled =
+      g_auto_translate_enabled && g_wifi_connected &&
+      ring_count <= kBackfillTranslateHistoryLimit;
+  if (g_auto_translate_enabled && g_wifi_connected &&
+      ring_count > kBackfillTranslateHistoryLimit) {
+    Serial.println("Translate: chat-open backfill skipped (large history)");
+  }
 
-  // Iterate the ring in insertion order. Oldest entry sits at ring_head
-  // when the ring is full; otherwise entries start at index 0.
-  const int start = (ring_count == MAX_DISPLAY_MESSAGES) ? ring_head : 0;
+  // Iterate the tail in chronological order.
+  const int start = 0;
   for (int i = 0; i < ring_count; i++) {
-    String& line = ring[(start + i) % MAX_DISPLAY_MESSAGES];
+    String& line = ring[start + i];
     bool out = line.startsWith("TX|");
 
     if (!divider_inserted && divider_at >= 0 && display_idx >= divider_at) {
@@ -688,14 +778,21 @@ void load_chat_from_file(const String& key) {
       if (t.length()) translate_request_to_file(t.c_str(), key.c_str());
     }
   }
+  delete[] ring;
+  ring = nullptr;
 
-  read_pos_set(key.c_str(), total);
+  if (!history_truncated) read_pos_set(key.c_str(), ring_count);
 
   // Time-based retention pruning: keep only the last 7 days on disk.
   // This enforces persistent history by time window rather than count.
-  int kept_after_prune = prune_chat_file_to_recent_seconds(path, kChatHistoryKeepSeconds);
-  if (kept_after_prune > 0 && kept_after_prune != total) {
-    read_pos_set(key.c_str(), kept_after_prune);
+  if (file_size <= kPruneOnOpenMaxBytes) {
+    int kept_after_prune = prune_chat_file_to_recent_seconds(path, kChatHistoryKeepSeconds);
+    if (!history_truncated && kept_after_prune > 0 && kept_after_prune != ring_count) {
+      read_pos_set(key.c_str(), kept_after_prune);
+    }
+  } else {
+    Serial.printf("Chat retention: skipped on open for large file %s (%u bytes)\n",
+                  path.c_str(), (unsigned)file_size);
   }
 
   // Scroll priority: if a "NEW MESSAGES" divider was created (i.e.
@@ -777,6 +874,50 @@ bool load_landscape_nvs() {
   bool v = g_prefs.getUChar("landscape", 0) != 0;
   g_prefs.end();
   return v;
+}
+bool save_fixed_position_nvs(double lat, double lon) {
+  Preferences pos_prefs;
+  if (!pos_prefs.begin("fixedpos", false)) return false;
+  bool ok = true;
+  ok = ok && (pos_prefs.putUChar("valid", (lat != 0.0 || lon != 0.0) ? 1 : 0) == 1);
+  ok = ok && (pos_prefs.putDouble("lat", lat) == sizeof(double));
+  ok = ok && (pos_prefs.putDouble("lon", lon) == sizeof(double));
+  pos_prefs.end();
+  return ok;
+}
+bool clear_fixed_position_nvs() {
+  Preferences pos_prefs;
+  if (!pos_prefs.begin("fixedpos", false)) return false;
+  bool ok = true;
+  ok = ok && (pos_prefs.putUChar("valid", 0) == 1);
+  ok = ok && (pos_prefs.putDouble("lat", 0.0) == sizeof(double));
+  ok = ok && (pos_prefs.putDouble("lon", 0.0) == sizeof(double));
+  pos_prefs.end();
+  return ok;
+}
+bool load_fixed_position_nvs(double* lat, double* lon) {
+  Preferences pos_prefs;
+  if (!pos_prefs.begin("fixedpos", false)) {
+    if (lat) *lat = 0.0;
+    if (lon) *lon = 0.0;
+    return false;
+  }
+  bool valid = pos_prefs.getUChar("valid", 0) != 0;
+  double saved_lat = valid ? pos_prefs.getDouble("lat", 0.0) : 0.0;
+  double saved_lon = valid ? pos_prefs.getDouble("lon", 0.0) : 0.0;
+  pos_prefs.end();
+
+  if (!valid || !isfinite(saved_lat) || !isfinite(saved_lon) ||
+      saved_lat < -90.0 || saved_lat > 90.0 ||
+      saved_lon < -180.0 || saved_lon > 180.0) {
+    if (lat) *lat = 0.0;
+    if (lon) *lon = 0.0;
+    return false;
+  }
+
+  if (lat) *lat = saved_lat;
+  if (lon) *lon = saved_lon;
+  return true;
 }
 void load_ui_prefs_nvs() {
   g_prefs.begin("ui", true);
@@ -971,6 +1112,13 @@ void save_preset_idx_nvs(int) {}
 int  load_preset_idx_nvs() { return -1; }
 void save_notifications_nvs() {}
 void load_notifications_nvs() {}
+bool save_fixed_position_nvs(double, double) { return false; }
+bool clear_fixed_position_nvs() { return false; }
+bool load_fixed_position_nvs(double* lat, double* lon) {
+  if (lat) *lat = 0.0;
+  if (lon) *lon = 0.0;
+  return false;
+}
 #endif
 
 // ---- Resolve pending TX on boot ----

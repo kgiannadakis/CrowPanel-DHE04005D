@@ -82,6 +82,9 @@ void save_notifications_nvs();
 void load_notifications_nvs();
 void save_landscape_nvs(bool landscape);
 bool load_landscape_nvs();
+bool save_fixed_position_nvs(double lat, double lon);
+bool clear_fixed_position_nvs();
+bool load_fixed_position_nvs(double* lat, double* lon);
 
 // Contact file persistence
 void rebuild_contacts_file_excluding(const uint8_t* pub32);

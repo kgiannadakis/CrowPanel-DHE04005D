@@ -74,7 +74,7 @@ static AtlasSlot s_slots[EMOJI_SIZE_COUNT] = {};
 
 static void* psram_alloc(size_t bytes) {
     void* p = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!p) p = heap_caps_malloc(bytes, MALLOC_CAP_DEFAULT);  // fallback
+    if (!p) p = heap_caps_malloc(bytes, MALLOC_CAP_DEFAULT);
     return p;
 }
 

@@ -602,11 +602,70 @@ void tz_update_offset_now() {
 }
 
 // ---- Keyboard focus/defocus ----
+static uint16_t textsend_char_count(const char* text) {
+  if (!text) return 0;
+  const uint8_t* p = (const uint8_t*)text;
+  size_t remaining = strlen(text);
+  uint16_t count = 0;
+  while (remaining > 0) {
+    int len = utf8_seq_len(*p);
+    if (len > 0 && (size_t)len <= remaining && utf8_valid_seq(p, len)) {
+      p += len;
+      remaining -= (size_t)len;
+    } else {
+      p++;
+      remaining--;
+    }
+    count++;
+  }
+  return count;
+}
+
+static void textsend_counter_position() {
+  if (!ui_textsend_counter || !ui_textsendtype) return;
+  lv_obj_update_layout(ui_textsend_counter);
+  lv_obj_align_to(ui_textsend_counter, ui_textsendtype,
+                  LV_ALIGN_OUT_TOP_RIGHT, -8, -3);
+}
+
+static void textsend_chatpanel_fit_idle() {
+  if (!ui_chatpanel) return;
+  lv_coord_t height = TEXTSEND_Y_DEFAULT - CHATPANEL_START_Y - 24;
+  if (height < 80) height = 80;
+  lv_obj_set_height(ui_chatpanel, height);
+}
+
+void textsend_counter_update() {
+  if (!ui_textsend_counter || !ui_textsendtype) return;
+  const char* text = lv_textarea_get_text(ui_textsendtype);
+  uint16_t count = textsend_char_count(text);
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%u/%u",
+           (unsigned)count, (unsigned)TEXTSEND_MAX_CHARS);
+  lv_label_set_text(ui_textsend_counter, buf);
+  textsend_counter_position();
+}
+
+void textsend_counter_show() {
+  if (!ui_textsend_counter) return;
+  textsend_chatpanel_fit_idle();
+  textsend_counter_update();
+  lv_obj_clear_flag(ui_textsend_counter, LV_OBJ_FLAG_HIDDEN);
+  textsend_counter_position();
+  if (ui_textsendtype) lv_obj_move_foreground(ui_textsendtype);
+  lv_obj_move_foreground(ui_textsend_counter);
+}
+
+void textsend_counter_hide() {
+  if (ui_textsend_counter) lv_obj_add_flag(ui_textsend_counter, LV_OBJ_FLAG_HIDDEN);
+}
+
 void cb_textsend_focused(lv_event_t*) {
   if (!ui_Keyboard1 || !ui_textsendtype) return;
   if (g_in_chat_mode) {
     lv_obj_set_y(ui_textsendtype, KB_TA_Y);
     kb_show(ui_Keyboard1, ui_textsendtype);
+    textsend_counter_show();
     chat_scroll_to_newest();
   }
 }
@@ -684,16 +743,21 @@ void cb_timeout_focused(lv_event_t*)    { settings_field_focus(ui_screentimeout)
 void cb_txpower_focused(lv_event_t*)    { settings_field_focus(ui_txpowerslider); }
 void cb_txpower_defocused(lv_event_t*)  { settings_field_defocus(ui_txpowerslider); }
 void cb_hashtag_focused(lv_event_t*)    { settings_field_focus(ui_hashtagchannel); }
+void cb_private_channel_name_focused(lv_event_t*) { settings_field_focus(ui_privatechannelname); }
+void cb_private_channel_hex_focused(lv_event_t*)  { settings_field_focus(ui_privatechannelhex); }
 
 void cb_textsend_defocused(lv_event_t*) {
   kb_hide(ui_Keyboard1, ui_textsendtype);
   if (g_in_chat_mode && ui_textsendtype) {
     lv_obj_set_y(ui_textsendtype, TEXTSEND_Y_DEFAULT);
+    textsend_counter_show();
     chat_scroll_to_newest();
   }
 }
 void cb_timeout_defocused(lv_event_t*)  { settings_field_defocus(ui_screentimeout); }
 void cb_hashtag_defocused(lv_event_t*)  { settings_field_defocus(ui_hashtagchannel); }
+void cb_private_channel_name_defocused(lv_event_t*) { settings_field_defocus(ui_privatechannelname); }
+void cb_private_channel_hex_defocused(lv_event_t*)  { settings_field_defocus(ui_privatechannelhex); }
 
 // ---- Search field ----
 void cb_searchfield_focused(lv_event_t*) {
@@ -717,6 +781,10 @@ void cb_searchfield_ready(lv_event_t*) {
 }
 
 // ---- Ready callbacks ----
+void cb_textsend_changed(lv_event_t*) {
+  textsend_counter_update();
+}
+
 void cb_textsend_ready(lv_event_t*) {
   if (!ui_textsendtype) return;
   const char* t = lv_textarea_get_text(ui_textsendtype);
@@ -728,6 +796,7 @@ void cb_textsend_ready(lv_event_t*) {
   lv_textarea_set_text(ui_textsendtype, "");
   kb_hide(ui_Keyboard1, ui_textsendtype);
   lv_obj_set_y(ui_textsendtype, TEXTSEND_Y_DEFAULT);
+  textsend_counter_show();
 }
 
 void cb_rename_ready(lv_event_t*) {
@@ -770,6 +839,48 @@ void cb_hashtag_ready(lv_event_t*) {
 
   lv_textarea_set_text(ui_hashtagchannel, "");
   settings_field_defocus(ui_hashtagchannel);
+}
+
+void cb_private_channel_ready(lv_event_t*) {
+  if (!g_mesh || !ui_privatechannelname || !ui_privatechannelhex) {
+    settings_field_defocus(ui_privatechannelname);
+    settings_field_defocus(ui_privatechannelhex);
+    return;
+  }
+
+  String name = lv_textarea_get_text(ui_privatechannelname);
+  String hex  = lv_textarea_get_text(ui_privatechannelhex);
+  name.trim();
+  hex.trim();
+
+  if (!name.length()) {
+    serialmon_append("JOIN private: enter channel name");
+    settings_field_focus(ui_privatechannelname);
+    return;
+  }
+  if (!hex.length()) {
+    serialmon_append("JOIN private: enter 32-char hex code");
+    settings_field_focus(ui_privatechannelhex);
+    return;
+  }
+  if (hex.length() != 32) {
+    serialmon_append("JOIN private: hex code must be 32 characters");
+    settings_field_focus(ui_privatechannelhex);
+    return;
+  }
+
+  int idx = mesh_join_private_channel(name, hex);
+  if (idx >= 0) {
+    ui_refresh_targets();
+    enter_chat_mode(TargetKind::CHANNEL, idx, nullptr);
+    lv_textarea_set_text(ui_privatechannelname, "");
+    lv_textarea_set_text(ui_privatechannelhex, "");
+    settings_field_defocus(ui_privatechannelname);
+    settings_field_defocus(ui_privatechannelhex);
+  } else {
+    ui_refresh_targets();
+    settings_field_focus(ui_privatechannelhex);
+  }
 }
 
 // ---- Purge data ----

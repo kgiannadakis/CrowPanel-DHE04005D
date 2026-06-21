@@ -7,12 +7,90 @@
 #include "app_globals.h"
 #include "mesh_api.h"
 #include "translate.h"
+#include "display.h"
+#include "settings_cb.h"
 
 #include "ui.h"
 #include "ui_homescreen.h"
 
 static lv_obj_t* g_path_reset_btn = nullptr;
 static lv_obj_t* g_path_discover_btn = nullptr;
+
+struct BubbleReplyData {
+  char mention[64];
+  lv_point_t press_point;
+  bool tracking;
+};
+
+static String mention_from_sender_name(const String& safe_name) {
+  String mention = safe_name;
+  mention.replace("#", "");
+  mention.trim();
+  if (mention.endsWith(":")) mention.remove(mention.length() - 1);
+  mention.trim();
+  if (!mention.length()) return "";
+  return "@[" + mention + "] ";
+}
+
+static void insert_reply_mention(const char* mention) {
+  if (!mention || !mention[0] || !ui_textsendtype) return;
+
+  const char* cur_text = lv_textarea_get_text(ui_textsendtype);
+  String next = mention;
+  if (cur_text && cur_text[0]) {
+    if (strncmp(cur_text, mention, strlen(mention)) == 0) {
+      next = cur_text;
+    } else {
+      next += cur_text;
+    }
+  }
+
+  lv_obj_clear_flag(ui_textsendtype, LV_OBJ_FLAG_HIDDEN);
+  lv_textarea_set_text(ui_textsendtype, next.c_str());
+  lv_textarea_set_cursor_pos(ui_textsendtype, LV_TEXTAREA_CURSOR_LAST);
+
+  if (g_in_chat_mode && ui_Keyboard1) {
+    lv_obj_set_y(ui_textsendtype, KB_TA_Y);
+    kb_show(ui_Keyboard1, ui_textsendtype);
+    textsend_counter_show();
+    chat_scroll_to_newest();
+  } else {
+    textsend_counter_update();
+  }
+}
+
+static void cb_bubble_reply_swipe(lv_event_t* e) {
+  BubbleReplyData* rd = (BubbleReplyData*)lv_event_get_user_data(e);
+  if (!rd) return;
+
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_DELETE) {
+    lv_mem_free(rd);
+    return;
+  }
+
+  lv_indev_t* indev = (lv_indev_t*)lv_event_get_param(e);
+  if (!indev) indev = lv_indev_get_act();
+  if (!indev) return;
+
+  lv_point_t p;
+  lv_indev_get_point(indev, &p);
+
+  if (code == LV_EVENT_PRESSED) {
+    rd->press_point = p;
+    rd->tracking = true;
+    return;
+  }
+
+  if (code != LV_EVENT_RELEASED || !rd->tracking) return;
+  rd->tracking = false;
+
+  int16_t dx = (int16_t)p.x - (int16_t)rd->press_point.x;
+  int16_t dy = (int16_t)p.y - (int16_t)rd->press_point.y;
+  if (dx >= 55 && dy > -35 && dy < 35) {
+    insert_reply_mention(rd->mention);
+  }
+}
 
 static void cb_bubble_long_press_translate(lv_event_t* e) {
     if (!g_current_chat_key[0]) return;
@@ -26,7 +104,7 @@ static void cb_bubble_long_press_translate(lv_event_t* e) {
         // into the matching bubble via find_bubble_for_source() in
         // translate.cpp — so we don't need to pass the bubble pointer
         // through any more.
-        translate_request_to_file(body, g_current_chat_key);
+        translate_request_manual_to_file(body, g_current_chat_key);
     }
 }
 
@@ -91,6 +169,20 @@ lv_obj_t* chat_add(bool out, const char* txt, bool live, char loaded_status, con
   safeName.replace("#", "");
   String safeTs = ts;
   safeTs.replace("#", "");
+
+  String replyMention = mention_from_sender_name(safeName);
+  if (replyMention.length()) {
+    BubbleReplyData* rd = (BubbleReplyData*)lv_mem_alloc(sizeof(BubbleReplyData));
+    if (rd) {
+      memset(rd, 0, sizeof(*rd));
+      strncpy(rd->mention, replyMention.c_str(), sizeof(rd->mention) - 1);
+      rd->mention[sizeof(rd->mention) - 1] = '\0';
+      lv_obj_add_flag(bubble, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(bubble, cb_bubble_reply_swipe, LV_EVENT_PRESSED, rd);
+      lv_obj_add_event_cb(bubble, cb_bubble_reply_swipe, LV_EVENT_RELEASED, rd);
+      lv_obj_add_event_cb(bubble, cb_bubble_reply_swipe, LV_EVENT_DELETE, rd);
+    }
+  }
 
   // Build signal info string for header (hops + SNR, shown next to sender)
   String safeSig = "";

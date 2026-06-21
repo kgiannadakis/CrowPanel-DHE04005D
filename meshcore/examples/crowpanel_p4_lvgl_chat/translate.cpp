@@ -94,6 +94,7 @@ const char* translate_lang_list() {
 struct TranslateRequest {
     char chat_key[20];
     char text[TRANSLATE_TEXT_MAX];
+    bool manual;
 };
 
 static TranslateRequest s_queue[TRANSLATE_QUEUE_SIZE];
@@ -105,6 +106,14 @@ static bool s_translate_mem_blocked = false;
 static uint32_t s_translate_mem_blocked_since_ms = 0;
 static bool s_translate_http_fallback = false;
 static uint32_t s_translate_http_fallback_until_ms = 0;
+
+static inline int q_prev(int idx) {
+    return (idx + TRANSLATE_QUEUE_SIZE - 1) % TRANSLATE_QUEUE_SIZE;
+}
+
+static inline int q_next(int idx) {
+    return (idx + 1) % TRANSLATE_QUEUE_SIZE;
+}
 
 #if defined(ESP32)
 // On P4 LVGL runs on its own task (see display.cpp::lvgl_task), while
@@ -479,7 +488,280 @@ void translate_init() {
     // runs directly off the main Arduino loop.
 }
 
+static void translate_request_enqueue(const char* text, const char* chat_key, bool manual) {
+    if (!text || !text[0]) return;
+    if (!chat_key || !chat_key[0]) return;
+
+    char safe_text[TRANSLATE_TEXT_MAX];
+    {
+        String cleaned = sanitize_for_font_string(text, &lv_font_montserrat_14);
+        // Bound request length before queueing/networking to reduce heap churn.
+        if (cleaned.length() >= (TRANSLATE_TEXT_MAX - 1)) {
+            cleaned = cleaned.substring(0, TRANSLATE_TEXT_MAX - 1);
+        }
+        utf8_strlcpy(safe_text, sizeof(safe_text), cleaned.c_str());
+    }
+    if (!safe_text[0]) return;
+
+    bool queued = false;
+    bool full   = false;
+    bool dropped_oldest = false;
+    bool promoted = false;
+
+    q_lock();
+    // Dedup + enqueue under one critical section. Producers call from
+    // either the LVGL task (long-press, load_chat_from_file Layer C)
+    // or the main Arduino task (on_contact_recv, channel RX); without
+    // this lock the head/tail indices can tear and the dedup scan can
+    // observe an inconsistent snapshot.
+    int duplicate_idx = -1;
+    for (int i = s_queue_tail; i != s_queue_head; i = q_next(i)) {
+        if (strcmp(s_queue[i].chat_key, chat_key) == 0 &&
+            strcmp(s_queue[i].text, safe_text) == 0) {
+            duplicate_idx = i;
+            break;
+        }
+    }
+
+    if (duplicate_idx >= 0) {
+        if (manual) {
+            // Mark an existing background request as user-triggered. Queue is
+            // tiny, so leave ordering alone unless the duplicate was not
+            // already the next item; the manual flag is enough to bypass the
+            // conservative TLS heap guard when it reaches the front.
+            s_queue[duplicate_idx].manual = true;
+            promoted = true;
+        }
+    } else {
+        if (manual) {
+            int next = q_next(s_queue_head);
+            if (next == s_queue_tail) {
+                // Queue full: drop oldest background work, then insert this
+                // user request at the front.
+                s_queue_tail = q_next(s_queue_tail);
+                dropped_oldest = true;
+                full = true;
+            }
+            s_queue_tail = q_prev(s_queue_tail);
+            TranslateRequest& req = s_queue[s_queue_tail];
+            strncpy(req.chat_key, chat_key, sizeof(req.chat_key) - 1);
+            req.chat_key[sizeof(req.chat_key) - 1] = '\0';
+            utf8_strlcpy(req.text, sizeof(req.text), safe_text);
+            req.manual = true;
+            queued = true;
+        } else {
+            int next = q_next(s_queue_head);
+            if (next == s_queue_tail) {
+                // Queue full: drop oldest to keep freshest incoming context.
+                s_queue_tail = q_next(s_queue_tail);
+                dropped_oldest = true;
+                full = true;
+            }
+            TranslateRequest& req = s_queue[s_queue_head];
+            strncpy(req.chat_key, chat_key, sizeof(req.chat_key) - 1);
+            req.chat_key[sizeof(req.chat_key) - 1] = '\0';
+            utf8_strlcpy(req.text, sizeof(req.text), safe_text);
+            req.manual = false;
+            s_queue_head = q_next(s_queue_head);
+            queued = true;
+        }
+    }
+    q_unlock();
+
+    if (!queued && !promoted) return;
+    if (dropped_oldest || full) Serial.println("Translate: queue full, dropped oldest");
+    if (promoted) {
+        Serial.printf("Translate: promoted manual '%.40s' -> %s\n",
+                      safe_text, translate_lang_code(g_translate_lang_idx));
+        serialmon_append("Translate requested");
+        return;
+    }
+
+    if (manual) {
+        Serial.printf("Translate: queued manual '%.40s' -> %s\n",
+                      safe_text, translate_lang_code(g_translate_lang_idx));
+        serialmon_append("Translate requested");
+        return;
+    }
+
+    static uint32_t s_last_queue_log_ms = 0;
+    uint32_t now_q = millis();
+    if (now_q - s_last_queue_log_ms > 2000) {
+        s_last_queue_log_ms = now_q;
+        Serial.printf("Translate: queued '%.40s' -> %s\n",
+                      safe_text, translate_lang_code(g_translate_lang_idx));
+    }
+}
+
 void translate_request_to_file(const char* text, const char* chat_key) {
+    translate_request_enqueue(text, chat_key, false);
+}
+
+void translate_request_manual_to_file(const char* text, const char* chat_key) {
+    translate_request_enqueue(text, chat_key, true);
+}
+
+void translate_loop() {
+#if defined(ESP32)
+    if (!g_wifi_connected || WiFi.status() != WL_CONNECTED) return;
+
+    // Peek the queue first without dequeuing. If empty, we skip the
+    // rate-limit + heap-probe work (heap_caps_get_free_size walks a
+    // free-block list) â€” this function runs on every main-loop tick.
+    TranslateRequest peek = {};
+    q_lock();
+    const bool queue_empty = (s_queue_head == s_queue_tail);
+    if (!queue_empty) peek = s_queue[s_queue_tail];
+    q_unlock();
+    if (queue_empty) return;
+
+    // --- Rate limit / backoff -----------------------------------------
+    // Manual requests ignore the exponential HTTP failure backoff: a long
+    // press is explicit user intent, and it should retry immediately when
+    // possible. Background auto-translate remains conservative.
+    static uint32_t s_last_attempt_ms = 0;
+    const uint32_t now_ms = millis();
+    if (!peek.manual && (int32_t)(now_ms - s_translate_backoff_until_ms) < 0) return;
+    if (now_ms - s_last_attempt_ms < (peek.manual ? 250UL : 500UL)) return;
+
+    // --- Memory guard -------------------------------------------------
+    // HTTPS/TLS needs much more contiguous internal/DMA heap than plain HTTP.
+    // Auto translation keeps the old conservative TLS guard. Manual
+    // long-press requests may fall back to HTTP immediately when TLS memory
+    // is too fragmented, so the user can still get a translation instead of
+    // waiting forever on "low mem skip".
+    const size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    const size_t int_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const size_t dma_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+    const size_t int_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    const bool tls_mem_too_low =
+        (dma_free < 48 * 1024 || int_free < 72 * 1024 ||
+         dma_largest < 28 * 1024 || int_largest < 28 * 1024);
+    const bool http_mem_too_low =
+        (dma_free < 16 * 1024 || int_free < 18 * 1024 ||
+         dma_largest < 4 * 1024 || int_largest < 4 * 1024);
+    bool use_http_for_this = s_translate_http_fallback;
+    if (peek.manual && tls_mem_too_low && !http_mem_too_low) {
+        use_http_for_this = true;
+    }
+
+    if (tls_mem_too_low && (!peek.manual || http_mem_too_low)) {
+        static uint32_t s_last_warn_ms = 0;
+        if (s_translate_mem_blocked_since_ms == 0) s_translate_mem_blocked_since_ms = now_ms;
+        if (now_ms - s_last_warn_ms > (peek.manual ? 3000UL : 15000UL)) {
+            Serial.printf("Translate: low mem skip%s dma=%u int=%u dma_lg=%u int_lg=%u\n",
+                          peek.manual ? " manual" : "",
+                          (unsigned)dma_free, (unsigned)int_free,
+                          (unsigned)dma_largest, (unsigned)int_largest);
+            s_last_warn_ms = now_ms;
+            if (peek.manual) serialmon_append("Translate waiting for memory");
+        }
+        s_translate_mem_blocked = true;
+        if (!peek.manual && (now_ms - s_translate_mem_blocked_since_ms) > 60000UL) {
+            s_translate_http_fallback = true;
+            s_translate_http_fallback_until_ms = now_ms + 120000UL;
+        }
+        // Brief cooling window to avoid tight-loop probing when memory is low.
+        s_translate_backoff_until_ms = now_ms + (peek.manual ? 800UL : 1500UL);
+        return;
+    }
+    if (s_translate_mem_blocked) {
+        Serial.printf("Translate: mem recovered dma=%u int=%u dma_lg=%u int_lg=%u\n",
+                      (unsigned)dma_free, (unsigned)int_free,
+                      (unsigned)dma_largest, (unsigned)int_largest);
+        s_translate_mem_blocked = false;
+        s_translate_mem_blocked_since_ms = 0;
+        if (!use_http_for_this) {
+            s_translate_http_fallback = false;
+            s_translate_http_fallback_until_ms = 0;
+        }
+    }
+
+    // Now actually dequeue â€” we know we can proceed.
+    TranslateRequest req;
+    bool have = false;
+    q_lock();
+    if (s_queue_head != s_queue_tail) {
+        req = s_queue[s_queue_tail];
+        s_queue_tail = q_next(s_queue_tail);
+        have = true;
+    }
+    q_unlock();
+    if (!have) return;  // Race: enqueue drained between peek and dequeue.
+
+    s_last_attempt_ms = now_ms;  // We committed â€” start the rate-limit timer.
+
+    const char* lang = translate_lang_code(g_translate_lang_idx);
+
+    char result[TRANSLATE_TEXT_MAX];
+    esp_task_wdt_reset();
+    if (s_translate_http_fallback &&
+        (int32_t)(now_ms - s_translate_http_fallback_until_ms) >= 0) {
+        s_translate_http_fallback = false;
+        s_translate_http_fallback_until_ms = 0;
+        use_http_for_this = false;
+    }
+    if (req.manual && use_http_for_this) {
+        Serial.printf("Translate: manual HTTP fallback dma=%u int=%u dma_lg=%u int_lg=%u\n",
+                      (unsigned)dma_free, (unsigned)int_free,
+                      (unsigned)dma_largest, (unsigned)int_largest);
+    }
+    const bool ok = use_http_for_this
+                      ? do_translate_http(req.text, lang, result, sizeof(result))
+                      : do_translate_https(req.text, lang, result, sizeof(result));
+    if (!ok) {
+        // Exponential-ish backoff to reduce TLS/SDIO pressure on repeated fails.
+        if (s_translate_fail_streak < 6) s_translate_fail_streak++;
+        uint32_t backoff_ms = req.manual ? 2000u : (1000u << (s_translate_fail_streak - 1));
+        if (backoff_ms > 12000u) backoff_ms = 12000u;
+        s_translate_backoff_until_ms = now_ms + backoff_ms;
+        if (!s_translate_http_fallback && s_translate_fail_streak >= 3) {
+            s_translate_http_fallback = true;
+            s_translate_http_fallback_until_ms = now_ms + 120000UL;
+        }
+        Serial.printf("Translate: fail streak=%u backoff=%lums mode=%s%s\n",
+                      (unsigned)s_translate_fail_streak,
+                      (unsigned long)backoff_ms,
+                      use_http_for_this ? "http" : "https",
+                      req.manual ? " manual" : "");
+        if (req.manual) serialmon_append("Translate failed");
+        return;
+    }
+    s_translate_fail_streak = 0;
+    s_translate_backoff_until_ms = 0;
+
+    // Google returns the source verbatim for no-op translations (e.g.
+    // the user's target language matches the already-typed language).
+    // Skip persistence in that case â€” there's nothing to show.
+    if (strcmp(result, req.text) == 0) {
+        if (req.manual) serialmon_append("Translate: no change");
+        return;
+    }
+
+    // Always persist to disk, keyed by body-text match so that the
+    // translation lands on the correct RX line even when multiple
+    // untranslated messages are pending.
+    append_translation_to_last_rx(String(req.chat_key), req.text, result);
+
+    // If the user is currently viewing this chat, update the visible
+    // bubble in place so the translation appears without needing a
+    // chat reload. Take lvgl_lock FIRST, then check g_current_chat_key
+    // under the lock â€” every writer to that key (load_chat_from_file,
+    // exit_chat_mode, delete-confirm) runs from LVGL event callbacks
+    // under lvgl_lock, so this check is race-free.
+    if (lvgl_lock(100)) {
+        if (strcmp(g_current_chat_key, req.chat_key) == 0) {
+            lv_obj_t* bubble = find_bubble_for_source(req.text);
+            if (bubble) attach_translation_label(bubble, result);
+        }
+        lvgl_unlock();
+    }
+    if (req.manual) serialmon_append("Translate done");
+#endif
+}
+
+#if 0
+void translate_request_to_file_old_dead_code(const char* text, const char* chat_key) {
     if (!text || !text[0]) return;
     if (!chat_key || !chat_key[0]) return;
 
@@ -675,3 +957,4 @@ void translate_loop() {
     }
 #endif
 }
+#endif

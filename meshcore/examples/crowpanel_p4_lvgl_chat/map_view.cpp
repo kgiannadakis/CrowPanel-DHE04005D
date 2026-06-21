@@ -425,6 +425,31 @@ static int rebuild_map(bool include_markers) {
   int drawn_pins = 0;
   int hidden_pins = 0;
 
+  if (include_markers && g_fixed_position_valid) {
+    const double pan_origin_wx = (double)x_start * kTilePx;
+    const double pan_origin_wy = (double)y_start * kTilePx;
+    double self_wx = 0.0, self_wy = 0.0;
+    latlon_to_world(g_fixed_position_lat, g_fixed_position_lon, s.zoom,
+                    &self_wx, &self_wy);
+    const int mx = (int)round(self_wx - pan_origin_wx);
+    const int my = (int)round(self_wy - pan_origin_wy);
+    const int screen_x = lv_obj_get_x(s.pan_layer) + mx;
+    const int screen_y = lv_obj_get_y(s.pan_layer) + my;
+    if (screen_x >= -20 && screen_y >= -20 &&
+        screen_x <= view_w + 20 && screen_y <= view_h + 20 &&
+        drawn_pins < kMaxMarkerSlots) {
+      MarkerSlot& ms = s_marker_slots[drawn_pins];
+      const int dot_sz = 10;
+      lv_obj_set_size(ms.dot, dot_sz, dot_sz);
+      lv_obj_set_pos(ms.dot, mx - dot_sz / 2, my - dot_sz / 2);
+      lv_obj_set_style_bg_color(ms.dot, lv_color_hex(0x6DC264), 0);
+      lv_obj_clear_flag(ms.dot, LV_OBJ_FLAG_HIDDEN);
+      ms.active_dot = true;
+      ms.active_lbl = false;
+      drawn_pins++;
+    }
+  }
+
   if (include_markers && g_mesh) {
 #if defined(ESP32)
     bool locked = true;

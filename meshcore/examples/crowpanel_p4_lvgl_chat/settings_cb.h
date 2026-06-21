@@ -62,8 +62,12 @@ void ui_populate_presets();
 // Keyboard focus/defocus
 void settings_field_focus(lv_obj_t* field);
 void settings_field_defocus(lv_obj_t* field);
+void textsend_counter_update();
+void textsend_counter_show();
+void textsend_counter_hide();
 void cb_textsend_focused(lv_event_t*);
 void cb_textsend_defocused(lv_event_t*);
+void cb_textsend_changed(lv_event_t*);
 void cb_rename_focused(lv_event_t*);
 void cb_rename_defocused(lv_event_t*);
 void cb_timeout_focused(lv_event_t*);
@@ -72,6 +76,10 @@ void cb_txpower_focused(lv_event_t*);
 void cb_txpower_defocused(lv_event_t*);
 void cb_hashtag_focused(lv_event_t*);
 void cb_hashtag_defocused(lv_event_t*);
+void cb_private_channel_name_focused(lv_event_t*);
+void cb_private_channel_name_defocused(lv_event_t*);
+void cb_private_channel_hex_focused(lv_event_t*);
+void cb_private_channel_hex_defocused(lv_event_t*);
 void cb_searchfield_focused(lv_event_t*);
 void cb_searchfield_defocused(lv_event_t*);
 void cb_searchfield_changed(lv_event_t*);
@@ -82,6 +90,7 @@ void cb_textsend_ready(lv_event_t*);
 void cb_rename_ready(lv_event_t*);
 void cb_timeout_ready(lv_event_t*);
 void cb_hashtag_ready(lv_event_t*);
+void cb_private_channel_ready(lv_event_t*);
 
 // Purge data
 void cb_purge_data(lv_event_t*);

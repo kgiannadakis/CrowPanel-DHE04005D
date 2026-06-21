@@ -34,6 +34,8 @@ extern lv_obj_t * ui_Label15;
 extern lv_obj_t * ui_screentimeout;
 extern lv_obj_t * ui_Label1;
 extern lv_obj_t * ui_hashtagchannel;
+extern lv_obj_t * ui_privatechannelname;
+extern lv_obj_t * ui_privatechannelhex;
 extern lv_obj_t * ui_notificationstoggle;
 extern lv_obj_t * ui_Label20;
 extern lv_obj_t * ui_autorepeatertoggle;

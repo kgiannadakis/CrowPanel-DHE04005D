@@ -39,6 +39,8 @@ lv_obj_t * ui_Label15             = NULL;
 lv_obj_t * ui_screentimeout       = NULL;
 lv_obj_t * ui_Label1              = NULL;
 lv_obj_t * ui_hashtagchannel      = NULL;
+lv_obj_t * ui_privatechannelname  = NULL;
+lv_obj_t * ui_privatechannelhex   = NULL;
 lv_obj_t * ui_notificationstoggle = NULL;
 lv_obj_t * ui_Label20             = NULL;
 lv_obj_t * ui_autorepeatertoggle  = NULL;
@@ -284,16 +286,36 @@ void ui_settingscreen_screen_init(void) {
     style_ta(ui_renamebox);
 
     // ══════════════════════════════════════════════════════════
-    // JOIN CHANNEL
+    // JOIN PUBLIC CHANNEL
     // ══════════════════════════════════════════════════════════
 
-    make_section_hdr(form, "JOIN CHANNEL");
+    make_section_hdr(form, "JOIN PUBLIC CHANNEL");
 
     ui_hashtagchannel = lv_textarea_create(form);
     lv_obj_set_size(ui_hashtagchannel, lv_pct(100), 44);
     lv_textarea_set_one_line(ui_hashtagchannel, true);
-    lv_textarea_set_placeholder_text(ui_hashtagchannel, "#channel or name|key");
+    lv_textarea_set_max_length(ui_hashtagchannel, 31);
+    lv_textarea_set_placeholder_text(ui_hashtagchannel, "#channel");
     style_ta(ui_hashtagchannel);
+
+    // JOIN PRIVATE CHANNEL
+
+    make_section_hdr(form, "JOIN PRIVATE CHANNEL");
+
+    ui_privatechannelname = lv_textarea_create(form);
+    lv_obj_set_size(ui_privatechannelname, lv_pct(100), 44);
+    lv_textarea_set_one_line(ui_privatechannelname, true);
+    lv_textarea_set_max_length(ui_privatechannelname, 31);
+    lv_textarea_set_placeholder_text(ui_privatechannelname, "Channel name");
+    style_ta(ui_privatechannelname);
+
+    ui_privatechannelhex = lv_textarea_create(form);
+    lv_obj_set_size(ui_privatechannelhex, lv_pct(100), 44);
+    lv_textarea_set_one_line(ui_privatechannelhex, true);
+    lv_textarea_set_max_length(ui_privatechannelhex, 32);
+    lv_textarea_set_accepted_chars(ui_privatechannelhex, "0123456789abcdefABCDEF");
+    lv_textarea_set_placeholder_text(ui_privatechannelhex, "32-character hex code");
+    style_ta(ui_privatechannelhex);
 
     // ══════════════════════════════════════════════════════════
     // [8] RADIO PRESET — dropdown auto-applies, shows current

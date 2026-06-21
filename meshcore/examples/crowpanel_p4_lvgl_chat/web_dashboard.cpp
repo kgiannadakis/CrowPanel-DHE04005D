@@ -120,11 +120,11 @@ select{cursor:pointer}
 <div class="grid two">
 <div>
 <label for="lat">Latitude</label>
-<input id="lat" inputmode="decimal" placeholder="37.9838">
+<input id="lat" inputmode="decimal" placeholder="Type latitude, e.g. 37.9838">
 </div>
 <div>
 <label for="lon">Longitude</label>
-<input id="lon" inputmode="decimal" placeholder="23.7275">
+<input id="lon" inputmode="decimal" placeholder="Type longitude, e.g. 23.7275">
 </div>
 </div>
 <div class="btn-row">
@@ -302,10 +302,7 @@ function hideBanner(){
 function fmt(n){
   return Number(n).toFixed(6).replace(/0+$/,'').replace(/\.$/,'');
 }
-async function loadPositionState(){
-  const res=await fetch('/json/position',{cache:'no-store'});
-  const json=await res.json();
-  if(json.status!=='ok') throw new Error(json.message||'Failed to load position');
+function applyPositionState(json){
   const p=json.data.position;
   const hasCoords=!!p.fixed;
   fixedState.textContent='Fixed position: '+(hasCoords?'Enabled':'Disabled');
@@ -318,18 +315,30 @@ async function loadPositionState(){
     lon.value='';
   }
 }
+async function loadPositionState(){
+  const res=await fetch('/api/position_state',{cache:'no-store'});
+  const json=await res.json();
+  if(json.status!=='ok') throw new Error(json.message||'Failed to load position');
+  applyPositionState(json);
+}
 async function callPositionApi(url,successMsg){
   const res=await fetch(url,{cache:'no-store'});
   const json=await res.json();
   if(json.status!=='ok') throw new Error(json.message||'Request failed');
   showBanner(successMsg,true);
-  await loadPositionState();
+  applyPositionState(json);
 }
 saveBtn.addEventListener('click',async()=>{
   hideBanner();
-  const params=new URLSearchParams({lat:lat.value.trim(),lon:lon.value.trim()});
+  const latText=lat.value.trim();
+  const lonText=lon.value.trim();
+  if(!latText||!lonText){
+    showBanner('Type latitude and longitude first. The grey numbers are examples only.',false);
+    return;
+  }
+  const params=new URLSearchParams({lat:latText,lon:lonText});
   try{
-    await callPositionApi('/json/position/set?'+params.toString(),'Fixed position saved.');
+    await callPositionApi('/api/save_position?'+params.toString(),'Fixed position saved.');
   }catch(err){
     showBanner(err.message,false);
   }
@@ -337,7 +346,7 @@ saveBtn.addEventListener('click',async()=>{
 clearBtn.addEventListener('click',async()=>{
   hideBanner();
   try{
-    await callPositionApi('/json/position/clear','Fixed position removed.');
+    await callPositionApi('/api/clear_position','Fixed position removed.');
   }catch(err){
     showBanner(err.message,false);
   }
@@ -487,11 +496,11 @@ a{color:#8ec8ff}
   <div class="grid two">
     <div>
       <label for="lat">Latitude</label>
-      <input id="lat" inputmode="decimal" placeholder="37.9838">
+      <input id="lat" inputmode="decimal" placeholder="Type latitude, e.g. 37.9838">
     </div>
     <div>
       <label for="lon">Longitude</label>
-      <input id="lon" inputmode="decimal" placeholder="23.7275">
+      <input id="lon" inputmode="decimal" placeholder="Type longitude, e.g. 23.7275">
     </div>
   </div>
   <div class="btns">
@@ -529,10 +538,7 @@ function hideBanner(){
 function fmt(n){
   return Number(n).toFixed(6).replace(/0+$/,'').replace(/\.$/,'');
 }
-async function loadState(){
-  const res=await fetch('/json/position',{cache:'no-store'});
-  const json=await res.json();
-  if(json.status!=='ok') throw new Error(json.message||'Failed to load position');
+function applyState(json){
   const p=json.data.position;
   const hasCoords=!!p.fixed;
   fixedState.textContent='Fixed position: '+(hasCoords?'Enabled':'Disabled');
@@ -545,18 +551,30 @@ async function loadState(){
     lon.value='';
   }
 }
+async function loadState(){
+  const res=await fetch('/api/position_state',{cache:'no-store'});
+  const json=await res.json();
+  if(json.status!=='ok') throw new Error(json.message||'Failed to load position');
+  applyState(json);
+}
 async function callApi(url,successMsg){
   const res=await fetch(url,{cache:'no-store'});
   const json=await res.json();
   if(json.status!=='ok') throw new Error(json.message||'Request failed');
   showBanner(successMsg,true);
-  await loadState();
+  applyState(json);
 }
 saveBtn.addEventListener('click',async()=>{
   hideBanner();
-  const params=new URLSearchParams({lat:lat.value.trim(),lon:lon.value.trim()});
+  const latText=lat.value.trim();
+  const lonText=lon.value.trim();
+  if(!latText||!lonText){
+    showBanner('Type latitude and longitude first. The grey numbers are examples only.',false);
+    return;
+  }
+  const params=new URLSearchParams({lat:latText,lon:lonText});
   try{
-    await callApi('/json/position/set?'+params.toString(),'Fixed position saved.');
+    await callApi('/api/save_position?'+params.toString(),'Fixed position saved.');
   }catch(err){
     showBanner(err.message,false);
   }
@@ -564,7 +582,7 @@ saveBtn.addEventListener('click',async()=>{
 clearBtn.addEventListener('click',async()=>{
   hideBanner();
   try{
-    await callApi('/json/position/clear','Fixed position removed.');
+    await callApi('/api/clear_position','Fixed position removed.');
   }catch(err){
     showBanner(err.message,false);
   }
@@ -610,16 +628,32 @@ loadState().catch(err=>showBanner(err.message,false));
 
 #if defined(ESP32)
 
-String position_state_json() {
-    double lat = 0.0;
-    double lon = 0.0;
-    mesh_get_fixed_position(&lat, &lon);
+static const int POSITION_API_REV = 4;
 
-    char buf[192];
+String position_state_json() {
+    double lat = g_fixed_position_valid ? g_fixed_position_lat : 0.0;
+    double lon = g_fixed_position_valid ? g_fixed_position_lon : 0.0;
+    bool fixed = g_fixed_position_valid;
+    if (!fixed) {
+        double saved_lat = 0.0;
+        double saved_lon = 0.0;
+        if (load_fixed_position_nvs(&saved_lat, &saved_lon)) {
+            lat = saved_lat;
+            lon = saved_lon;
+            fixed = true;
+            g_fixed_position_valid = true;
+            g_fixed_position_lat = saved_lat;
+            g_fixed_position_lon = saved_lon;
+            g_fixed_position_apply_pending = true;
+        }
+    }
+
+    char buf[224];
     snprintf(buf, sizeof(buf),
-        "{\"status\":\"ok\",\"data\":{\"position\":{\"latitude\":%.7f,\"longitude\":%.7f,\"fixed\":%s},\"advertise\":%s}}",
+        "{\"status\":\"ok\",\"api_rev\":%d,\"data\":{\"position\":{\"latitude\":%.7f,\"longitude\":%.7f,\"fixed\":%s},\"advertise\":%s}}",
+        POSITION_API_REV,
         lat, lon,
-        (lat != 0.0 || lon != 0.0) ? "true" : "false",
+        fixed ? "true" : "false",
         g_position_advert_enabled ? "true" : "false");
     return String(buf);
 }
@@ -679,13 +713,26 @@ static void handle_position_set(AsyncWebServerRequest* req) {
         return;
     }
 
-    mesh_set_fixed_position(lat, lon);
-    handle_position_json(req);
+    if (!mesh_set_fixed_position(lat, lon)) {
+        req->send(500, "application/json", position_error_json("Position could not be written to storage."));
+        return;
+    }
+
+    char buf[224];
+    snprintf(buf, sizeof(buf),
+        "{\"status\":\"ok\",\"api_rev\":%d,\"data\":{\"position\":{\"latitude\":%.7f,\"longitude\":%.7f,\"fixed\":true},\"advertise\":%s}}",
+        POSITION_API_REV,
+        lat, lon,
+        g_position_advert_enabled ? "true" : "false");
+    req->send(200, "application/json", String(buf));
 }
 
 static void handle_position_clear(AsyncWebServerRequest* req) {
-    mesh_clear_fixed_position();
-    handle_position_json(req);
+    if (!mesh_clear_fixed_position()) {
+        req->send(500, "application/json", position_error_json("Position could not be cleared from storage."));
+        return;
+    }
+    req->send(200, "application/json", position_state_json());
 }
 
 // HTTPS handlers live in web_dashboard_https.cpp.
@@ -1082,12 +1129,21 @@ void webdash_start() {
     if (!s_initialized) {
         s_server.addHandler(&s_ws);
         s_server.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
-            req->send_P(200, "text/html", INDEX_HTML);
+            AsyncWebServerResponse* res = req->beginResponse_P(200, "text/html", INDEX_HTML);
+            res->addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+            res->addHeader("Pragma", "no-cache");
+            req->send(res);
         });
         s_server.on("/position", HTTP_GET, handle_position_page);
-        s_server.on("/json/position", HTTP_GET, handle_position_json);
+        // Register specific legacy routes before /json/position because this
+        // AsyncWebServer build can match the shorter path first.
         s_server.on("/json/position/set", HTTP_GET, handle_position_set);
         s_server.on("/json/position/clear", HTTP_GET, handle_position_clear);
+        s_server.on("/json/position", HTTP_GET, handle_position_json);
+        // Non-overlapping routes used by the dashboard from pos4 onward.
+        s_server.on("/api/position_state", HTTP_GET, handle_position_json);
+        s_server.on("/api/save_position", HTTP_GET, handle_position_set);
+        s_server.on("/api/clear_position", HTTP_GET, handle_position_clear);
         s_server.on("/api/stats", HTTP_GET, handle_stats);
         s_server.on("/api/contacts", HTTP_GET, handle_contacts);
         s_server.on("/api/channels", HTTP_GET, handle_channels);

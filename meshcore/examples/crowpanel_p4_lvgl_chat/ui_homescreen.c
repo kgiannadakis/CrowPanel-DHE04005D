@@ -14,6 +14,7 @@ lv_obj_t * ui_mutebutton       = NULL;
 lv_obj_t * ui_mutelabel        = NULL;
 lv_obj_t * ui_searchfield      = NULL;
 lv_obj_t * ui_textsendtype     = NULL;
+lv_obj_t * ui_textsend_counter = NULL;
 lv_obj_t * ui_backbutton       = NULL;
 lv_obj_t * ui_backlabel        = NULL;
 lv_obj_t * ui_timelabel        = NULL;
@@ -149,7 +150,7 @@ void ui_homescreen_screen_init(void) {
     // the panel staying at its idle height is fine because that region
     // is masked by the keyboard anyway.
     lv_obj_set_size(ui_chatpanel, SCR_W,
-                    TEXTSEND_Y_DEFAULT - CHATPANEL_START_Y - 8);
+                    TEXTSEND_Y_DEFAULT - CHATPANEL_START_Y - 24);
     lv_obj_set_style_bg_color(ui_chatpanel, lv_color_hex(TH_BG), 0);
     lv_obj_set_style_bg_opa(ui_chatpanel, LV_OPA_COVER, 0);
     lv_obj_set_style_border_opa(ui_chatpanel, LV_OPA_TRANSP, 0);
@@ -167,6 +168,19 @@ void ui_homescreen_screen_init(void) {
     lv_textarea_set_placeholder_text(ui_textsendtype, "Type a message...");
     style_textarea(ui_textsendtype);
     lv_obj_add_flag(ui_textsendtype, LV_OBJ_FLAG_HIDDEN);
+
+    ui_textsend_counter = lv_label_create(ui_homescreen);
+    lv_label_set_text(ui_textsend_counter, "0/139");
+    lv_obj_set_style_text_color(ui_textsend_counter, lv_color_hex(TH_TEXT3), 0);
+    lv_obj_set_style_text_font(ui_textsend_counter, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(ui_textsend_counter, lv_color_hex(TH_BG), 0);
+    lv_obj_set_style_bg_opa(ui_textsend_counter, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_left(ui_textsend_counter, 3, 0);
+    lv_obj_set_style_pad_right(ui_textsend_counter, 3, 0);
+    lv_obj_set_style_pad_top(ui_textsend_counter, 1, 0);
+    lv_obj_set_style_pad_bottom(ui_textsend_counter, 1, 0);
+    lv_obj_set_style_radius(ui_textsend_counter, 0, 0);
+    lv_obj_add_flag(ui_textsend_counter, LV_OBJ_FLAG_HIDDEN);
 
     // ── TAB BAR ─────────────────────────────────────────────
 

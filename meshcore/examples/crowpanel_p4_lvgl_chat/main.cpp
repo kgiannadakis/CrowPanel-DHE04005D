@@ -173,6 +173,10 @@ bool g_auto_contact_enabled  = true;
 bool g_auto_repeater_enabled = true;
 bool g_packet_forward_enabled = true;
 bool g_position_advert_enabled = true;
+bool g_fixed_position_valid = false;
+bool g_fixed_position_apply_pending = false;
+double g_fixed_position_lat = 0.0;
+double g_fixed_position_lon = 0.0;
 bool g_auto_translate_enabled = false;
 int  g_translate_lang_idx     = 0;
 uint8_t g_text_header_bytes   = 1;
@@ -242,15 +246,14 @@ RepeaterListEntry g_repeater_list[MAX_DD_ENTRIES] = {};
 int          g_repeater_count = 0;
 
 // ---- Serial monitor buffers ----
-// Halved from 4 KB to 2 KB — the serial monitor label renders this
+// Trimmed from 2 KB to 1 KB — the serial monitor label renders this
 // entire buffer on every refresh (label does a full relayout for any
 // text change), so cutting the size proportionally cuts the
-// per-refresh CPU cost. 2 KB is still ~40 lines of 50-char log
-// output visible on-screen at once, which is enough for debugging.
-const size_t SERIAL_BUF_SIZE = 2048;
+// per-refresh CPU cost and returns always-on internal RAM.
+const size_t SERIAL_BUF_SIZE = 1024;
 const size_t SERIAL_BUF_TRIM = SERIAL_BUF_SIZE / 2;
-char  g_serial_buf[2048 + 1];
-char  g_serial_buf_front[2048 + 1];
+char  g_serial_buf[1024 + 1];
+char  g_serial_buf_front[1024 + 1];
 size_t g_serial_len = 0;
 
 // ---- Speaker / Discover buttons ----
@@ -260,6 +263,7 @@ lv_obj_t* g_pkt_fwd_btn = nullptr;
 
 // ---- Keyboard state ----
 bool g_kb_greek = false;
+uint8_t g_kb_lang = 0;  // 0=EN, 1=EL, 2=DE
 
 // ---- Confirm action ----
 ConfirmAction g_confirm_action = ConfirmAction::NONE;
@@ -1745,6 +1749,10 @@ public:
     if (pipe > 0) {
       channelName = input.substring(0, pipe);
       channelName.trim();
+      if (!channelName.length()) {
+        serialmon_append("JOIN private: enter channel name");
+        return -1;
+      }
       String keyStr = input.substring(pipe + 1);
       keyStr.trim();
 
@@ -2236,6 +2244,7 @@ void setup() {
   Serial.begin(115200);
   delay(50);
   Serial.println(">>> setup() entered");
+  Serial.printf("[fw] CrowPanel DHE04005D direct-RGB build %s %s\n", __DATE__, __TIME__);
   dbg_print_boot_state();
   Serial.flush();
   CHECKPOINT(1);
@@ -2509,6 +2518,21 @@ void setup() {
   #error "need to define filesystem"
 #endif
 
+  {
+    double saved_lat = 0.0;
+    double saved_lon = 0.0;
+    if (load_fixed_position_nvs(&saved_lat, &saved_lon)) {
+      g_fixed_position_valid = true;
+      g_fixed_position_lat = saved_lat;
+      g_fixed_position_lon = saved_lon;
+      g_uimesh->setNodePosition(saved_lat, saved_lon);
+    } else {
+      g_fixed_position_valid = false;
+      g_fixed_position_lat = 0.0;
+      g_fixed_position_lon = 0.0;
+    }
+  }
+
   // Keep chat/CLI text framing in legacy 1-byte mode for interoperability.
   g_uimesh->setTextHeaderBytes(1);
 
@@ -2541,6 +2565,7 @@ void setup() {
   }
 
   reg(ui_textsendtype,    cb_textsend_ready, LV_EVENT_READY);
+  reg(ui_textsendtype,    cb_textsend_changed, LV_EVENT_VALUE_CHANGED);
   // Defensive: on some LVGL keyboard layouts/versions the READY event
   // is emitted by the keyboard widget but not forwarded to the bound
   // textarea. Wire both so "enter/check" always sends.
@@ -2549,6 +2574,8 @@ void setup() {
   reg(ui_renamebox,       cb_rename_ready,   LV_EVENT_CANCEL);
   reg(ui_screentimeout,   cb_timeout_ready,  LV_EVENT_READY);
   reg(ui_hashtagchannel,  cb_hashtag_ready,  LV_EVENT_READY);
+  reg(ui_privatechannelname, cb_private_channel_ready, LV_EVENT_READY);
+  reg(ui_privatechannelhex,  cb_private_channel_ready, LV_EVENT_READY);
   reg(ui_searchfield,     cb_searchfield_ready, LV_EVENT_READY);
 
   reg(ui_textsendtype,    cb_textsend_focused, LV_EVENT_FOCUSED);
@@ -2561,6 +2588,8 @@ void setup() {
   reg(ui_screentimeout,   cb_timeout_focused,  LV_EVENT_CLICKED);
   reg(ui_txpowerslider,   cb_txpower_focused,  LV_EVENT_CLICKED);
   reg(ui_hashtagchannel,  cb_hashtag_focused,  LV_EVENT_CLICKED);
+  reg(ui_privatechannelname, cb_private_channel_name_focused, LV_EVENT_CLICKED);
+  reg(ui_privatechannelhex,  cb_private_channel_hex_focused,  LV_EVENT_CLICKED);
   reg(ui_searchfield,     cb_searchfield_focused, LV_EVENT_FOCUSED);
   reg(ui_searchfield,     cb_searchfield_focused, LV_EVENT_CLICKED);
 
@@ -2569,6 +2598,8 @@ void setup() {
   reg(ui_screentimeout,   cb_timeout_defocused,      LV_EVENT_DEFOCUSED);
   reg(ui_txpowerslider,   cb_txpower_defocused,      LV_EVENT_DEFOCUSED);
   reg(ui_hashtagchannel,  cb_hashtag_defocused,      LV_EVENT_DEFOCUSED);
+  reg(ui_privatechannelname, cb_private_channel_name_defocused, LV_EVENT_DEFOCUSED);
+  reg(ui_privatechannelhex,  cb_private_channel_hex_defocused,  LV_EVENT_DEFOCUSED);
   reg(ui_searchfield,     cb_searchfield_defocused,  LV_EVENT_DEFOCUSED);
 
   reg(ui_searchfield,     cb_searchfield_changed, LV_EVENT_VALUE_CHANGED);
@@ -3025,6 +3056,7 @@ void loop() {
         !lv_obj_has_flag(ui_Keyboard1, LV_OBJ_FLAG_HIDDEN)) {
       kb_hide(ui_Keyboard1, ui_textsendtype);
       if (ui_textsendtype) lv_obj_set_y(ui_textsendtype, TEXTSEND_Y_DEFAULT);
+      textsend_counter_show();
       chat_scroll_to_newest();
     } else if (repeater_cli_mode_active()) {
       // Repeater CLI keyboard: hide it but stay in CLI mode.
@@ -3174,6 +3206,17 @@ void loop() {
       g_uimesh->sendZeroHopAdvert(0);
     } else {
       serialmon_append("TX 0-hop advert failed: mesh not ready");
+    }
+  }
+  if (g_fixed_position_apply_pending) {
+    g_fixed_position_apply_pending = false;
+    if (g_uimesh) {
+      if (g_fixed_position_valid) {
+        g_uimesh->setNodePosition(g_fixed_position_lat, g_fixed_position_lon);
+      } else {
+        g_uimesh->clearNodePosition();
+      }
+      g_deferred_flood_advert = true;
     }
   }
   if (g_deferred_preset_idx >= 0) { int idx = g_deferred_preset_idx; g_deferred_preset_idx = -1; if (g_uimesh) g_uimesh->applyPresetByIdx(idx, false); }
@@ -3351,6 +3394,17 @@ uint32_t mesh_send_discover_repeaters()                { return g_uimesh ? g_uim
 void mesh_send_flood_advert(int delay_ms)              { if (g_uimesh) g_uimesh->sendFloodAdvert(delay_ms); }
 void mesh_rename_if_non_empty(const char* name)        { if (g_uimesh) g_uimesh->renameIfNonEmpty(name); }
 int  mesh_join_hashtag_channel(const String& raw)      { return g_uimesh ? g_uimesh->joinHashtagChannel(raw) : -1; }
+int  mesh_join_private_channel(const String& name, const String& hex_key) {
+  if (!g_uimesh) return -1;
+  String raw = name;
+  String key = hex_key;
+  raw.trim();
+  key.trim();
+  if (!raw.length() || !key.length()) return -1;
+  raw += "|";
+  raw += key;
+  return g_uimesh->joinHashtagChannel(raw);
+}
 void mesh_purge_contacts_and_repeaters()               { if (g_uimesh) g_uimesh->purgeContactsAndRepeaters(); }
 int  mesh_current_channel_idx()                        { return g_uimesh ? g_uimesh->currentChannelIdx() : -1; }
 bool mesh_select_contact_by_pubkey(const uint8_t* pk)  { return g_uimesh ? g_uimesh->selectContactByPubKey(pk) : false; }
@@ -3393,18 +3447,30 @@ const char* mesh_get_node_name() {
   return g_uimesh ? g_uimesh->getNodeName() : "CrowPanel";
 }
 void mesh_get_fixed_position(double* lat, double* lon) {
-  if (lat) *lat = g_uimesh ? g_uimesh->getNodeLat() : 0.0;
-  if (lon) *lon = g_uimesh ? g_uimesh->getNodeLon() : 0.0;
+  if (lat) *lat = g_fixed_position_valid ? g_fixed_position_lat : 0.0;
+  if (lon) *lon = g_fixed_position_valid ? g_fixed_position_lon : 0.0;
 }
-void mesh_set_fixed_position(double lat, double lon) {
-  if (!g_uimesh) return;
-  g_uimesh->setNodePosition(lat, lon);
-  g_deferred_flood_advert = true;
+bool mesh_set_fixed_position(double lat, double lon) {
+  bool saved = save_fixed_position_nvs(lat, lon);
+  if (saved) {
+    g_fixed_position_valid = (lat != 0.0 || lon != 0.0);
+    g_fixed_position_lat = g_fixed_position_valid ? lat : 0.0;
+    g_fixed_position_lon = g_fixed_position_valid ? lon : 0.0;
+    g_fixed_position_apply_pending = true;
+  }
+  serialmon_append(saved ? "Fixed position saved" : "Fixed position save failed");
+  return saved;
 }
-void mesh_clear_fixed_position() {
-  if (!g_uimesh) return;
-  g_uimesh->clearNodePosition();
-  g_deferred_flood_advert = true;
+bool mesh_clear_fixed_position() {
+  bool saved = clear_fixed_position_nvs();
+  if (saved) {
+    g_fixed_position_valid = false;
+    g_fixed_position_lat = 0.0;
+    g_fixed_position_lon = 0.0;
+    g_fixed_position_apply_pending = true;
+  }
+  serialmon_append(saved ? "Fixed position cleared" : "Fixed position clear failed");
+  return saved;
 }
 
 void mesh_populate_repeater_list() {

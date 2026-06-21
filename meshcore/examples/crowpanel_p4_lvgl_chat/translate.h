@@ -35,6 +35,11 @@ void translate_loop();
 // short-circuits to a no-op while a prior request is still pending.
 void translate_request_to_file(const char* text, const char* chat_key);
 
+// User-triggered translation from a bubble long-press. This gets queue
+// priority and may use the lighter plain-HTTP fallback immediately when
+// there is not enough contiguous internal/DMA heap for HTTPS.
+void translate_request_manual_to_file(const char* text, const char* chat_key);
+
 // Language helpers
 const char* translate_lang_code(int idx);
 const char* translate_lang_list();  // newline-separated for lv_dropdown
