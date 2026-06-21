@@ -121,12 +121,19 @@ The display runs on LVGL over `esp_lcd_panel_rgb`, the backlight is driven throu
 | **Custom UI** | CrowPanel-focused Meshtastic interface with chat list, message view, nodes, and settings screens |
 | **Touch Keyboard** | On-screen keyboard with a MeshCore-style layout tuned for the 5" display |
 | **Custom Channels** | Add or join Meshtastic channels directly from the device — tap the "+" on the Chats tab, enter a name, and leave the key blank to create a new channel or paste a base64 PSK to join an existing one |
-| **MQTT Controls** | Built-in MQTT settings popup (server, credentials, root topic, TLS/JSON/encryption) plus per-channel bridge toggles, including primary LongFast uplink/downlink |
+| **MQTT Controls** ⚠️ | Built-in MQTT settings popup (server, credentials, root topic, TLS/JSON/encryption) plus per-channel bridge toggles, including primary LongFast uplink/downlink — **highly experimental, see warning below** |
 | **Private Chats** | Long-press private chats to delete local chat history with confirmation |
 | **Security Tools** | Regenerate private keys directly from settings |
 | **Radio Defaults** | TX power defaults to 20 dBm, with 22 dBm still available as a manual option |
 | **Offline Maps** | Pan/zoom OpenStreetMap view that loads tiles from a microSD card — uses the **same** `/sdcard/tiles/` files as MeshCore, so one tile set serves both firmwares |
 | **CrowPanel Display** | Dedicated LVGL display setup, backlight handling, and safer display buffer fallback |
+
+> [!WARNING]
+> **MQTT on Meshtastic is highly experimental and not recommended for use.**
+> On this board it can cause memory pressure and instability under load, and may
+> crash the device. Although v1.1 includes stability fixes, MQTT remains unreliable —
+> it is best left disabled. Enable it only if you understand the risks and are
+> prepared for unexpected reboots.
 
 ---
 
