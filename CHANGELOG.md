@@ -8,27 +8,34 @@ follows simple `MAJOR.MINOR` versioning that matches the GitHub releases.
 ## [1.1] - 2026-06-21
 
 ### Added
-- **Greek and German language support** across both UIs — full Greek font set
-  and German Latin LVGL fonts (10–22 px), with on-screen keyboard layouts for
-  the new characters.
-- **Emoji rendering** via a dedicated emoji atlas/font pipeline
-  (`McEmojiAtlas`, `McEmojiFont`, `McFonts`) shared by the Meshtastic UI.
-- **Translate-on-receive** for incoming messages and richer map markers —
-  distinct marker shapes/labels with repeater markers now drawn at every zoom
-  level (z7–z12).
-- Chat history now loads up to ~7 days of messages when a conversation is
-  opened.
+- **Greek and German language support** across *both* UIs:
+  - MeshCore chat: Greek font set (`lv_font_greek`) and German Latin LVGL fonts
+    in 7 sizes (10, 12, 14, 16, 18, 20, 22 px).
+  - Meshtastic UI: dedicated `McGreekFont` and `McGermanFont` glyph sets.
+  - On-screen keyboard layouts extended to type the new Greek/German characters.
+- **Emoji rendering** in both UIs via a dedicated atlas/font pipeline
+  (`McEmojiAtlas`, `McEmojiFont`, `McFonts` on Meshtastic; `emoji_atlas` on
+  MeshCore), with prebuilt atlases shipped under `docs/`.
+- **Translate-on-receive** — incoming messages can be auto-translated as they
+  arrive.
+- **Improved map view** — distinct marker shapes and labels per node type, with
+  repeater markers now drawn at every zoom level (z7–z12).
+- **Longer chat history** — up to ~7 days of messages are loaded when a
+  conversation is opened.
 - Hosted-SDIO driver (`CrowpanelHostedSdio`) for the ESP32-P4 variant.
 
 ### Changed
 - Vendored the `ESP32_Display_Panel`, `ESP32_IO_Expander` and `esp-lib-utils`
   libraries into the tree for reproducible firmware builds.
-- Numerous mcui screen, clock, sender and node-action refinements.
+- Refreshed Meshtastic mcui throughout — theme, tab bar, keyboard, settings,
+  node list/actions, clock, sender and chat view.
+- Updated the printable enclosure models (`case_A`, `case_B` STL).
 
 ### Fixed
-- **MQTT stability** on the 5" RGB-panel board — addressed PSRAM/internal-RAM
+- **MQTT stability** on the 5" RGB-panel board — addressed PSRAM / internal-RAM
   starvation that could crash the device under bidirectional MQTT load, and
-  hardened the MQTT/ServiceEnvelope paths.
+  hardened the MQTT / `ServiceEnvelope` paths (plus related NodeDB, Router and
+  MeshService fixes).
 
 ## [1.0] - Initial release
 
