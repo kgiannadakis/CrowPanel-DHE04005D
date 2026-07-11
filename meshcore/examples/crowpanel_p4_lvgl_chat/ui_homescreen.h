@@ -22,6 +22,9 @@ extern lv_obj_t * ui_textsend_counter;
 extern lv_obj_t * ui_backbutton;
 extern lv_obj_t * ui_backlabel;
 extern lv_obj_t * ui_timelabel;
+extern lv_obj_t * ui_batterylabel;
+extern lv_obj_t * ui_batterybody;
+extern lv_obj_t * ui_batteryfill;
 extern lv_obj_t * ui_Keyboard1;
 
 // Stubs kept for link-compat — main.cpp may reference these nav buttons

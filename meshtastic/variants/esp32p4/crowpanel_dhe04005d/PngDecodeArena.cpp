@@ -53,8 +53,15 @@ static const char *TAG = "png_arena";
 // fragmentation headroom. Kept well under PSRAM's 32 MB so the single RGB
 // framebuffer (~768 KB), LVGL partial draw buffers, and ESP-Hosted WiFi/MQTT
 // have ample room (~20 MB left). Raise if larger viewports need more cache.
+// Sized to hold BOTH the decoded-tile image cache AND all of LVGL's general
+// allocations (widget tree, draw tasks, decoder instances). Since 2.7.26 the
+// LVGL allocator is routed to THIS same multi_heap (see crowpanel_lvgl_alloc:
+// crowpanel_shared_heap()) so that one robust, integrity-checked PSRAM heap
+// backs everything — a decoded buffer can never be freed into a different heap
+// than it was allocated from (the cross-heap free that corrupted the split
+// two-heap layout). Budget: ~9.5 MB image cache + ~0.5 MB UI + decode scratch.
 #ifndef PNG_ARENA_SIZE
-#define PNG_ARENA_SIZE (12u * 1024u * 1024u)
+#define PNG_ARENA_SIZE (16u * 1024u * 1024u)
 #endif
 
 // Unwrapped original, provided by the linker via -Wl,--wrap=heap_caps_malloc
@@ -62,6 +69,7 @@ static const char *TAG = "png_arena";
 // reservation reaches real PSRAM. It is called before the framebuffer init, so
 // the system PSRAM heap is still intact at that moment.
 extern "C" void *__real_heap_caps_malloc(size_t size, uint32_t caps);
+extern "C" void *__real_heap_caps_aligned_alloc(size_t alignment, size_t size, uint32_t caps);
 
 static multi_heap_handle_t s_arena = nullptr;
 static uint8_t * s_region_base = nullptr;
@@ -110,6 +118,16 @@ void png_decode_arena_reserve(void)
              (unsigned)multi_heap_free_size(s_arena));
 }
 
+// Expose the arena's multi_heap so the LVGL custom allocator can share it.
+// Returns nullptr until png_decode_arena_reserve() has run. Sharing one heap
+// for LVGL structs AND decoded image buffers makes a cross-heap free (which
+// corrupts a heap and was the root cause of the map-screen freeze/crash)
+// structurally impossible.
+void *crowpanel_shared_heap(void)
+{
+    return static_cast<void *>(s_arena);
+}
+
 // Install the arena allocator into LVGL's image-cache draw-buf handlers so the
 // decoded ARGB8888 output buffer comes from the arena. MUST be called AFTER
 // lv_init() (which initializes the default handlers).
@@ -143,6 +161,19 @@ bool png_decode_arena_try_free_ptr(void *ptr)
         return false;
     multi_heap_free(s_arena, ptr);
     return true;
+}
+
+// General-purpose allocation from the arena for large, long-lived UI assets
+// (emoji atlas glyphs etc.). Once the PSRAM guard is armed, plain SPIRAM
+// allocations get redirected to INTERNAL RAM — a ~180 KB asset would consume
+// the entire DMA/internal pool (starving ESP-Hosted until its SDIO driver
+// asserts). Same serialization assumption as the decode handlers: callers run
+// on the UI task. Returns NULL if the arena is unavailable or full.
+void *png_decode_arena_malloc(size_t size)
+{
+    if (!s_arena)
+        return nullptr;
+    return multi_heap_malloc(s_arena, size);
 }
 
 // --- lodepng scratch allocators (paired with -DLODEPNG_NO_COMPILE_ALLOCATORS) -

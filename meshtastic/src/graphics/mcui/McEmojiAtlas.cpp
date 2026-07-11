@@ -42,8 +42,21 @@ struct AtlasSlot {
 AtlasSlot s_slots[EMOJI_SIZE_COUNT] = {};
 sdmmc_card_t *s_sd_card = nullptr;
 
+#if defined(CROWPANEL_DHE04005D)
+extern "C" void *png_decode_arena_malloc(size_t size);
+#endif
+
 void *psram_alloc(size_t bytes)
 {
+#if defined(CROWPANEL_DHE04005D)
+    // On the P4 the PSRAM guard redirects post-FB-init SPIRAM allocations to
+    // INTERNAL RAM; the atlas (~180 KB) would consume the whole DMA/internal
+    // pool and starve ESP-Hosted (SDIO assert). Use the pre-reserved PSRAM
+    // arena, which survives the framebuffer heap corruption.
+    void *arena = png_decode_arena_malloc(bytes);
+    if (arena)
+        return arena;
+#endif
     void *p = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!p)
         p = heap_caps_malloc(bytes, MALLOC_CAP_DEFAULT);

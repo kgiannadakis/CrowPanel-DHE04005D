@@ -135,6 +135,8 @@ extern volatile bool g_ppa_recovery_redraw_pending;
 // 90° rotation on the CPU. Slower but rock-solid.
 static constexpr uint32_t kPpaConsecutiveFailLimit = 3;
 static volatile uint32_t  s_ppa_consecutive_fails  = 0;
+// PPA hardware rotation for portrait flushes. Auto-falls back to CPU rotation
+// if the PPA misbehaves (kPpaConsecutiveFailLimit consecutive failures).
 volatile bool             g_ppa_disabled           = false;
 
 // Software 90° CCW rotation of `src` (rect_w × rect_h) into
@@ -432,7 +434,7 @@ bool display_init(void) {
   cfg.num_fbs               = 2;
   // Larger bounce buffers reduce RGB DMA starvation during heavy UI redraws
   // (fast scroll / map pans), which is a common source of tearing bands.
-  cfg.bounce_buffer_size_px = H_size * 40;
+  cfg.bounce_buffer_size_px = H_size * 30;
   cfg.dma_burst_size        = 64;
   cfg.flags.fb_in_psram     = 1;
 

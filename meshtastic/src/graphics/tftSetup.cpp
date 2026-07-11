@@ -24,6 +24,10 @@ void tftSetup(void) { mcui::setup(); }
 
 DeviceScreen *deviceScreen = nullptr;
 
+#ifndef TFT_TASK_STACK_SIZE
+#define TFT_TASK_STACK_SIZE 16384
+#endif
+
 #ifdef ARCH_ESP32
 // Get notified when the system is entering light sleep
 CallbackObserver<DeviceScreen, void *> tftSleepObserver =
@@ -135,7 +139,7 @@ void tftSetup(void)
 #ifdef ARCH_ESP32
         tftSleepObserver.observe(&notifyLightSleep);
         endSleepObserver.observe(&notifyLightSleepEnd);
-        xTaskCreatePinnedToCore(tft_task_handler, "tft", 10240, NULL, 1, NULL, 0);
+        xTaskCreatePinnedToCore(tft_task_handler, "tft", TFT_TASK_STACK_SIZE, NULL, 1, NULL, 0);
 #elif defined(ARCH_PORTDUINO)
         std::thread *tft_task = new std::thread([] { tft_task_handler(); });
 #endif

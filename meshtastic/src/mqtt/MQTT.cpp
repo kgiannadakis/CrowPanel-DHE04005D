@@ -20,12 +20,16 @@
 #include <WiFi.h>
 #if defined(ARCH_ESP32P4) && defined(CROWPANEL_DHE04005D) && !defined(ARCH_PORTDUINO)
 #include <errno.h>
+#include <esp_heap_caps.h>
 #include <lwip/sockets.h>
 #endif
 #endif
 #if HAS_ETHERNET && defined(USE_WS5500)
 #include <ETHClass2.h>
 #define ETH ETH2
+#elif HAS_ETHERNET && defined(USE_CH390D)
+#include "ESP32_CH390.h"
+#define ETH CH390
 #endif // HAS_ETHERNET
 #include "Default.h"
 #if !defined(ARCH_NRF52) || NRF52_USE_JSON
@@ -36,7 +40,7 @@
 #include <assert.h>
 #include <utility>
 
-#include <IPAddress.h>
+#include "IPAddress.h"
 #if defined(ARCH_PORTDUINO)
 #include <netinet/in.h>
 #elif !defined(ntohl)
@@ -119,9 +123,38 @@ static bool crowpanelSubscriptionsPending = false;
 #if defined(CROWPANEL_DHE04005D)
 static constexpr uint8_t MQTT_SUBSCRIBE_QOS = 0;
 static constexpr uint16_t MQTT_KEEPALIVE_SECONDS = 0;
-static constexpr uint8_t MQTT_PUBLIC_BROADCAST_DECRYPTS_PER_SEC = 1;
-static constexpr uint32_t MQTT_PUBLIC_LOOP_INTERVAL_MS = 2000;
-static constexpr uint32_t MQTT_PUBLIC_DECODE_FAILURE_PAUSE_MS = 10000;
+// 8 (was 1): the per-second decode budget for encrypted broadcasts (channel
+// text is an encrypted broadcast, so 1/s could DROP your own channel traffic on
+// a busy public feed). Raised now that the DMA-pressure guard + lifeboat below
+// protect against the old SDIO RX-buffer assert. Known foreign-key spammers are
+// muted by sender BEFORE consuming this budget (see isBadSender), so the budget
+// is mostly spent on decodable traffic.
+static constexpr uint8_t MQTT_PUBLIC_BROADCAST_DECRYPTS_PER_SEC = 8;
+// 100 ms (was 2000): how often the broker socket is drained. This is the primary
+// message-delivery latency. Polling faster ALSO reduces DMA pressure — unread
+// broker data accumulates as lwIP pbufs in the same internal DMA pool ESP-Hosted
+// needs, so a slow poll let it erode (14K->1K in 2 min); draining promptly frees
+// those pbufs. The DMA-pressure guard at the top of runOnce() remains the safety
+// net if a burst still collapses the pool. Stock meshtastic uses 20 ms.
+static constexpr uint32_t MQTT_PUBLIC_LOOP_INTERVAL_MS = 100;
+// Short blanket pause, and only after several consecutive failures: a single
+// foreign-keyed packet must not make us deaf to the whole public broker.
+// Persistent offenders are handled per-gateway (see badGateways below).
+static constexpr uint32_t MQTT_PUBLIC_DECODE_FAILURE_PAUSE_MS = 3000;
+static constexpr uint8_t MQTT_PUBLIC_DECODE_FAILURE_THRESHOLD = 3;
+// Mute by SENDER node id, not by gateway: gateways relay a mix of good
+// (default-key) and foreign-keyed traffic, so muting a gateway also drops
+// good packets. The `from` header is cleartext even on encrypted payloads.
+static constexpr uint32_t MQTT_BAD_SENDER_SKIP_MS = 600000; // 10 min
+static constexpr size_t MQTT_BAD_SENDER_SLOTS = 8;
+struct BadSenderEntry {
+    uint32_t node;    // sending node id whose packets we can't decode
+    uint32_t untilMs; // skip this sender until this time; 0 = free slot
+};
+static BadSenderEntry badSenders[MQTT_BAD_SENDER_SLOTS] = {};
+static uint8_t consecutiveDecodeFailures = 0;
+static uint32_t lastBadSenderSkipLog = 0;
+static uint32_t badSenderSkipCount = 0;
 #else
 static constexpr uint8_t MQTT_SUBSCRIBE_QOS = 1;
 static constexpr uint16_t MQTT_KEEPALIVE_SECONDS = 15;
@@ -151,6 +184,59 @@ inline bool isPublicDownlinkPaused()
     return false;
 #endif
 }
+
+#if defined(CROWPANEL_DHE04005D)
+inline bool isBadSender(uint32_t node)
+{
+    if (node == 0)
+        return false;
+    const uint32_t now = millis();
+    for (auto &e : badSenders) {
+        if (e.untilMs != 0 && (int32_t)(e.untilMs - now) <= 0)
+            e.untilMs = 0; // expired
+        if (e.untilMs != 0 && e.node == node)
+            return true;
+    }
+    return false;
+}
+
+inline void markBadSender(uint32_t node)
+{
+    if (node == 0)
+        return;
+    const uint32_t now = millis();
+    BadSenderEntry *slot = nullptr;
+    BadSenderEntry *oldest = &badSenders[0];
+    for (auto &e : badSenders) {
+        if (e.untilMs != 0 && e.node == node) {
+            slot = &e; // already listed: refresh expiry
+            break;
+        }
+        if (!slot && (e.untilMs == 0 || (int32_t)(e.untilMs - now) <= 0))
+            slot = &e;
+        if ((int32_t)(e.untilMs - oldest->untilMs) < 0)
+            oldest = &e;
+    }
+    if (!slot)
+        slot = oldest; // all slots busy: recycle the one expiring soonest
+    slot->node = node;
+    slot->untilMs = now + MQTT_BAD_SENDER_SKIP_MS;
+    if (slot->untilMs == 0)
+        slot->untilMs = 1; // 0 means "free slot"
+    LOG_WARN("CrowPanel MQTT skip sender 0x%08x for %us: undecodable traffic", (unsigned)node,
+             (unsigned)(MQTT_BAD_SENDER_SKIP_MS / 1000));
+}
+
+inline void logBadSenderSkip(uint32_t node)
+{
+    badSenderSkipCount++;
+    if (lastBadSenderSkipLog == 0 || !Throttle::isWithinTimespanMs(lastBadSenderSkipLog, MQTT_REJECT_LOG_INTERVAL_MS)) {
+        LOG_DEBUG("Skipped packets from foreign-keyed MQTT senders: count=%u latest 0x%08x", badSenderSkipCount, (unsigned)node);
+        badSenderSkipCount = 0;
+        lastBadSenderSkipLog = millis();
+    }
+}
+#endif
 
 inline bool mqttContactDiscoveryEnabled()
 {
@@ -358,16 +444,31 @@ inline void onReceiveProto(char *topic, byte *payload, size_t length)
             router->enqueueReceivedMessage(p.release());
         }
     } else if (router) {
+#if defined(CROWPANEL_DHE04005D)
+        if (isCrowPanelPublicDefaultMqtt() && isBadSender(p->from)) {
+            // This node's packets recently failed decode (foreign key on our
+            // channel hash); drop just its packets instead of pausing everything.
+            logBadSenderSkip(p->from);
+            return;
+        }
+#endif
         if (!allowPublicMqttBroadcastDecode(*p))
             return;
         if (perhapsDecode(p.get()) != DecodeState::DECODE_SUCCESS) { // ignore messages if we don't have the channel key
 #if defined(CROWPANEL_DHE04005D)
             if (mqtt && isCrowPanelPublicDefaultMqtt()) {
-                mqtt->pausePublicDownlink(MQTT_PUBLIC_DECODE_FAILURE_PAUSE_MS, "MQTT decode failure");
+                markBadSender(p->from);
+                if (++consecutiveDecodeFailures >= MQTT_PUBLIC_DECODE_FAILURE_THRESHOLD) {
+                    consecutiveDecodeFailures = 0;
+                    mqtt->pausePublicDownlink(MQTT_PUBLIC_DECODE_FAILURE_PAUSE_MS, "MQTT decode failure");
+                }
             }
 #endif
             return;
         }
+#if defined(CROWPANEL_DHE04005D)
+        consecutiveDecodeFailures = 0;
+#endif
         if (isMqttContactDiscoveryPacket(*p)) {
             logIgnoredMqttContactDiscovery(p->decoded.portnum);
             return;
@@ -579,6 +680,9 @@ inline bool isConnectedToNetwork()
 #ifdef USE_WS5500
     if (ETH.connected())
         return true;
+#elif defined(USE_CH390D)
+    if (ETH.isConnected())
+        return true;
 #endif
 
 #if HAS_WIFI
@@ -644,8 +748,30 @@ void MQTT::onReceive(char *topic, byte *payload, size_t length)
     onReceiveProto(topic, payload, length);
 }
 
+#if defined(ARCH_ESP32P4) && defined(CROWPANEL_DHE04005D) && !defined(ARCH_PORTDUINO)
+// DMA "lifeboat": a sacrificial reserve of DMA-capable internal RAM. The
+// precompiled ESP-Hosted SDIO driver asserts (reboots) when a ~2 KB RX buffer
+// allocation fails, and app-level backpressure can't stop the C6 delivering
+// LAN multicast/TCP-control frames. When the guard sees the pool collapsing,
+// releasing this block instantly gives the driver contiguous headroom.
+static uint8_t *s_dmaLifeboat = nullptr;
+static constexpr size_t kDmaLifeboatBytes = 16 * 1024;
+
+static void dmaLifeboatAcquire()
+{
+    if (!s_dmaLifeboat)
+        s_dmaLifeboat = (uint8_t *)heap_caps_malloc(kDmaLifeboatBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+}
+#endif
+
 void mqttInit()
 {
+#if defined(ARCH_ESP32P4) && defined(CROWPANEL_DHE04005D) && !defined(ARCH_PORTDUINO)
+    // Reserve the lifeboat now, while the internal heap is still fresh.
+    dmaLifeboatAcquire();
+    LOG_INFO("CrowPanel DMA lifeboat %s (%u bytes)", s_dmaLifeboat ? "reserved" : "UNAVAILABLE",
+             (unsigned)kDmaLifeboatBytes);
+#endif
     new MQTT();
 }
 
@@ -910,10 +1036,84 @@ int32_t MQTT::runOnce()
         return disable();
     bool wantConnection = wantsLink();
 
+#if HAS_NETWORKING && defined(ARCH_ESP32P4) && defined(CROWPANEL_DHE04005D) && !defined(ARCH_PORTDUINO)
+    {
+        // The precompiled ESP-Hosted SDIO driver in the framework asserts (and
+        // reboots) if it can't allocate an internal RX buffer. Back-pressure the
+        // broker link before that point: stop servicing the socket so the TCP
+        // window closes and the C6 stops pushing frames until heap recovers.
+        // Watch DMA-CAPABLE internal memory specifically: on the P4 a chunk of
+        // internal RAM (TCM) is 8-bit-capable but NOT DMA-capable, so the
+        // plain INTERNAL|8BIT numbers can look healthy (90+ KB) while the DMA
+        // pool ESP-Hosted allocates its SDIO RX buffers from is already empty
+        // (observed: internal8 free=28k while dma free=432 → copy_payload
+        // assert with no warning).
+        // Thresholds calibrated to this board's normal operating level: the
+        // DMA pool hovers around ~30 KB free in steady state (everything
+        // dynamic allocates from it), and the SDIO driver needs ~2 KB per RX
+        // frame. Trip below 20 KB / 6 KB-largest — enough cushion for hosted
+        // bursts without pinning the guard during normal operation.
+        size_t freeDma = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        size_t largestDma = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        if (s_dmaLifeboat && largestDma < 6 * 1024) {
+            // Pool is collapsing: hand the reserve to the SDIO driver before
+            // its next RX allocation fails and asserts.
+            heap_caps_free(s_dmaLifeboat);
+            s_dmaLifeboat = nullptr;
+            LOG_WARN("CrowPanel DMA lifeboat RELEASED (largest block was %u)", (unsigned)largestDma);
+            freeDma = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+            largestDma = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        } else if (!s_dmaLifeboat && freeDma > 48 * 1024 && largestDma > 24 * 1024) {
+            // Pressure long gone: re-arm the reserve for the next spike.
+            dmaLifeboatAcquire();
+            if (s_dmaLifeboat) {
+                LOG_INFO("CrowPanel DMA lifeboat re-armed");
+                freeDma = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+                largestDma = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+            }
+        }
+        // The armed lifeboat counts as spendable headroom for the pressure
+        // decision — otherwise reserving it would only trip the guard 16 KB
+        // earlier for nothing.
+        const size_t effectiveFree = freeDma + (s_dmaLifeboat ? kDmaLifeboatBytes : 0);
+        static bool dmaPressureDisconnected = false;
+        if (dmaPressureDisconnected) {
+            if (freeDma > 32 * 1024 && largestDma > 12 * 1024) {
+                dmaPressureDisconnected = false;
+                LOG_WARN("CrowPanel MQTT DMA pressure cleared (free=%u largest=%u); reconnecting broker", (unsigned)freeDma,
+                         (unsigned)largestDma);
+                // fall through: the normal flow below reconnects and resubscribes
+            } else {
+                return 2000; // stay offline until the pool genuinely recovers
+            }
+        } else if (effectiveFree < 20 * 1024 || largestDma < 6 * 1024) {
+            const size_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            LOG_WARN("CrowPanel MQTT DMA pressure: dma free=%u largest=%u lifeboat=%d (internal8 free=%u)", (unsigned)freeDma,
+                     (unsigned)largestDma, s_dmaLifeboat ? 1 : 0, (unsigned)freeInternal);
+            // Disconnect outright rather than pausing reads: a paused-but-
+            // subscribed socket keeps accumulating broker data as lwIP pbufs
+            // in this very pool until the TCP window fills (observed erosion
+            // 14K->1K in two minutes). Dropping the connection frees the
+            // socket buffers and stops the inbound traffic at the source.
+            if (!moduleConfig.mqtt.proxy_to_client_enabled && isConnectedDirectly()) {
+                LOG_WARN("CrowPanel MQTT disconnecting broker until DMA pool recovers");
+                pubSub.disconnect();
+            }
+            dmaPressureDisconnected = true;
+            return 2000;
+        }
+    }
+#endif
+
 #if HAS_NETWORKING && defined(CROWPANEL_DHE04005D)
     if (isCrowPanelPublicDefaultMqtt() && publicDownlinkPauseUntilMs != 0) {
         const uint32_t now = millis();
         if ((int32_t)(publicDownlinkPauseUntilMs - now) > 0) {
+            // Downlink stays paused, but our own uploads must not starve: when a
+            // decode-failure storm keeps re-arming the pause every <10s, queued
+            // publishes would otherwise never reach the broker (the drain below
+            // this early return would never run).
+            publishQueuedMessages();
             return 1000;
         }
         publicDownlinkPauseUntilMs = 0;
@@ -956,6 +1156,20 @@ int32_t MQTT::runOnce()
             sendSubscriptions();
         }
         publishQueuedMessages();
+
+        // PubSubClient::loop() (called once in the condition above) processes at
+        // most ONE packet per call, so a single poll caps delivery at 1 pkt per
+        // interval and lets the rest sit in the socket as DMA-pool pbufs. Drain a
+        // bounded burst here to cut delivery latency AND actively relieve DMA
+        // pressure (each processed packet frees its pbuf). Bounded so we never
+        // starve the radio/UI threads on a firehose feed; the DMA-pressure guard
+        // at the top of runOnce() re-checks on the next pass. onReceive() still
+        // applies the per-second decode budget, so this doesn't uncork unlimited
+        // AES work — it just stops the socket backlog.
+        for (int i = 0; i < 15; i++) {
+            if (!pubSub.loop())
+                break;
+        }
 #endif
 
         powerFSM.trigger(EVENT_CONTACT_FROM_PHONE); // Suppress entering light sleep (because that would turn off bluetooth)

@@ -307,12 +307,17 @@ class NodeDB
         newStatus.notifyObservers(&status);
     }
 
+    /// CrowPanel: flush the batched new-node save if its deadline passed (or force).
+    void flushPendingNodeDbSave(bool force = false);
+
   private:
     static constexpr uint32_t NEW_NODE_SAVE_INTERVAL_MS = 5000;
     bool duplicateWarned = false;
     bool localPositionUpdatedSinceBoot = false;
     uint32_t lastNodeDbSave = 0;    // when we last saved our db to flash
     uint32_t lastNodeDbNewNodeSave = 0; // fast debounce window for newly discovered nodes
+    uint32_t nodeDbBatchPendingSince = 0; // 0 = no batched new-node save pending
+    uint16_t nodeDbBatchPendingCount = 0; // new nodes accumulated in the pending batch
     uint32_t lastBackupAttempt = 0; // when we last tried a backup automatically or manually
     uint32_t lastSort = 0;          // When last sorted the nodeDB
     /// Find a node in our DB, create an empty NodeInfoLite if missing

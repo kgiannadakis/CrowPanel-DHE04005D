@@ -9,7 +9,7 @@
 #include <RAK13800_W5100S.h>
 #include <SPI.h>
 
-#if HAS_NETWORKING
+#if HAS_NETWORKING && !defined(USE_WS5500) && !defined(USE_CH390D)
 
 #ifndef DISABLE_NTP
 #include <NTPClient.h>
@@ -101,7 +101,6 @@ static int32_t reconnectETH()
             LOG_INFO("Start Ethernet network services");
 
 #ifndef DISABLE_NTP
-            timeClient.begin();
             timeClient.setUpdateInterval(60 * 60); // Update once an hour
 #endif
 
@@ -153,6 +152,7 @@ static int32_t reconnectETH()
         } else {
             ntp_renew = millis() + 300 * 1000; // failure, retry every 5 minutes
         }
+        timeClient.end(); // W5100S: release UDP socket for other services
     }
 #endif
 

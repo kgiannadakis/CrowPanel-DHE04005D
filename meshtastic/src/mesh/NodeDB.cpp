@@ -9,6 +9,7 @@
 #include "FSCommon.h"
 #include "MeshRadio.h"
 #include "MeshService.h"
+#include "MessageStore.h"
 #include "NodeDB.h"
 #include "PacketHistory.h"
 #include "PowerFSM.h"
@@ -17,6 +18,7 @@
 #include "Router.h"
 #include "SPILock.h"
 #include "SafeFile.h"
+#include "TransmitHistory.h"
 #include "TypeConversions.h"
 #include "error.h"
 #include "main.h"
@@ -96,6 +98,14 @@ static unsigned char userprefs_admin_key_1[] = USERPREFS_USE_ADMIN_KEY_1;
 #ifdef USERPREFS_USE_ADMIN_KEY_2
 static unsigned char userprefs_admin_key_2[] = USERPREFS_USE_ADMIN_KEY_2;
 #endif
+
+// Weak empty variant initialization function.
+// May be redefined by variant files.
+void variantDefaultConfig() __attribute__((weak));
+void variantDefaultConfig() {}
+
+void variantDefaultModuleConfig() __attribute__((weak));
+void variantDefaultModuleConfig() {}
 
 #ifdef HELTEC_MESH_NODE_T114
 
@@ -527,6 +537,15 @@ bool NodeDB::factoryReset(bool eraseBleBonds)
     }
 #endif
     spiLock->unlock();
+
+    // rmDir above nuked the .dat file, but TransmitHistory's in-memory
+    // cache auto-flushes every 5 min and would resurrect it.
+    if (transmitHistory) {
+        transmitHistory->clear();
+    }
+#if HAS_SCREEN
+    messageStore.clearAllMessages();
+#endif
     // second, install default state (this will deal with the duplicate mac address issue)
     installDefaultNodeDatabase();
     installDefaultDeviceState();
@@ -585,7 +604,11 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
     config.lora.tx_enabled =
         true; // FIXME: maybe false in the future, and setting region to enable it. (unset region forces it off)
     config.lora.override_duty_cycle = false;
+#if defined(CROWPANEL_DHE04005D)
+    config.lora.config_ok_to_mqtt = true; // default ON: this build operates on public MQTT
+#else
     config.lora.config_ok_to_mqtt = false;
+#endif
 #if HAS_LORA_FEM
     config.lora.fem_lna_mode = meshtastic_Config_LoRaConfig_FEM_LNA_Mode_ENABLED;
 #else
@@ -699,7 +722,7 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
     strncpy(config.network.ntp_server, "meshtastic.pool.ntp.org", 32);
 
 #if (defined(T_DECK) || defined(T_WATCH_S3) || defined(UNPHONE) || defined(PICOMPUTER_S3) || defined(SENSECAP_INDICATOR) ||      \
-     defined(ELECROW_PANEL) || defined(HELTEC_V4_TFT)) &&                                                                        \
+     defined(ELECROW_PANEL) || defined(HELTEC_V4_TFT) || defined(HELTEC_V4_R8_TFT)) &&                                           \
     HAS_TFT
     // switch BT off by default; use TFT programming mode or hotkey to enable
     config.bluetooth.enabled = false;
@@ -796,6 +819,8 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
 #endif
 
     initConfigIntervals();
+    variantDefaultConfig();
+    variantDefaultModuleConfig();
 }
 
 void NodeDB::initConfigIntervals()
@@ -841,7 +866,8 @@ void NodeDB::installDefaultModuleConfig()
     moduleConfig.has_store_forward = true;
     moduleConfig.has_telemetry = true;
     moduleConfig.has_external_notification = true;
-#if defined(PIN_BUZZER) || defined(PIN_VIBRATION) || defined(LED_NOTIFICATION)
+#if defined(PIN_BUZZER) || defined(PIN_VIBRATION) || defined(LED_NOTIFICATION) || defined(PCA_LED_NOTIFICATION) ||               \
+    defined(NEOPIXEL_STATUS_NOTIFICATION_PIN)
     moduleConfig.external_notification.enabled = true;
 #endif
 #if defined(PIN_BUZZER)
@@ -862,7 +888,7 @@ void NodeDB::installDefaultModuleConfig()
 #endif
 #if defined(PIN_VIBRATION)
     moduleConfig.external_notification.nag_timeout = 2;
-#elif defined(PIN_BUZZER) || defined(LED_NOTIFICATION)
+#elif defined(PIN_BUZZER) || defined(LED_NOTIFICATION) || defined(NEOPIXEL_STATUS_NOTIFICATION_PIN)
     moduleConfig.external_notification.nag_timeout = default_ringtone_nag_secs;
 #endif
 
@@ -933,7 +959,11 @@ void NodeDB::installDefaultModuleConfig()
 #else
     moduleConfig.mqtt.tls_enabled = default_mqtt_tls_enabled;
 #endif
+#if defined(CROWPANEL_DHE04005D)
+    moduleConfig.mqtt.mqtt_contact_discovery_enabled = true; // default ON for this build
+#else
     moduleConfig.mqtt.mqtt_contact_discovery_enabled = false;
+#endif
 
     moduleConfig.has_neighbor_info = true;
     moduleConfig.neighbor_info.enabled = false;
@@ -1227,11 +1257,11 @@ void NodeDB::loadFromDisk()
     spiLock->unlock();
 #endif
 #ifdef FSCom
-#ifdef FACTORY_INSTALL
+#if defined(FACTORY_INSTALL) && !defined(ARCH_PORTDUINO)
     spiLock->lock();
     if (!FSCom.exists("/prefs/" xstr(BUILD_EPOCH))) {
         LOG_WARN("Factory Install Reset!");
-        FSCom.format();
+        rmDir("/prefs");
         FSCom.mkdir("/prefs");
         File f2 = FSCom.open("/prefs/" xstr(BUILD_EPOCH), FILE_O_WRITE);
         if (f2) {
@@ -1621,6 +1651,13 @@ bool NodeDB::saveToDiskNoRetry(int saveWhat)
 bool NodeDB::saveToDisk(int saveWhat)
 {
     LOG_DEBUG("Save to disk %d", saveWhat);
+#if defined(CROWPANEL_DHE04005D)
+    if (saveWhat & SEGMENT_NODEDATABASE) {
+        // Any nodedb write (batched, shutdown, settings...) satisfies the batch.
+        nodeDbBatchPendingSince = 0;
+        nodeDbBatchPendingCount = 0;
+    }
+#endif
 
     // do not try to save anything if power level is not safe. In many cases flash will be lock-protected
     // and all writes will fail anyway. Device should be sleeping at this point anyway.
@@ -1916,14 +1953,20 @@ bool NodeDB::updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelInde
         uint32_t saveInterval = isNewNode ? newNodeSaveIntervalMs() : ONE_MINUTE_MS;
         uint32_t &lastSaveRef = isNewNode ? lastNodeDbNewNodeSave : lastNodeDbSave;
 #if defined(CROWPANEL_DHE04005D)
-        // The CrowPanel P4 boards reboot/crash often, and the throttled new-node cadence
-        // (plus the first-boot window where lastSaveRef==0 suppresses writes for a full
-        // interval) was losing freshly learned node NAMES, so a discovered contact reverted
-        // to "!hexid" after restart. Learning a node's name is a rare, discrete event (MQTT
-        // contact-discovery NodeInfo is already dropped upstream when that setting is off),
-        // so persist it immediately. Updates to existing nodes keep the slower cadence.
-        if (isNewNode)
-            saveInterval = 0;
+        // Batch new-node persistence. The previous immediate-save-per-node policy
+        // (added when the board crashed often and lost learned names) made MQTT
+        // contact-discovery bursts rewrite the whole nodes.proto file dozens of
+        // times a minute. A batch flushes after 10 new nodes or 30 s (see
+        // flushPendingNodeDbSave, also ticked from updateFrom on packet activity),
+        // so a discovery burst costs a couple of flash writes instead of dozens
+        // while a freshly learned name still hits flash within seconds.
+        if (isNewNode) {
+            if (nodeDbBatchPendingSince == 0)
+                nodeDbBatchPendingSince = millis();
+            nodeDbBatchPendingCount++;
+            flushPendingNodeDbSave(nodeDbBatchPendingCount >= 10);
+            return changed;
+        }
 #endif
         if (saveInterval == 0 || !Throttle::isWithinTimespanMs(lastSaveRef, saveInterval)) {
             saveToDisk(SEGMENT_NODEDATABASE);
@@ -1942,12 +1985,30 @@ bool NodeDB::updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelInde
 
 /// given a subpacket sniffed from the network, update our DB state
 /// we updateGUI and updateGUIforNode if we think our this change is big enough for a redraw
+void NodeDB::flushPendingNodeDbSave(bool force)
+{
+#if defined(CROWPANEL_DHE04005D)
+    if (nodeDbBatchPendingSince == 0)
+        return;
+    if (!force && Throttle::isWithinTimespanMs(nodeDbBatchPendingSince, 30000))
+        return;
+    LOG_DEBUG("Flush batched NodeDB save (%u new nodes)", (unsigned)nodeDbBatchPendingCount);
+    saveToDisk(SEGMENT_NODEDATABASE); // clears the pending batch
+    const uint32_t now = millis();
+    lastNodeDbNewNodeSave = now;
+    lastNodeDbSave = now;
+#else
+    (void)force;
+#endif
+}
+
 void NodeDB::updateFrom(const meshtastic_MeshPacket &mp)
 {
     if (mp.from == getNodeNum()) {
         LOG_DEBUG("Ignore update from self");
         return;
     }
+    flushPendingNodeDbSave(false); // batched new-node save, at most every 30 s
     if (mp.which_payload_variant == meshtastic_MeshPacket_decoded_tag && mp.from) {
         if (mp.via_mqtt && !mqttContactDiscoveryEnabled()) {
             LOG_DEBUG("Skip MQTT contact update from 0x%x", mp.from);
@@ -2176,11 +2237,22 @@ meshtastic_NodeInfoLite *NodeDB::getOrCreateMeshNode(NodeNum n)
         // Persist newly discovered nodes promptly, even if they first arrive via
         // telemetry/position and user info comes later. This helps node discovery
         // survive quick reboot/power loss without waiting for periodic saves.
-        if (n != getNodeNum() && !Throttle::isWithinTimespanMs(lastNodeDbNewNodeSave, newNodeSaveIntervalMs())) {
-            saveToDisk(SEGMENT_NODEDATABASE);
-            const uint32_t now = millis();
-            lastNodeDbNewNodeSave = now;
-            lastNodeDbSave = now;
+        if (n != getNodeNum()) {
+#if defined(CROWPANEL_DHE04005D)
+            // Join the batched new-node save instead of writing per node
+            // (discovery bursts otherwise rewrite the whole DB file constantly).
+            if (nodeDbBatchPendingSince == 0)
+                nodeDbBatchPendingSince = millis();
+            nodeDbBatchPendingCount++;
+            flushPendingNodeDbSave(nodeDbBatchPendingCount >= 10);
+#else
+            if (!Throttle::isWithinTimespanMs(lastNodeDbNewNodeSave, newNodeSaveIntervalMs())) {
+                saveToDisk(SEGMENT_NODEDATABASE);
+                const uint32_t now = millis();
+                lastNodeDbNewNodeSave = now;
+                lastNodeDbSave = now;
+            }
+#endif
         }
     }
 

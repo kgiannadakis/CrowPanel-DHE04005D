@@ -20,6 +20,11 @@ void mesh_set_time_epoch(uint32_t epoch);
 void update_timelabel();
 String time_string_now();
 
+// Battery (onboard STC8). battery_poll() reads I2C off-lock; update_batterylabel()
+// applies the cached reading to the status bar under the LVGL lock.
+void battery_poll();
+void update_batterylabel();
+
 // SNR
 int snr_to_bars(int8_t snr);
 void snr_contact_update(const uint8_t* pub_key, int8_t snr);

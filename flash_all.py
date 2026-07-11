@@ -17,7 +17,7 @@ Examples:
     python flash_all.py /dev/cu.usbserial   (macOS)
 """
 
-import subprocess, sys, os, glob, shutil
+import subprocess, sys, os, glob, shutil, csv
 
 # Prefer the standalone PlatformIO install (Python 3.11) over a pio that may
 # be installed under a newer Python. The pioarduino platform-espressif32
@@ -52,6 +52,39 @@ BUILDS = [
 ENVS = {name: env for name, env in BUILDS}
 
 
+def parse_num(s):
+    return int(s.strip(), 0)
+
+
+def parse_partitions_csv(path):
+    parts = {}
+    with open(path, newline="") as fp:
+        for row in csv.reader(line for line in fp if not line.lstrip().startswith("#")):
+            if len(row) < 5:
+                continue
+            name = row[0].strip()
+            if not name:
+                continue
+            parts[name] = {
+                "type": row[1].strip(),
+                "subtype": row[2].strip(),
+                "offset": parse_num(row[3]),
+                "size": parse_num(row[4]),
+            }
+    return parts
+
+
+def require_fits(label, filename, part):
+    size = os.path.getsize(filename)
+    if size > part["size"]:
+        print(
+            f"ERROR: {label} image is too large for partition "
+            f"({size:#x} bytes > {part['size']:#x})."
+        )
+        print(f"       file: {filename}")
+        sys.exit(1)
+
+
 def find_firmware(proj, env):
     build_dir = os.path.join(REPO_DIR, proj, ".pio", "build", env)
     if not os.path.isdir(build_dir):
@@ -72,6 +105,13 @@ def build_all():
 
 
 def flash():
+    partitions_csv = os.path.join(REPO_DIR, "selector", "partitions_dualboot.csv")
+    parts = parse_partitions_csv(partitions_csv)
+    for required in ("factory", "ota_0", "ota_1"):
+        if required not in parts:
+            print(f"ERROR: {required} partition missing from {partitions_csv}")
+            sys.exit(1)
+
     # partitions.bin: source of truth is selector/partitions_dualboot.csv,
     # which PlatformIO compiles into selector/.pio/build/<env>/partitions.bin
     # on every selector build. Copy it to the repo root so this script and
@@ -83,6 +123,11 @@ def flash():
     partitions = os.path.join(REPO_DIR, "partitions.bin")
     if not os.path.isfile(selector_partitions):
         print(f"ERROR: {selector_partitions} not found. Build selector first.")
+        sys.exit(1)
+    if os.path.getmtime(selector_partitions) < os.path.getmtime(partitions_csv):
+        print(f"ERROR: {os.path.relpath(selector_partitions, REPO_DIR)} is older than")
+        print(f"       {os.path.relpath(partitions_csv, REPO_DIR)}.")
+        print("       Re-run without --skip-build so PlatformIO regenerates partitions.bin.")
         sys.exit(1)
     shutil.copyfile(selector_partitions, partitions)
     print(f"  partitions.bin <- {os.path.relpath(selector_partitions, REPO_DIR)}")
@@ -104,24 +149,32 @@ def flash():
             print(f"ERROR: No firmware found for {name}. Build first.")
             sys.exit(1)
 
+    require_fits("selector", selector_fw, parts["factory"])
+    require_fits("meshcore", meshcore_fw, parts["ota_0"])
+    require_fits("meshtastic", meshtastic_fw, parts["ota_1"])
+
+    factory_off = f"0x{parts['factory']['offset']:x}"
+    ota0_off = f"0x{parts['ota_0']['offset']:x}"
+    ota1_off = f"0x{parts['ota_1']['offset']:x}"
+
     print(f"\n{'='*60}")
     print(f"  Flashing to {PORT} at {BAUD} baud")
     print(f"{'='*60}")
     print(f"  0x2000   -> bootloader.bin (from meshtastic)")
     print(f"  0x8000   -> partitions.bin (from repo root)")
-    print(f"  0x10000  -> {os.path.basename(selector_fw)}    (factory)")
-    print(f"  0x190000 -> {os.path.basename(meshcore_fw)}     (ota_0)")
-    print(f"  0x690000 -> {os.path.basename(meshtastic_fw)}   (ota_1)")
+    print(f"  {factory_off:<8} -> {os.path.basename(selector_fw)}    (factory)")
+    print(f"  {ota0_off:<8} -> {os.path.basename(meshcore_fw)}     (ota_0)")
+    print(f"  {ota1_off:<8} -> {os.path.basename(meshtastic_fw)}   (ota_1)")
 
     subprocess.run([
         sys.executable, "-m", "esptool",
         "--chip", "esp32p4", "--port", PORT, "--baud", BAUD,
-        "write_flash",
+        "write-flash",
         "0x2000",   bootloader,
         "0x8000",   partitions,
-        "0x10000",  selector_fw,
-        "0x190000", meshcore_fw,
-        "0x690000", meshtastic_fw,
+        factory_off, selector_fw,
+        ota0_off,    meshcore_fw,
+        ota1_off,    meshtastic_fw,
     ], check=True)
 
     print("\nDone! Power-cycle to enter the boot selector.")

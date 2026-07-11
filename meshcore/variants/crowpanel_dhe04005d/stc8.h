@@ -30,6 +30,19 @@ enum {
   STC8_GPIO_OUT_MAX,
 };
 
+// Battery charge state reported by the STC8 (EM_BAT_CHARGE_STATE in Elecrow's
+// factory firmware), at battery register offset 9.
+enum {
+  STC8_BAT_DISCHARGING   = 0,
+  STC8_BAT_CHARGING      = 1,
+  STC8_BAT_FULLY_CHARGED = 2,
+};
+
+// Read battery info from the STC8 (I2C 0x2F, register block starting at 0x00).
+// Any of level_pct / charge_state / millivolts may be NULL to skip that field;
+// millivolts is the divider-corrected battery voltage. Returns ESP_OK on success.
+esp_err_t stc8_read_battery(uint8_t *level_pct, uint8_t *charge_state, uint16_t *millivolts);
+
 // duty: 0..100 (percent)
 esp_err_t stc8_set_pwm_duty(int pwm_num, uint8_t duty);
 

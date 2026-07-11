@@ -31,7 +31,7 @@ uint8_t getWifiDisconnectReason();
 bool wifiConnectNowBlocking(uint32_t timeoutMs);
 #endif
 
-#ifdef USE_WS5500
+#if defined(USE_WS5500) || defined(USE_CH390D)
 // Startup Ethernet
 bool initEthernet();
 #endif

@@ -5,7 +5,6 @@
 #include "persistence.h"
 #include "app_globals.h"
 #include "utils.h"
-#include <vector>
 #include <new>
 #if defined(ESP32)
 #include <esp_task_wdt.h>
@@ -226,45 +225,85 @@ void append_translation_to_last_rx(const String& key, const char* match_text, co
   File f = LittleFS.open(path, FILE_READ);
   if (!f) return;
 
-  std::vector<String> lines;
+  size_t target_insert_offset = SIZE_MAX;
   while (f.available()) {
+    size_t line_start = f.position();
     String line = f.readStringUntil('\n');
-    line.trim();
-    if (line.length()) lines.push_back(line);
+    size_t line_end = f.position();
+    String parsed = line;
+    parsed.trim();
+    if (!parsed.startsWith("RX|")) continue;
+    if (parsed.indexOf("{{TR}}") >= 0) continue;
+
+    int p1 = parsed.indexOf('|');
+    int p2 = (p1 >= 0) ? parsed.indexOf('|', p1 + 1) : -1;
+    int p3 = (p2 >= 0) ? parsed.indexOf('|', p2 + 1) : -1;
+    if (p3 < 0) continue;
+    String body = parsed.substring(p3 + 1);
+    if (strip_chat_body_prefix(body) != match_text) continue;
+
+    const size_t consumed = line_end - line_start;
+    const bool consumed_newline = consumed > line.length();
+    size_t insert_at = line_end - (consumed_newline ? 1u : 0u);
+    if (line.endsWith("\r") && insert_at > line_start) insert_at--;
+    target_insert_offset = insert_at;
   }
   f.close();
+  if (target_insert_offset == SIZE_MAX) return;
 
-  // Walk the file in reverse and attach the translation to the newest
-  // RX line whose body (everything after the third '|' pipe, stripped
-  // of any existing {{TR}} marker — there shouldn't be one, but be
-  // defensive) equals match_text. Matching by body content means
-  // out-of-order completion of concurrent translations lands each one
-  // on its correct source message.
-  bool appended = false;
-  for (int i = (int)lines.size() - 1; i >= 0; i--) {
-    if (!lines[i].startsWith("RX|")) continue;
-    if (lines[i].indexOf("{{TR}}") >= 0) continue;  // already translated
-    // Parse RX|ts|sig|body — three pipes before body.
-    int p1 = lines[i].indexOf('|');
-    int p2 = (p1 >= 0) ? lines[i].indexOf('|', p1 + 1) : -1;
-    int p3 = (p2 >= 0) ? lines[i].indexOf('|', p2 + 1) : -1;
-    if (p3 < 0) continue;
-    String body = lines[i].substring(p3 + 1);
-    if (strip_chat_body_prefix(body) != match_text) continue;
-    lines[i] += "{{TR}}";
-    lines[i] += translation;
-    appended = true;
-    break;
+  // Rebuild with constant memory: only a fixed copy buffer is resident,
+  // regardless of how many messages the channel contains.
+  File src = LittleFS.open(path, FILE_READ);
+  if (!src) return;
+  String tmp = path + ".trtmp";
+  String bak = path + ".trbak";
+  LittleFS.remove(tmp);
+  File dst = LittleFS.open(tmp, FILE_WRITE);
+  if (!dst) { src.close(); return; }
+
+  uint8_t copy_buf[512];
+  size_t copied = 0;
+  bool ok = true;
+  while (copied < target_insert_offset) {
+    size_t want = target_insert_offset - copied;
+    if (want > sizeof(copy_buf)) want = sizeof(copy_buf);
+    size_t got = src.read(copy_buf, want);
+    if (got == 0 || dst.write(copy_buf, got) != got) { ok = false; break; }
+    copied += got;
+    esp_task_wdt_reset();
   }
-  if (!appended) return;  // source no longer on disk (chat cleared, message deleted, etc.)
 
+  static const char marker[] = "{{TR}}";
+  if (ok && dst.write((const uint8_t*)marker, sizeof(marker) - 1) != sizeof(marker) - 1) ok = false;
+  size_t translation_len = strlen(translation);
+  if (ok && dst.write((const uint8_t*)translation, translation_len) != translation_len) ok = false;
+
+  while (ok && src.available()) {
+    size_t got = src.read(copy_buf, sizeof(copy_buf));
+    if (got == 0) break;
+    if (dst.write(copy_buf, got) != got) { ok = false; break; }
+    esp_task_wdt_reset();
+  }
+  src.close();
+  dst.close();
+
+  if (!ok) {
+    LittleFS.remove(tmp);
+    return;
+  }
+
+  LittleFS.remove(bak);
+  if (!LittleFS.rename(path, bak)) {
+    LittleFS.remove(tmp);
+    return;
+  }
+  if (!LittleFS.rename(tmp, path)) {
+    LittleFS.rename(bak, path);
+    LittleFS.remove(tmp);
+    return;
+  }
+  LittleFS.remove(bak);
   esp_task_wdt_reset();
-  File w = LittleFS.open(path, FILE_WRITE);
-  if (!w) return;
-  for (size_t i = 0; i < lines.size(); i++) {
-    w.println(lines[i]);
-  }
-  w.close();
 #else
   (void)key; (void)match_text; (void)translation;
 #endif
@@ -1182,18 +1221,35 @@ void rebuild_contacts_file_excluding(const uint8_t* pub32) {
   if (!pub32) return;
   File in = LittleFS.open("/contacts", FILE_READ);
   if (!in) return;
+  LittleFS.remove("/contacts.tmp");
   File out = LittleFS.open("/contacts.tmp", FILE_WRITE);
   if (!out) { in.close(); return; }
 
+  bool ok = true;
   ContactRecord rec;
   while (in.read((uint8_t*)&rec, sizeof(rec)) == sizeof(rec)) {
     if (memcmp(rec.pub_key, pub32, 32) == 0) continue;
-    out.write((const uint8_t*)&rec, sizeof(rec));
+    if (out.write((const uint8_t*)&rec, sizeof(rec)) != sizeof(rec)) {
+      ok = false;
+      break;
+    }
   }
   in.close();
   out.close();
-  LittleFS.remove("/contacts");
-  LittleFS.rename("/contacts.tmp", "/contacts");
+  if (!ok) {
+    LittleFS.remove("/contacts.tmp");
+    return;
+  }
+
+  LittleFS.remove("/contacts.bak");
+  if (!LittleFS.rename("/contacts", "/contacts.bak")) {
+    LittleFS.remove("/contacts.tmp");
+    return;
+  }
+  if (!LittleFS.rename("/contacts.tmp", "/contacts")) {
+    LittleFS.rename("/contacts.bak", "/contacts");
+    LittleFS.remove("/contacts.tmp");
+  }
 #else
   (void)pub32;
 #endif
@@ -1202,5 +1258,7 @@ void rebuild_contacts_file_excluding(const uint8_t* pub32) {
 void purge_contacts_file_all() {
 #if defined(ESP32)
   LittleFS.remove("/contacts");   // no-op if absent
+  LittleFS.remove("/contacts.tmp");
+  LittleFS.remove("/contacts.bak");
 #endif
 }

@@ -31,6 +31,8 @@
 #include "i2c_bus.h"
 #include "stc8.h"
 
+LV_IMG_DECLARE(elecrow_logo);
+
 // ---------------------------------------------------------------------------
 // Layout constants (post scan-offset compensation: LVGL sees 792×479)
 // ---------------------------------------------------------------------------
@@ -66,6 +68,11 @@ static constexpr uint32_t COL_BTN_GREY   = 0x34495E;
 static constexpr uint32_t COL_BTN_DARK   = 0x233A5E;
 static constexpr uint32_t COL_BTN_GREEN2 = 0x27AE60;
 static constexpr uint32_t COL_BTN_GREY2  = 0x7F8C8D;
+static constexpr uint32_t COL_CYAN       = 0x18E6F0;
+static constexpr uint32_t COL_CYAN_DARK  = 0x063852;
+static constexpr uint32_t COL_MAGENTA    = 0xD85CFF;
+static constexpr uint32_t COL_PURPLE     = 0x7A5CFF;
+static constexpr uint32_t COL_PANEL      = 0x08142A;
 
 // ---------------------------------------------------------------------------
 // NVS / OTA / GitHub
@@ -73,7 +80,7 @@ static constexpr uint32_t COL_BTN_GREY2  = 0x7F8C8D;
 static const char *WIFI_NS     = "selwifi";
 static const char *DUALBOOT_NS = "dualboot";
 static const char *GITHUB_API  = "https://api.github.com/repos/kgiannadakis/CrowPanel-DIS02050A/releases/latest";
-static const char *UA          = "CrowPanel-DHE04005D-Selector/2.0";
+static const char *UA          = "CrowPanel-DHE04005D-Selector/3.0";
 // TODO: repoint GITHUB_API + asset_score() heuristics at the DHE04005D
 // release repo once it exists. Until then OTA will report "Could not find
 // release assets" — that's the expected error path.
@@ -246,6 +253,145 @@ static void make_screen_header(lv_obj_t* scr, const char* title, const char* sub
     }
 }
 
+static lv_obj_t* make_rect(lv_obj_t* parent, int x, int y, int w, int h,
+                           uint32_t color, lv_opa_t opa, int radius = 0) {
+    lv_obj_t* obj = lv_obj_create(parent);
+    lv_obj_set_pos(obj, x, y);
+    lv_obj_set_size(obj, w, h);
+    lv_obj_set_style_bg_color(obj, col(color), 0);
+    lv_obj_set_style_bg_opa(obj, opa, 0);
+    lv_obj_set_style_border_width(obj, 0, 0);
+    lv_obj_set_style_radius(obj, radius, 0);
+    lv_obj_set_style_pad_all(obj, 0, 0);
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+    return obj;
+}
+
+static lv_obj_t* make_label(lv_obj_t* parent, const char* text, int x, int y,
+                            const lv_font_t* font, uint32_t color,
+                            lv_text_align_t align = LV_TEXT_ALIGN_LEFT,
+                            int width = LV_SIZE_CONTENT) {
+    lv_obj_t* lbl = lv_label_create(parent);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_pos(lbl, x, y);
+    lv_obj_set_style_text_color(lbl, col(color), 0);
+    lv_obj_set_style_text_font(lbl, font, 0);
+    lv_obj_set_style_text_align(lbl, align, 0);
+    if (width != LV_SIZE_CONTENT) {
+        lv_obj_set_width(lbl, width);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+    }
+    return lbl;
+}
+
+static lv_obj_t* make_line(lv_obj_t* parent, int x, int y,
+                           const lv_point_t points[], uint16_t point_count,
+                           uint32_t color, lv_opa_t opa, int width = 1) {
+    lv_obj_t* line = lv_line_create(parent);
+    lv_line_set_points(line, points, point_count);
+    lv_obj_set_pos(line, x, y);
+    lv_obj_set_style_line_color(line, col(color), 0);
+    lv_obj_set_style_line_opa(line, opa, 0);
+    lv_obj_set_style_line_width(line, width, 0);
+    lv_obj_clear_flag(line, LV_OBJ_FLAG_CLICKABLE);
+    return line;
+}
+
+static void make_honeycomb_hex(lv_obj_t* parent, int x, int y,
+                               uint32_t color, lv_opa_t opa) {
+    static const lv_point_t hex[] = {
+        {18, 0}, {36, 10}, {36, 30}, {18, 40}, {0, 30}, {0, 10}, {18, 0}
+    };
+    make_line(parent, x, y, hex, 7, color, opa, 1);
+}
+
+static void make_circuit_background(lv_obj_t* scr) {
+    lv_obj_set_style_bg_color(scr, col(0x010713), 0);
+    lv_obj_set_style_bg_grad_color(scr, col(0x03132A), 0);
+    lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
+
+    static const lv_point_t left_top[] = {{0, 0}, {68, 0}, {88, 20}, {148, 20}};
+    static const lv_point_t right_top[] = {{0, 18}, {74, 18}, {92, 0}, {168, 0}};
+    static const lv_point_t left_mid[] = {{0, 0}, {55, 0}, {75, 20}, {155, 20}};
+    static const lv_point_t right_mid[] = {{0, 20}, {88, 20}, {108, 0}, {190, 0}};
+    make_line(scr, 0, 54, left_top, 4, 0x087CDE, LV_OPA_50, 1);
+    make_line(scr, 632, 55, right_top, 4, 0x087CDE, LV_OPA_50, 1);
+    make_line(scr, 0, 126, left_mid, 4, 0x087CDE, LV_OPA_40, 1);
+    make_line(scr, 610, 121, right_mid, 4, 0x087CDE, LV_OPA_40, 1);
+    make_rect(scr, 145, 73, 96, 1, 0x087CDE, LV_OPA_40, 0);
+    make_rect(scr, 559, 73, 96, 1, 0x087CDE, LV_OPA_40, 0);
+    make_rect(scr, 148, 70, 7, 7, 0x159BFF, LV_OPA_80, 4);
+    make_rect(scr, 648, 70, 7, 7, 0x159BFF, LV_OPA_80, 4);
+}
+
+static void make_elecrow_mark(lv_obj_t* scr) {
+    lv_obj_t* logo = lv_img_create(scr);
+    lv_img_set_src(logo, &elecrow_logo);
+    lv_obj_set_pos(logo, 32, 17);
+    lv_obj_clear_flag(logo, LV_OBJ_FLAG_CLICKABLE);
+}
+
+static void make_feature_row(lv_obj_t* parent, int y, const char* icon,
+                             const char* text, uint32_t accent) {
+    lv_obj_t* box = make_rect(parent, 50, y - 3, 27, 27, 0x071B35, LV_OPA_70, 5);
+    lv_obj_set_style_border_width(box, 1, 0);
+    lv_obj_set_style_border_color(box, col(accent), 0);
+    lv_obj_set_style_shadow_width(box, 6, 0);
+    lv_obj_set_style_shadow_color(box, col(accent), 0);
+    lv_obj_set_style_shadow_opa(box, LV_OPA_30, 0);
+
+    lv_obj_t* il = make_label(box, icon, 0, 0, &lv_font_montserrat_10, accent,
+                              LV_TEXT_ALIGN_CENTER, 27);
+    lv_obj_align(il, LV_ALIGN_CENTER, 0, 0);
+
+    make_label(parent, text, 92, y + 1, &lv_font_montserrat_14, COL_TEXT);
+    make_rect(parent, 50, y + 34, 222, 1, 0x13466D, LV_OPA_30, 0);
+}
+
+static lv_obj_t* make_boot_card(lv_obj_t* parent, int x, int y, int w, int h,
+                                uint32_t accent, const char* glyph,
+                                const char* title, const char* sub,
+                                Action on_click, bool enabled) {
+    lv_obj_t* card = lv_btn_create(parent);
+    lv_obj_set_pos(card, x, y);
+    lv_obj_set_size(card, w, h);
+    lv_obj_set_style_radius(card, 20, 0);
+    lv_obj_set_style_bg_color(card, col(enabled ? COL_PANEL : COL_DISABLED), 0);
+    lv_obj_set_style_bg_opa(card, enabled ? LV_OPA_80 : LV_OPA_60, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, col(enabled ? accent : 0x394352), 0);
+    lv_obj_set_style_shadow_width(card, enabled ? 22 : 0, 0);
+    lv_obj_set_style_shadow_color(card, col(accent), 0);
+    lv_obj_set_style_shadow_opa(card, enabled ? LV_OPA_50 : LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(card, 0, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    if (enabled && on_click != ACT_NONE) {
+        lv_obj_add_event_cb(card, btn_event_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)on_click);
+    } else {
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_CLICKABLE);
+    }
+
+    lv_obj_t* glow = make_rect(card, (w - 70) / 2, 18, 70, 70, accent,
+                               enabled ? LV_OPA_30 : LV_OPA_10, 16);
+    (void)glow;
+    make_label(card, glyph, 0, 30, &lv_font_montserrat_36,
+               enabled ? accent : 0x596170, LV_TEXT_ALIGN_CENTER, w);
+    make_label(card, title, 0, 91, &lv_font_montserrat_24,
+               enabled ? COL_TEXT : 0x666666, LV_TEXT_ALIGN_CENTER, w);
+    make_label(card, sub ? sub : "", 12, 127, &lv_font_montserrat_14,
+               enabled ? COL_SUB : 0x555555, LV_TEXT_ALIGN_CENTER, w - 24);
+
+    if (!enabled) {
+        make_label(card, "[empty slot]", 0, h - 26, &lv_font_montserrat_12,
+                   COL_ERR, LV_TEXT_ALIGN_CENTER, w);
+    }
+    return card;
+}
+
 // ---------------------------------------------------------------------------
 // Screens
 // ---------------------------------------------------------------------------
@@ -270,16 +416,30 @@ static void switch_screen(lv_obj_t* scr) {
 // --- Main screen (firmware buttons + countdown) ----------------------------
 static lv_obj_t* build_screen_main(bool ota0_ok, bool ota1_ok) {
     lv_obj_t* scr = lv_obj_create(NULL);
-    make_screen_header(scr,
-        "MeshCore/Meshtastic Dual-Boot by KaA",
-        "Tap a firmware to boot  |  Auto-boots last choice in 3s");
+    make_circuit_background(scr);
 
     char meshcoreVer[40], meshtasticVer[40];
-    const char* mcSub = firmware_version(find_ota(0), meshcoreVer, sizeof(meshcoreVer)) ? meshcoreVer : nullptr;
-    const char* mtSub = firmware_version(find_ota(1), meshtasticVer, sizeof(meshtasticVer)) ? meshtasticVer : nullptr;
+    bool hasMcVer = firmware_version(find_ota(0), meshcoreVer, sizeof(meshcoreVer));
+    bool hasMtVer = firmware_version(find_ota(1), meshtasticVer, sizeof(meshtasticVer));
+    char mcSub[64];
+    char mtSub[64];
+    snprintf(mcSub, sizeof(mcSub), "%s", hasMcVer ? meshcoreVer : "Advanced HMI & Control");
+    snprintf(mtSub, sizeof(mtSub), "%s", hasMtVer ? meshtasticVer : "Off-Grid Mesh Comms");
 
-    make_button(scr, BTN_A_X, BTN_Y, BTN_W, BTN_H, COL_MESHCORE,   "MeshCore",   ACT_BOOT_SLOT_0, ota0_ok, mcSub, &lv_font_montserrat_28);
-    make_button(scr, BTN_B_X, BTN_Y, BTN_W, BTN_H, COL_MESHTASTIC, "Meshtastic", ACT_BOOT_SLOT_1, ota1_ok, mtSub, &lv_font_montserrat_28);
+    make_label(scr, "KaA", 0, 5, &lv_font_montserrat_48,
+               0x35B9FF, LV_TEXT_ALIGN_CENTER, SCR_W);
+    lv_obj_t* title_box = make_rect(scr, 90, 82, 620, 56, 0x03142B, LV_OPA_70, 12);
+    lv_obj_set_style_border_width(title_box, 1, 0);
+    lv_obj_set_style_border_color(title_box, col(0x087CDE), 0);
+    make_label(scr, "MeshCore / Meshtastic DualBoot", 0, 94,
+               &lv_font_montserrat_28, COL_TEXT, LV_TEXT_ALIGN_CENTER, SCR_W);
+    make_label(scr, "Pick firmware to boot", 0, 146, &lv_font_montserrat_18,
+               0xB7F8FF, LV_TEXT_ALIGN_CENTER, SCR_W);
+
+    make_boot_card(scr, 128, 174, 250, 190, 0x19A8FF, "MC",
+                   "MeshCore", mcSub, ACT_BOOT_SLOT_0, ota0_ok);
+    make_boot_card(scr, 422, 174, 250, 190, 0x28E982, "/\\",
+                   "Meshtastic", mtSub, ACT_BOOT_SLOT_1, ota1_ok);
 
     // keep for future reference: hide Update Firmware and WiFi Setup buttons on the main screen
     // make_button(scr, UPDATE_X, ACTION_Y, ACTION_W, ACTION_H, COL_UPDATE, "Update Firmware", ACT_GO_UPDATE_CONFIRM, true, nullptr, &lv_font_montserrat_18);
@@ -287,15 +447,19 @@ static lv_obj_t* build_screen_main(bool ota0_ok, bool ota1_ok) {
 
     s_main_countdown_lbl = lv_label_create(scr);
     lv_label_set_text(s_main_countdown_lbl, "");
-    lv_obj_set_style_text_color(s_main_countdown_lbl, col(COL_SUB), 0);
-    lv_obj_set_style_text_font(s_main_countdown_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_align(s_main_countdown_lbl, LV_ALIGN_BOTTOM_MID, 0, -40);
+    lv_obj_set_style_text_color(s_main_countdown_lbl, col(0xB7F8FF), 0);
+    lv_obj_set_style_text_font(s_main_countdown_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_align(s_main_countdown_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(s_main_countdown_lbl, SCR_W - 80);
+    lv_obj_align(s_main_countdown_lbl, LV_ALIGN_BOTTOM_MID, 0, -47);
 
     lv_obj_t* footer = lv_label_create(scr);
-    lv_label_set_text(footer, "Bootloader 2.0 (P4 port)  |  Baked by Kostis Giannadakis");
-    lv_obj_set_style_text_color(footer, col(COL_TEXT), 0);
+    lv_label_set_text(footer, "Bootloader v3.0, Unofficial Meshcore/Meshtastic firmwares, baked by Kostis Giannadakis");
+    lv_obj_set_style_text_color(footer, col(0xAFC8E8), 0);
     lv_obj_set_style_text_font(footer, &lv_font_montserrat_14, 0);
-    lv_obj_align(footer, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_text_align(footer, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(footer, SCR_W - 24);
+    lv_obj_align(footer, LV_ALIGN_BOTTOM_MID, 0, -8);
 
     return scr;
 }

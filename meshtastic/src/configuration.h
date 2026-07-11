@@ -31,6 +31,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #endif
 #if __has_include("SensorRtcHelper.hpp")
 #include "SensorRtcHelper.hpp"
+// SensorLib defines isBitSet as a macro; undefine it here to avoid conflicts
+// with the SparkFun MMC5983MA library, which has a class method of the same name.
+#ifdef isBitSet
+#undef isBitSet
+#endif
 #endif
 
 /* Offer chance for variant-specific defines */
@@ -151,8 +156,22 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #ifdef USE_KCT8103L_PA
 // Power Amps are often non-linear, so we can use an array of values for the power curve
+#if defined(HELTEC_WIRELESS_TRACKER_V2)
 #define NUM_PA_POINTS 22
 #define TX_GAIN_LORA 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 13, 13, 13, 12, 12, 11, 10, 9, 8, 7
+#elif defined(HELTEC_MESH_NODE_T096)
+#define NUM_PA_POINTS 22
+#define TX_GAIN_LORA 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 13, 13, 13, 12, 11, 10, 9, 8, 7
+#elif defined(HELTEC_V4_R8)
+#define NUM_PA_POINTS 22
+#define TX_GAIN_LORA 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 12, 12, 11, 11, 10, 9, 8, 7
+#else
+// If a board enables USE_KCT8103L_PA but does not match a known variant and has
+// not already provided a PA curve, fail at compile time to avoid unsafe defaults.
+#if !defined(NUM_PA_POINTS) || !defined(TX_GAIN_LORA)
+#error "USE_KCT8103L_PA is defined, but no PA gain curve (NUM_PA_POINTS / TX_GAIN_LORA) is configured for this board."
+#endif
+#endif
 #endif
 
 #ifdef RAK13302
@@ -224,6 +243,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define QMI8658_ADDR 0x6B
 #define QMC5883L_ADDR 0x0D
 #define HMC5883L_ADDR 0x1E
+#define MMC5983MA_ADDR 0x30
 #define SHTC3_ADDR 0x70
 #define LPS22HB_ADDR 0x5C
 #define LPS22HB_ADDR_ALT 0x5D
@@ -273,6 +293,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define DA217_ADDR 0x26
 #define BMI270_ADDR 0x68
 #define BMI270_ADDR_ALT 0x69
+#define ICM42607P_ADDR 0x68
+#define ICM42607P_ADDR_ALT 0x69
 
 // -----------------------------------------------------------------------------
 // LED

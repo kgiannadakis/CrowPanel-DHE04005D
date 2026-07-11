@@ -123,6 +123,9 @@ class RadioInterface
 
     virtual ~RadioInterface() {}
 
+    /// Fires once per valid received LoRa packet (arg = sender NodeNum). Used e.g. to flash LED_LORA.
+    static Observable<uint32_t> loraRxPacketObservable;
+
     /**
      * Coerce LoRa config fields (bandwidth/spread_factor) derived from presets.
      * This is used during early bootstrapping so UIs that display these fields directly remain consistent.
@@ -231,14 +234,6 @@ class RadioInterface
     /// Some boards (1st gen Pinetab Lora module) have broken IRQ wires, so we need to poll via i2c registers
     virtual bool isIRQPending() { return false; }
 
-    /**
-     * Current instantaneous RSSI of the RX path in dBm — i.e. the noise
-     * floor when no packet is present. Subclasses that back onto RadioLib
-     * SX126x/LR11x0 can implement this by calling `lora.getRSSI(false)`.
-     * Default return value of 0 means "not implemented for this radio".
-     */
-    [[nodiscard]] virtual float getNoiseFloor() { return 0.0f; }
-
     // Whether we use the default frequency slot given our LoRa config (region and modem preset)
     static bool uses_default_frequency_slot;
 
@@ -271,6 +266,12 @@ class RadioInterface
      * Save the channel we selected for later reuse.
      */
     virtual void saveChannelNum(uint32_t savedChannelNum);
+
+    /**
+     * Get current RSSI reading from the radio.
+     * Returns 0 if not available.
+     */
+    virtual int16_t getCurrentRSSI() { return 0; }
 
   private:
     /**

@@ -626,10 +626,8 @@ void translate_loop() {
 
     // --- Memory guard -------------------------------------------------
     // HTTPS/TLS needs much more contiguous internal/DMA heap than plain HTTP.
-    // Auto translation keeps the old conservative TLS guard. Manual
-    // long-press requests may fall back to HTTP immediately when TLS memory
-    // is too fragmented, so the user can still get a translation instead of
-    // waiting forever on "low mem skip".
+    // Auto translation keeps the conservative TLS guard. Manual long-press
+    // translation uses the smaller plain-HTTP path below.
     const size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA);
     const size_t int_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     const size_t dma_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
@@ -640,10 +638,9 @@ void translate_loop() {
     const bool http_mem_too_low =
         (dma_free < 16 * 1024 || int_free < 18 * 1024 ||
          dma_largest < 4 * 1024 || int_largest < 4 * 1024);
-    bool use_http_for_this = s_translate_http_fallback;
-    if (peek.manual && tls_mem_too_low && !http_mem_too_low) {
-        use_http_for_this = true;
-    }
+    // Manual translation handles one bounded message. Avoid TLS's large
+    // contiguous allocation so visible history cannot starve the request.
+    bool use_http_for_this = peek.manual || s_translate_http_fallback;
 
     if (tls_mem_too_low && (!peek.manual || http_mem_too_low)) {
         static uint32_t s_last_warn_ms = 0;
@@ -701,11 +698,6 @@ void translate_loop() {
         s_translate_http_fallback_until_ms = 0;
         use_http_for_this = false;
     }
-    if (req.manual && use_http_for_this) {
-        Serial.printf("Translate: manual HTTP fallback dma=%u int=%u dma_lg=%u int_lg=%u\n",
-                      (unsigned)dma_free, (unsigned)int_free,
-                      (unsigned)dma_largest, (unsigned)int_largest);
-    }
     const bool ok = use_http_for_this
                       ? do_translate_http(req.text, lang, result, sizeof(result))
                       : do_translate_https(req.text, lang, result, sizeof(result));
@@ -738,11 +730,6 @@ void translate_loop() {
         return;
     }
 
-    // Always persist to disk, keyed by body-text match so that the
-    // translation lands on the correct RX line even when multiple
-    // untranslated messages are pending.
-    append_translation_to_last_rx(String(req.chat_key), req.text, result);
-
     // If the user is currently viewing this chat, update the visible
     // bubble in place so the translation appears without needing a
     // chat reload. Take lvgl_lock FIRST, then check g_current_chat_key
@@ -756,6 +743,10 @@ void translate_loop() {
         }
         lvgl_unlock();
     }
+
+    // Persistence now streams the file with constant memory. Update the
+    // selected bubble first so long histories cannot delay visible feedback.
+    append_translation_to_last_rx(String(req.chat_key), req.text, result);
     if (req.manual) serialmon_append("Translate done");
 #endif
 }

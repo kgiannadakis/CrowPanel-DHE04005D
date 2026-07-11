@@ -11,7 +11,20 @@
 #define LV_COLOR_DEPTH 16
 #endif
 
-#define LV_USE_STDLIB_MALLOC    LV_STDLIB_CLIB
+/* BUILTIN, not CLIB: with CLIB every lv_malloc is plain malloc() = INTERNAL
+ * RAM on this board, so the whole LVGL widget tree/draw state (~200 KB in
+ * thousands of small allocations) landed in the DMA/internal pool ESP-Hosted
+ * needs, fragmenting it to sub-100-byte blocks at UI start (SDIO asserts).
+ * BUILTIN uses one LV_MEM_SIZE TLSF pool allocated pre-guard in clean PSRAM
+ * via LV_MEM_POOL_ALLOC below - same pattern as the PNG decode arena. */
+// CUSTOM allocator (crowpanel_lvgl_alloc.cpp): lv_malloc/free/realloc routed to
+// a FreeRTOS multi_heap over a pre-reserved PSRAM block. This is the only option
+// that satisfies BOTH constraints on this board:
+//   - CLIB (malloc) puts LVGL in internal RAM -> starves ESP-Hosted DMA -> crash.
+//   - BUILTIN (lv_tlsf) infinite-loops in lv_tlsf_free during map image decode
+//     (proven by A/B: reverting to CLIB rendered the map; pool was 99% free).
+// multi_heap is PSRAM-resident (DMA-safe) AND robust (map-safe).
+#define LV_USE_STDLIB_MALLOC    LV_STDLIB_CUSTOM
 #define LV_USE_STDLIB_STRING    LV_STDLIB_BUILTIN
 #define LV_USE_STDLIB_SPRINTF   LV_STDLIB_BUILTIN
 
@@ -33,6 +46,10 @@
 
     #define LV_MEM_ADR 0
 
+    /* NOTE: LV_MEM_* applies only to LV_STDLIB_BUILTIN. This board uses
+     * LV_STDLIB_CUSTOM (see LV_USE_STDLIB_MALLOC below), which routes LVGL's heap
+     * to a PSRAM multi_heap in crowpanel_lvgl_alloc.cpp, so the settings here are
+     * inert and kept only as sane fallbacks. */
     #if LV_MEM_ADR == 0
         #if defined BOARD_HAS_PSRAM
           #define LV_MEM_POOL_INCLUDE     <esp_heap_caps.h>
@@ -48,7 +65,16 @@
 
 #define LV_DPI_DEF 140
 
-#define LV_USE_OS   LV_OS_FREERTOS
+// LV_OS_NONE, NOT FREERTOS: with an OS set, lv_draw_sw_init() spawns a
+// separate "swdraw" worker thread (lv_draw_sw.c) even for a single draw unit.
+// That worker decodes/draws map tiles and allocates from the LVGL TLSF pool
+// concurrently with lvgl_task, corrupting the pool's free-list -> lv_tlsf_free
+// spins forever (task_wdt caught swdraw in lv_tlsf_free). We already serialize
+// all LVGL access with our own recursive mutex (crowpanel_p4::lvgl_lock, which
+// is independent of LVGL's internal lv_lock), so OS_NONE makes draw+decode run
+// synchronously inside lv_timer_handler on lvgl_task — single-threaded, safe.
+// This board has one draw unit, so no parallelism is lost.
+#define LV_USE_OS   LV_OS_NONE
 
 #if LV_USE_OS == LV_OS_CUSTOM
     #define LV_OS_CUSTOM_INCLUDE <stdint.h>
@@ -71,17 +97,22 @@
 #define LV_USE_DRAW_SW 1
 #if LV_USE_DRAW_SW == 1
 
+    // ALL enabled. PNG map tiles decode to ARGB8888, and compositing them onto
+    // the RGB565 canvas routes through intermediate formats (RGB565A8 for the
+    // alpha plane, etc.). If a needed format is disabled, the SW draw unit's
+    // evaluate_cb scores the task "cannot draw", it is never assigned, and
+    // lv_refr spins forever waiting for a completion that never comes — a
+    // zero-progress hang in lv_timer_handler (no alloc, no flush). Enabling
+    // them all costs some flash (we have headroom) and removes that trap.
     #define LV_DRAW_SW_SUPPORT_RGB565        1
-    #define LV_DRAW_SW_SUPPORT_RGB565A8      0
-    #define LV_DRAW_SW_SUPPORT_RGB888        0
-    #define LV_DRAW_SW_SUPPORT_XRGB8888      0
-    // Required for PNG map tiles: LVGL's lodepng decoder outputs ARGB8888 draw
-    // buffers. If disabled, tiles can be "loaded" but won't render on RGB565.
+    #define LV_DRAW_SW_SUPPORT_RGB565A8      1
+    #define LV_DRAW_SW_SUPPORT_RGB888        1
+    #define LV_DRAW_SW_SUPPORT_XRGB8888      1
     #define LV_DRAW_SW_SUPPORT_ARGB8888      1
-    #define LV_DRAW_SW_SUPPORT_L8            0
-    #define LV_DRAW_SW_SUPPORT_AL88          0
+    #define LV_DRAW_SW_SUPPORT_L8            1
+    #define LV_DRAW_SW_SUPPORT_AL88          1
     #define LV_DRAW_SW_SUPPORT_A8            1
-    #define LV_DRAW_SW_SUPPORT_I1            0
+    #define LV_DRAW_SW_SUPPORT_I1            1
 
     #define LV_DRAW_SW_DRAW_UNIT_CNT    1
 
@@ -210,12 +241,17 @@
 
 #ifndef LV_CACHE_DEF_SIZE
 // Map tiles decode to 256 KB ARGB8888 buffers, served from the boot-time PSRAM
-// arena (see PngDecodeArena.cpp, 12 MB). 6 MB caches ~24 decoded tiles - more
-// than the visible portrait viewport - so tiles are not re-decoded on every
-// pan, while leaving the arena room for a tile's decode scratch in flight.
-// The old 128 KB budget rejected every tile (entry > budget), which made
-// decoder_open() destroy the decoded buffer and return LV_RESULT_INVALID.
-#define LV_CACHE_DEF_SIZE       (6U * 1024U * 1024U)
+// arena (see PngDecodeArena.cpp, 12 MB). The cache MUST hold the ENTIRE tile
+// grid the map rebuild loads (kMapMaxTileSlots, not just the visible
+// viewport): if capacity is even one tile short, LVGL's LRU faces a
+// sequential scan and EVERY tile misses on EVERY frame - 30 SD reads +
+// lodepng decodes per frame with the LVGL mutex held, which presents as a
+// completely locked device. 9.5 MB holds 30+ tiles plus other decoded UI
+// images, while leaving the 12 MB arena room for decode scratch in flight.
+// (The old 128 KB budget rejected every tile outright; the previous 6 MB
+// budget held ~24 - enough to *load* 30 tiles once, but one short of
+// surviving the redraw scan.)
+#define LV_CACHE_DEF_SIZE       ((9U * 1024U + 512U) * 1024U)
 #endif
 
 #define LV_IMAGE_HEADER_CACHE_DEF_CNT 8

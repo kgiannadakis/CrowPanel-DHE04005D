@@ -36,7 +36,7 @@
 // hypothesis we'd need to simultaneously reduce PCLK AND bump the
 // bounce buffer so the FIFO stays primed — otherwise we break scan
 // before we can measure. Leaving at 18 until someone has time for that.
-#define LCD_CLK_MHZ         (16)
+#define LCD_CLK_MHZ         (18)
 #define LCD_HPW             ( 4)
 #define LCD_HBP             ( 8)
 #define LCD_HFP             ( 8)

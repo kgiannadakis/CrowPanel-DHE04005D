@@ -233,6 +233,9 @@ static void ui_task(void *)
         }
 
 #if defined(CROWPANEL_DHE04005D)
+        // Poll hardware sensors (battery I2C) OUTSIDE the LVGL lock so the
+        // blocking read never stalls the render/touch task.
+        statusbar_poll_battery();
         if (crowpanel_p4::lvgl_lock(2)) {
             const bool chats_active = (s_active_tab == TAB_CHATS) || chatview_is_open();
             if (s_active_tab == TAB_CHATS) {

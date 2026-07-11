@@ -17,6 +17,7 @@
 #include <LittleFS.h>
 #include <esp_system.h>   // esp_random()
 #include <esp_partition.h>
+#include <esp_err.h>
 
 // ---------- Board ----------
 CrowPanelP4Board board;
@@ -99,6 +100,25 @@ static Module loraModule(&loraHal, P_LORA_NSS, P_LORA_DIO_1, P_LORA_RESET, P_LOR
 static CustomSX1262 loraRadio(&loraModule);
 CustomSX1262Wrapper radio_driver(loraRadio, board);
 
+static bool partitionLooksErased(const char* label) {
+  const esp_partition_t* part = esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, label);
+  if (!part) return false;
+
+  uint8_t buf[256];
+  const uint32_t offsets[] = {0, 4096, 65536};
+  for (uint32_t off : offsets) {
+    if (off >= part->size) continue;
+    size_t len = part->size - off;
+    if (len > sizeof(buf)) len = sizeof(buf);
+    if (esp_partition_read(part, off, buf, len) != ESP_OK) return false;
+    for (size_t i = 0; i < len; i++) {
+      if (buf[i] != 0xFF) return false;
+    }
+  }
+  return true;
+}
+
 // ---------- Required by MeshCore examples ----------
 bool radio_init() {
   board.begin();
@@ -154,7 +174,11 @@ bool radio_init() {
     Serial.println("LittleFS mounted OK");
   } else {
     Serial.println("LittleFS empty — formatting (first-boot only, fast)...");
-    if (LittleFS.begin(true, "/littlefs", 10, "mcdata")) {
+    bool can_format_mcdata = partitionLooksErased("mcdata");
+    if (!can_format_mcdata) {
+      Serial.println("LittleFS partition contains data; refusing to auto-format");
+    }
+    if (can_format_mcdata && LittleFS.begin(true, "/littlefs", 10, "mcdata")) {
       Serial.println("LittleFS formatted + mounted OK");
     } else {
       Serial.println("LittleFS mount failed — continuing without persistent storage");

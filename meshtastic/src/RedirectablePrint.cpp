@@ -276,6 +276,15 @@ meshtastic_LogRecord_Level RedirectablePrint::getLogLevel(const char *logLevel)
 
 void RedirectablePrint::log(const char *logLevel, const char *format, ...)
 {
+#if defined(CROWPANEL_QUIET_LOG) && CROWPANEL_QUIET_LOG
+    // Quiet serial console toggle: drop the high-volume DEBUG ('D') and TRACE
+    // ('T') chatter (Router dupe filtering, MQTT channel/PSK/topic lines, etc.)
+    // while keeping INFO / WARN / ERROR / CRITICAL. Panic and core-dump crash
+    // reports bypass this logger entirely, so they always print. Set
+    // CROWPANEL_QUIET_LOG=0 in platformio.ini to restore full debug output.
+    if (logLevel && (logLevel[0] == 'D' || logLevel[0] == 'T'))
+        return;
+#endif
 
     // append \n to format
     size_t len = strlen(format);

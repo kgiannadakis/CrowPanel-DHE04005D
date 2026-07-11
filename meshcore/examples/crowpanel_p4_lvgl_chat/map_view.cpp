@@ -582,11 +582,16 @@ static bool ensure_nonempty_map_view(bool include_markers) {
   return false;
 }
 
-static void marker_restore_timer_cb(lv_timer_t*) {
+static void marker_restore_timer_cb(lv_timer_t* t) {
+  // One-shot via pause, NOT via lv_timer_set_repeat_count(t, 1): when the
+  // repeat count hits 0 LVGL deletes the timer inside lv_timer_handler,
+  // leaving s_marker_restore_timer dangling — every later drag then calls
+  // resume/reset/set_period on freed heap memory (markers stuck hidden at
+  // best, corrupted heap and delayed random crashes at worst).
+  lv_timer_pause(t);
   if (!ui_mapscreen || lv_scr_act() != ui_mapscreen) return;
   (void)ensure_nonempty_map_view(true);
   s_markers_hidden = false;
-  if (s_marker_restore_timer) lv_timer_pause(s_marker_restore_timer);
 }
 
 static void content_pressing_cb(lv_event_t*) {
@@ -672,7 +677,6 @@ static void content_released_cb(lv_event_t*) {
     set_fast_pan_tile_mode(false);
     if (s_marker_restore_timer) {
       lv_timer_set_period(s_marker_restore_timer, kMarkerRestoreDelayMs);
-      lv_timer_set_repeat_count(s_marker_restore_timer, 1);
       lv_timer_resume(s_marker_restore_timer);
       lv_timer_reset(s_marker_restore_timer);
     } else {

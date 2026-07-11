@@ -10,6 +10,7 @@
 
 #include "ui.h"
 #include "ui_homescreen.h"
+#include "ui_theme.h"
 #include "stc8.h"
 
 // ---- I2C helpers ----
@@ -98,6 +99,81 @@ void update_timelabel() {
   snprintf(buf, sizeof(buf), "%02lu:%02lu",
            (unsigned long)(secs_today / 3600), (unsigned long)((secs_today % 3600) / 60));
   lv_label_set_text(ui_timelabel, buf);
+}
+
+// ---- Battery (onboard STC8 at I2C 0x2F) ----
+// battery_poll() does the blocking I2C read OFF the LVGL lock and caches the
+// result; update_batterylabel() applies it to the status-bar widgets UNDER the
+// lock. Split this way so the I2C read never stalls the render/touch path.
+static bool     s_batt_have      = false;
+static int      s_batt_pct_cache = 0;
+static uint32_t s_batt_col_cache = TH_TEXT2;
+
+// Icon fill geometry: body is 24px wide with a 1px border + 1px inset each side.
+static constexpr int kBattFillMaxW = 24 - 4;
+
+// Battery % from the measured voltage via a piecewise-linear Li-ion resting-
+// voltage -> state-of-charge curve (4.10 V = 100%, 3.10 V = 0%). Follows the
+// real cell shape: a quick drop off full, a long flat plateau through the
+// middle, then a steep knee near empty. Tune the points to your pack if needed.
+static int batt_pct_from_mv(int mv) {
+  static const struct { int mv; int pct; } kCurve[] = {
+    {4100, 100}, {4000, 92}, {3900, 85}, {3850, 78}, {3800, 68},
+    {3750, 55},  {3700, 42}, {3650, 32}, {3600, 25}, {3500, 17},
+    {3400, 11},  {3300, 6},  {3200, 3},  {3100, 0},
+  };
+  const int n = (int)(sizeof(kCurve) / sizeof(kCurve[0]));
+  if (mv >= kCurve[0].mv) return 100;
+  if (mv <= kCurve[n - 1].mv) return 0;
+  for (int i = 1; i < n; i++) {
+    if (mv >= kCurve[i].mv) {
+      const int vlo = kCurve[i].mv,     plo = kCurve[i].pct;
+      const int vhi = kCurve[i - 1].mv, phi = kCurve[i - 1].pct;
+      return plo + (mv - vlo) * (phi - plo) / (vhi - vlo);
+    }
+  }
+  return 0;
+}
+
+void battery_poll() {
+  // Blocking STC8 I2C read, at most every 5 s. MUST be called WITHOUT the LVGL
+  // lock. Caches the reading and flags update_batterylabel() to apply it.
+  static uint32_t s_last_ms = 0;
+  uint32_t nowm = millis();
+  if (s_last_ms != 0 && (uint32_t)(nowm - s_last_ms) < 5000) return;
+  s_last_ms = nowm;
+
+  uint8_t  state = 0;
+  uint16_t mv    = 0;
+  // Guard on a plausible battery range so a missing/uninitialised reading
+  // (0 mV) leaves the indicator blank rather than showing 0%.
+  if (stc8_read_battery(nullptr, &state, &mv) == ESP_OK && mv >= 2500 && mv <= 5000) {
+    int pct = batt_pct_from_mv((int)mv);
+    uint32_t col = TH_TEXT2;
+    if (state == STC8_BAT_CHARGING || state == STC8_BAT_FULLY_CHARGED)
+      col = 0x4CAF50;  // green while charging / full
+    else if (pct <= 15)
+      col = 0xE06060;  // red when low
+    s_batt_pct_cache = pct;
+    s_batt_col_cache = col;
+    s_batt_have  = true;
+    g_deferred_battery_dirty = true;
+  }
+}
+
+void update_batterylabel() {
+  if (!ui_batterylabel || !s_batt_have) return;
+  char bb[8];
+  snprintf(bb, sizeof(bb), "%d%%", s_batt_pct_cache);
+  lv_label_set_text(ui_batterylabel, bb);
+  lv_obj_set_style_text_color(ui_batterylabel, lv_color_hex(s_batt_col_cache), 0);
+  if (ui_batteryfill && ui_batterybody) {
+    int fill_w = s_batt_pct_cache * kBattFillMaxW / 100;
+    if (fill_w < 1 && s_batt_pct_cache > 0) fill_w = 1;  // keep a sliver visible
+    lv_obj_set_width(ui_batteryfill, fill_w);
+    lv_obj_set_style_bg_color(ui_batteryfill, lv_color_hex(s_batt_col_cache), 0);
+    lv_obj_clear_flag(ui_batterybody, LV_OBJ_FLAG_HIDDEN);
+  }
 }
 
 String time_string_now() {

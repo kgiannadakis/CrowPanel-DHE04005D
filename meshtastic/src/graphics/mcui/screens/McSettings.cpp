@@ -17,6 +17,7 @@
 #include "mesh/Default.h"
 #include "mesh/MeshService.h"
 #include "mesh/RadioInterface.h"
+#include "mesh/RadioLibInterface.h"
 #include "mesh/Router.h"
 #include "mesh/generated/meshtastic/config.pb.h"
 #include "mesh/generated/meshtastic/module_config.pb.h"
@@ -577,7 +578,10 @@ static const TzEntry TZ_LIST[] = {
     {"UTC+14   Kiribati (Line Islands)",       50400, MCUI_DST_NONE},
 };
 static constexpr int TZ_COUNT = sizeof(TZ_LIST) / sizeof(TZ_LIST[0]);
-static constexpr int TZ_DEFAULT_INDEX = 0;
+// Default timezone when nothing is saved in NVS (fresh flash / wiped prefs):
+// index 17 = "UTC+1  Brussels, Paris, Berlin (auto DST)". A saved preference
+// always overrides this.
+static constexpr int TZ_DEFAULT_INDEX = 17;
 
 static int tz_dow(int y, int m, int d)
 {
@@ -965,6 +969,83 @@ static void orientation_overlay_open()
     s_orientation_reboot_at_ms = millis() + 3000;
     s_orientation_last_countdown = UINT32_MAX;
     orientation_overlay_update();
+}
+
+// --- Reboot countdown overlay (e.g. after saving MQTT settings) --------------
+// Shows a "Restarting in 3..2..1" popup; the actual reboot is done by the main
+// loop when rebootAtMsec elapses. reboot_overlay_update() must be ticked from
+// settings_screen_tick().
+static lv_obj_t *s_reboot_overlay = nullptr;
+static lv_obj_t *s_reboot_overlay_label = nullptr;
+static uint32_t s_reboot_overlay_at_ms = 0;
+static uint32_t s_reboot_overlay_last_countdown = UINT32_MAX;
+
+static void reboot_overlay_update()
+{
+    if (!s_reboot_overlay || !s_reboot_overlay_label || !s_reboot_overlay_at_ms)
+        return;
+
+    uint32_t now = millis();
+    uint32_t secs = 0;
+    if (now < s_reboot_overlay_at_ms)
+        secs = (s_reboot_overlay_at_ms - now + 999) / 1000;
+
+    if (secs != s_reboot_overlay_last_countdown) {
+        char buf[32];
+        if (secs > 0)
+            snprintf(buf, sizeof(buf), "Restarting in %u...", (unsigned)secs);
+        else
+            snprintf(buf, sizeof(buf), "Restarting...");
+        lv_label_set_text(s_reboot_overlay_label, buf);
+        s_reboot_overlay_last_countdown = secs;
+    }
+    // The reboot itself is handled by the main loop when rebootAtMsec elapses;
+    // the overlay just stays up until then.
+}
+
+static void reboot_overlay_open(const char *title_text)
+{
+    if (s_reboot_overlay) {
+        lv_obj_delete(s_reboot_overlay);
+        s_reboot_overlay = nullptr;
+    }
+
+    lv_obj_t *scr = lv_screen_active();
+    s_reboot_overlay = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_reboot_overlay);
+    lv_obj_set_size(s_reboot_overlay, SCR_W, SCR_H);
+    lv_obj_set_pos(s_reboot_overlay, 0, 0);
+    lv_obj_set_style_bg_color(s_reboot_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_reboot_overlay, LV_OPA_70, 0);
+    lv_obj_remove_flag(s_reboot_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_move_foreground(s_reboot_overlay);
+
+    lv_obj_t *card = lv_obj_create(s_reboot_overlay);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_size(card, SCR_W > 460 ? 420 : SCR_W - 40, 150);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, lv_color_hex(TH_SURFACE), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(card, 0, 0);
+    lv_obj_set_style_pad_all(card, 18, 0);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, title_text);
+    lv_obj_set_style_text_color(title, lv_color_hex(TH_TEXT), 0);
+    lv_obj_set_style_text_font(title, MCUI_FONT_16, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    s_reboot_overlay_label = lv_label_create(card);
+    lv_label_set_text(s_reboot_overlay_label, "Restarting in 3...");
+    lv_obj_set_style_text_color(s_reboot_overlay_label, lv_color_hex(TH_TEXT2), 0);
+    lv_obj_set_style_text_font(s_reboot_overlay_label, MCUI_FONT_16, 0);
+    lv_obj_align(s_reboot_overlay_label, LV_ALIGN_CENTER, 0, 20);
+
+    s_reboot_overlay_at_ms = millis() + 3000;
+    s_reboot_overlay_last_countdown = UINT32_MAX;
+    rebootAtMsec = millis() + 3000; // main loop reboots when this elapses
+    reboot_overlay_update();
 }
 
 static void add_section_header(const char *text)
@@ -1780,6 +1861,7 @@ static lv_obj_t *s_mqtt_encrypt_sw = nullptr;
 static lv_obj_t *s_mqtt_json_sw = nullptr;
 static lv_obj_t *s_mqtt_tls_sw = nullptr;
 static lv_obj_t *s_mqtt_contact_discovery_sw = nullptr;
+static lv_obj_t *s_mqtt_ok_to_mqtt_sw = nullptr;
 
 static void mqtt_screen_close()
 {
@@ -1800,6 +1882,7 @@ static void mqtt_screen_close()
     s_mqtt_json_sw = nullptr;
     s_mqtt_tls_sw = nullptr;
     s_mqtt_contact_discovery_sw = nullptr;
+    s_mqtt_ok_to_mqtt_sw = nullptr;
 }
 
 static void mqtt_screen_back_cb(lv_event_t *) { mqtt_screen_close(); }
@@ -1946,8 +2029,6 @@ static void mqtt_make_switch_row_clickable(lv_obj_t *sw)
 
 static void mqtt_screen_save_cb(lv_event_t *)
 {
-    const bool was_mqtt_enabled = moduleConfig.mqtt.enabled;
-
     moduleConfig.has_mqtt = true;
     moduleConfig.mqtt.enabled = s_mqtt_enabled_sw && lv_obj_has_state(s_mqtt_enabled_sw, LV_STATE_CHECKED);
     moduleConfig.mqtt.encryption_enabled = s_mqtt_encrypt_sw && lv_obj_has_state(s_mqtt_encrypt_sw, LV_STATE_CHECKED);
@@ -1955,6 +2036,17 @@ static void mqtt_screen_save_cb(lv_event_t *)
     moduleConfig.mqtt.tls_enabled = s_mqtt_tls_sw && lv_obj_has_state(s_mqtt_tls_sw, LV_STATE_CHECKED);
     moduleConfig.mqtt.mqtt_contact_discovery_enabled =
         s_mqtt_contact_discovery_sw && lv_obj_has_state(s_mqtt_contact_discovery_sw, LV_STATE_CHECKED);
+
+    // "OK to MQTT" lives in config.lora (not moduleConfig): it sets the opt-in
+    // bitfield on our outgoing packets. Without it the public broker accepts
+    // our publishes but silently refuses to relay them to other subscribers.
+    const bool ok_to_mqtt = s_mqtt_ok_to_mqtt_sw && lv_obj_has_state(s_mqtt_ok_to_mqtt_sw, LV_STATE_CHECKED);
+    bool lora_config_changed = false;
+    if (config.lora.config_ok_to_mqtt != ok_to_mqtt) {
+        config.has_lora = true;
+        config.lora.config_ok_to_mqtt = ok_to_mqtt;
+        lora_config_changed = true;
+    }
 
     mqtt_copy_text(moduleConfig.mqtt.address, sizeof(moduleConfig.mqtt.address), s_mqtt_addr_ta);
     mqtt_copy_text(moduleConfig.mqtt.username, sizeof(moduleConfig.mqtt.username), s_mqtt_user_ta);
@@ -1989,36 +2081,19 @@ static void mqtt_screen_save_cb(lv_event_t *)
 
     int save_what = SEGMENT_MODULECONFIG;
     if (primary_changed) save_what |= SEGMENT_CHANNELS;
+    if (lora_config_changed) save_what |= SEGMENT_CONFIG;
 
     if (nodeDB) nodeDB->saveToDisk(save_what);
     if (service) service->reloadConfig(save_what);
 
-#if defined(ARCH_ESP32P4) && defined(CROWPANEL_DHE04005D) && !defined(ARCH_PORTDUINO)
-    const bool direct_mqtt_first_enable =
-        moduleConfig.mqtt.enabled && !was_mqtt_enabled && !moduleConfig.mqtt.proxy_to_client_enabled;
-    if (direct_mqtt_first_enable) {
-        LOG_WARN("mcui: MQTT enabled; rebooting so CrowPanel opens MQTT before RGB framebuffer");
-        LOG_INFO("mcui: MQTT settings saved (enabled=%d, primary up=%d, primary down=%d, root=%s)",
-                 moduleConfig.mqtt.enabled ? 1 : 0, pri_up ? 1 : 0, pri_dn ? 1 : 0, moduleConfig.mqtt.root);
-        mqtt_screen_close();
-        delay(300);
-        ESP.restart();
-        return;
-    }
-#endif
-
-    if (moduleConfig.mqtt.enabled) {
-        if (!mqtt) {
-            mqttInit();
-        }
-        if (mqtt) {
-            mqtt->start();
-        }
-    }
-
-    LOG_INFO("mcui: MQTT settings saved (enabled=%d, primary up=%d, primary down=%d, root=%s)",
+    LOG_INFO("mcui: MQTT settings saved (enabled=%d, primary up=%d, primary down=%d, root=%s); rebooting",
              moduleConfig.mqtt.enabled ? 1 : 0, pri_up ? 1 : 0, pri_dn ? 1 : 0, moduleConfig.mqtt.root);
-    mqtt_screen_close();
+
+    // Always reboot after saving MQTT settings: a restart cleanly applies every
+    // change and re-opens the broker link during the pre-framebuffer window this
+    // board needs. Show a 3..2..1 countdown; the main loop reboots when
+    // rebootAtMsec elapses.
+    reboot_overlay_open("Saving MQTT settings");
 }
 
 static void mqtt_open_clicked_cb(lv_event_t *)
@@ -2123,10 +2198,12 @@ static void mqtt_open_clicked_cb(lv_event_t *)
     s_mqtt_tls_sw = add_switch_row(s_mqtt_body, "TLS enabled", moduleConfig.mqtt.tls_enabled, nullptr);
     s_mqtt_contact_discovery_sw =
         add_switch_row(s_mqtt_body, "Discover MQTT contacts", moduleConfig.mqtt.mqtt_contact_discovery_enabled, nullptr);
+    s_mqtt_ok_to_mqtt_sw = add_switch_row(s_mqtt_body, "OK to MQTT (relay my packets)", config.lora.config_ok_to_mqtt, nullptr);
     mqtt_make_switch_row_clickable(s_mqtt_encrypt_sw);
     mqtt_make_switch_row_clickable(s_mqtt_json_sw);
     mqtt_make_switch_row_clickable(s_mqtt_tls_sw);
     mqtt_make_switch_row_clickable(s_mqtt_contact_discovery_sw);
+    mqtt_make_switch_row_clickable(s_mqtt_ok_to_mqtt_sw);
 
     lv_obj_t *proxy_note = lv_label_create(s_mqtt_body);
     lv_label_set_text(proxy_note, "Client proxy is disabled on CrowPanel (direct MQTT).");
@@ -2804,8 +2881,11 @@ static void refresh_values()
     }
     if (s_lbl_noise) {
 
+        // Upstream 2.7.26 tracks a rolling-average noise floor in RadioLibInterface
+        // (sampled from idle-RX RSSI); use it instead of the old instantaneous read.
         float nf = 0.0f;
-        if (router && router->getInterface()) nf = router->getInterface()->getNoiseFloor();
+        if (RadioLibInterface::instance && RadioLibInterface::instance->hasNoiseFloorSamples())
+            nf = (float)RadioLibInterface::instance->getNoiseFloor();
         if (nf < -1.0f) {
 
             snprintf(buf, sizeof(buf), "%d dBm", (int)lroundf(nf));
@@ -3211,6 +3291,7 @@ void settings_screen_tick()
 {
     if (!s_page) return;
     orientation_overlay_update();
+    reboot_overlay_update();
     uint32_t now = millis();
     if (now - s_last_refresh_ms < 1000) return;
     s_last_refresh_ms = now;

@@ -61,6 +61,16 @@ static inline void note_redirected_alloc()
     s_redirected.fetch_add(1, std::memory_order_relaxed);
 }
 
+// heap_caps_malloc_default is the path newlib malloc()/operator new and
+// FreeRTOS pvPortMalloc take. Wrapped (pass-through) so the guard's view of
+// the allocator surface stays complete for future diagnostics.
+void *__real_heap_caps_malloc_default(size_t size);
+
+void *__wrap_heap_caps_malloc_default(size_t size)
+{
+    return __real_heap_caps_malloc_default(size);
+}
+
 void *__wrap_heap_caps_malloc(size_t size, uint32_t caps)
 {
     if (should_redirect(caps)) {

@@ -37,11 +37,14 @@ struct McMessage {
 
 constexpr int MC_MAX_CONVERSATIONS = 8;
 
-// 16 (was 32): the store is heap_caps_malloc(MALLOC_CAP_INTERNAL) on this
-// board; halving it frees ~31 KB internal RAM and halves the save-time
-// serialize buffer, widening the headroom before internal exhaustion spills
-// onto the corrupted post-framebuffer PSRAM heap.
-constexpr int MC_MAX_MSGS_PER_CONV = 16;
+// 100 messages per conversation. The store is lv_malloc() → the unified PSRAM
+// multi_heap (crowpanel_lvgl_alloc), NOT internal/DMA RAM, so its size does not
+// pressure the ESP-Hosted/DMA pool. 8 convs * 100 * sizeof(McMessage)(244 B) =
+// ~195 KB on the 16 MB PSRAM heap. The on-disk format stores only `count`
+// messages (not the whole ring), so raising this does NOT invalidate existing
+// saves and needs no PERSIST_VERSION bump. head/count are uint8_t, so keep this
+// <= 255. The 300 KB messages_load() size guard still covers the worst case.
+constexpr int MC_MAX_MSGS_PER_CONV = 100;
 
 void messages_init();
 

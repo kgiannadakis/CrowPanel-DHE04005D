@@ -201,6 +201,7 @@ extern uint8_t g_deferred_sound;
 extern bool   g_deferred_refresh_targets;
 extern bool   g_deferred_serialmon_dirty;
 extern bool   g_deferred_timelabel_dirty;
+extern bool   g_deferred_battery_dirty;
 extern bool   g_deferred_route_label_dirty;
 extern bool   g_deferred_wifi_status_dirty;
 extern bool   g_deferred_receipt_update;

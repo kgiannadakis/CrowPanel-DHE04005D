@@ -60,10 +60,14 @@
     #endif
 
 #else       /*LV_MEM_CUSTOM*/
-    #define LV_MEM_CUSTOM_INCLUDE <stdlib.h>   /*Header for the dynamic memory function*/
-    #define LV_MEM_CUSTOM_ALLOC   malloc
-    #define LV_MEM_CUSTOM_FREE    free
-    #define LV_MEM_CUSTOM_REALLOC realloc
+    /*PSRAM-first allocator (see lv_psram_mem.h): keeps LVGL's widget/style/
+     *text allocations out of the ~500 KB internal SRAM pool that WiFi,
+     *mbedtls and ESP-Hosted need. Plain malloc served everything <=16 KB
+     *from internal SRAM, which exhausted it at runtime.*/
+    #define LV_MEM_CUSTOM_INCLUDE "lv_psram_mem.h"   /*Header for the dynamic memory function*/
+    #define LV_MEM_CUSTOM_ALLOC   lv_psram_malloc
+    #define LV_MEM_CUSTOM_FREE    lv_psram_free
+    #define LV_MEM_CUSTOM_REALLOC lv_psram_realloc
 #endif     /*LV_MEM_CUSTOM*/
 
 /*Number of the intermediate memory buffer used during rendering and other internal processing mechanisms.

@@ -1,0 +1,31 @@
+* text=auto
+
+# Keep source and project files consistent across operating systems.
+*.c text eol=lf
+*.cc text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.hpp text eol=lf
+*.ino text eol=lf
+*.ini text eol=lf
+*.json text eol=lf
+*.jsonc text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Binary assets and firmware artifacts.
+*.afdesign binary
+*.bin binary
+*.fnt binary
+*.gif binary
+*.jpg binary
+*.jpeg binary
+*.pack binary
+*.png binary
+*.stl binary
+*.ttf binary
+*.uf2 binary
+*.zip binary

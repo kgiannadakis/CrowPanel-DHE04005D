@@ -37,6 +37,33 @@ static lv_obj_t *s_send_btn = nullptr;
 static McConvId s_current = McConvId::none();
 static uint32_t s_last_tick = 0;
 
+// Sender-name resolution: a text message can arrive before the sender's
+// NodeInfo (very common over MQTT), so the name isn't known yet at first
+// display. rebuild_bubbles() re-resolves names from nodeDB every pass, so once
+// NodeInfo lands the friendly name appears — but only when the view rebuilds.
+// s_names_unresolved tracks whether the last pass had any hex-fallback sender;
+// chatview_tick() then retries periodically (but only while scrolled to the
+// bottom, so it never yanks a user reading history) until all names resolve.
+static bool s_names_unresolved = false;
+static bool s_pass_unresolved = false;
+static uint32_t s_last_name_retry_ms = 0;
+
+// Rebuild coalescing while composing. rebuild_bubbles() destroys and recreates
+// the whole bubble list (up to MC_MAX_MSGS_PER_CONV) under the LVGL lock; doing
+// that on every inbound packet on a busy channel starves touch/render and makes
+// typing lag. While the keyboard is open we coalesce rebuilds to at most one per
+// window and flush the pending one as soon as the keyboard closes.
+static uint32_t s_last_rebuild_ms = 0;
+static bool s_rebuild_pending = false;
+static constexpr uint32_t kChatTypingRebuildMs = 1500;
+
+// The full conversation (up to MC_MAX_MSGS_PER_CONV) is still stored and
+// persisted, but the chat view only renders the most recent messages. This keeps
+// rebuild_bubbles() cheap no matter how busy the channel is — the cost is bounded
+// by this window, not by the total history. messages_snapshot() already returns
+// the newest messages.
+static constexpr int kChatVisibleMessages = 30;
+
 static int16_t s_press_start_x = -1;
 
 static constexpr int16_t EDGE_SWIPE_MARGIN = 40;
@@ -217,12 +244,21 @@ static void add_bubble(const McMessage &m)
 
     char head[64] = {0};
     if (!m.outgoing) {
-        const char *sender = "?";
+        char namebuf[40];
+        const char *sender = nullptr;
         if (nodeDB) {
             auto *n = nodeDB->getMeshNode(m.from_node);
-            if (n && n->has_user) {
+            if (n && n->has_user && (n->user.short_name[0] || n->user.long_name[0])) {
                 sender = n->user.short_name[0] ? n->user.short_name : n->user.long_name;
             }
+        }
+        if (!sender) {
+            // No NodeInfo/name yet — show the node id (meshtastic "!hexid"
+            // convention) instead of a bare "?", so the sender is identifiable.
+            // Flag the pass so chatview_tick() retries once the name arrives.
+            snprintf(namebuf, sizeof(namebuf), "!%08x", (unsigned)m.from_node);
+            sender = namebuf;
+            s_pass_unresolved = true;
         }
         char ts[8] = "--:--";
         if (m.timestamp > 1700000000) {
@@ -277,9 +313,19 @@ static void rebuild_bubbles()
     lv_obj_clean(s_bubbles);
     if (!s_current.is_valid()) return;
 
-    McMessage buf[MC_MAX_MSGS_PER_CONV];
-    size_t n = messages_snapshot(s_current, buf, MC_MAX_MSGS_PER_CONV);
+    // Snapshot buffer lives on the PSRAM heap, not the stack (a stack array
+    // would risk the UI task stack). Allocated once and reused (rebuild_bubbles
+    // fires on every incoming packet during MQTT bursts, so per-call malloc/free
+    // churn is avoided). Single UI task, so a shared static buffer is safe. Sized
+    // to the visible window, not the full stored history.
+    static McMessage *buf = nullptr;
+    if (!buf)
+        buf = (McMessage *)lv_malloc(sizeof(McMessage) * kChatVisibleMessages);
+    if (!buf) return;
+    s_pass_unresolved = false; // add_bubble() sets this if any sender lacks a name
+    size_t n = messages_snapshot(s_current, buf, kChatVisibleMessages);
     for (size_t i = 0; i < n; i++) add_bubble(buf[i]);
+    s_names_unresolved = s_pass_unresolved;
 
     lv_obj_scroll_to_y(s_bubbles, LV_COORD_MAX, LV_ANIM_OFF);
 
@@ -293,15 +339,16 @@ static void rebuild_bubbles()
     // itself does not touch the corrupt heap.
     //
     // But a full-screen repaint is a full PPA rotate + draw_bitmap of the whole
-    // panel, during which the LVGL service task cannot sample touch. Under an
-    // MQTT downlink burst, rebuild_bubbles() fires on every incoming packet, so
-    // an unconditional full-screen invalidate here starves keyboard/touch input
-    // and makes typing feel laggy. Throttle it: at most one full-screen repaint
-    // per window. Stomped regions still self-heal within that window, and the
-    // per-bubble edits below invalidate their own areas normally regardless.
+    // panel, during which the LVGL service task cannot sample touch — that makes
+    // typing feel laggy. So skip it entirely while the keyboard is open (the
+    // per-bubble edits still invalidate their own areas), and otherwise throttle
+    // to at most one full repaint per window. When the keyboard closes, the
+    // deferred rebuild in chatview_tick() runs this path and heals any stomped
+    // region then.
     static uint32_t s_last_full_invalidate = 0;
     const uint32_t now = millis();
-    if (s_last_full_invalidate == 0 || (uint32_t)(now - s_last_full_invalidate) >= 1500) {
+    if (!keyboard_is_visible() &&
+        (s_last_full_invalidate == 0 || (uint32_t)(now - s_last_full_invalidate) >= 1500)) {
         s_last_full_invalidate = now;
         lv_obj_t *scr = lv_screen_active();
         if (scr) lv_obj_invalidate(scr);
@@ -469,11 +516,43 @@ void chatview_tick()
 {
     if (!chatview_is_open()) return;
     refresh_header_time();
-    uint32_t t = messages_change_tick();
-    if (t != s_last_tick) {
-        s_last_tick = t;
+
+    const bool typing = keyboard_is_visible();
+    const uint32_t now = millis();
+
+    auto do_rebuild = [&]() {
+        s_last_tick = messages_change_tick();
+        s_last_rebuild_ms = now;
+        s_rebuild_pending = false;
         rebuild_bubbles();
         if (s_current.is_valid()) messages_mark_read(s_current);
+    };
+
+    // New messages/state changed. While composing, coalesce: rebuilding the
+    // whole bubble list on every inbound packet starves touch/render and makes
+    // typing lag on a busy channel. Defer to one rebuild per window.
+    if (messages_change_tick() != s_last_tick) {
+        if (typing && (uint32_t)(now - s_last_rebuild_ms) < kChatTypingRebuildMs)
+            s_rebuild_pending = true;
+        else
+            do_rebuild();
+        return;
+    }
+
+    // Flush a coalesced rebuild once the window elapses or the keyboard closes.
+    if (s_rebuild_pending && (!typing || (uint32_t)(now - s_last_rebuild_ms) >= kChatTypingRebuildMs)) {
+        do_rebuild();
+        return;
+    }
+
+    // Sender-name retry: a NodeInfo arriving after the message upgrades "!hexid"
+    // to the friendly name. Cosmetic, so skip it while composing; only run while
+    // scrolled to the bottom so it never yanks a user reading history.
+    if (!typing && s_names_unresolved && s_bubbles) {
+        if ((uint32_t)(now - s_last_name_retry_ms) >= 3000 && lv_obj_get_scroll_bottom(s_bubbles) <= 4) {
+            s_last_name_retry_ms = now;
+            rebuild_bubbles();
+        }
     }
 }
 

@@ -848,6 +848,11 @@ struct MapTileSlot {
     lv_obj_t *img = nullptr;
     lv_obj_t *placeholder = nullptr;
     char src[96] = {0};
+    // Cache of the tile this slot last resolved, so an unchanged view (the
+    // every-4s marker refresh, the post-drag marker restore) skips all SD I/O.
+    // -1 = invalid.
+    int cz = -1, cx = -1, cy = -1;
+    bool cloaded = false; // whether (cz,cx,cy) resolved to a real tile file
 };
 
 struct MapMarkerSlot {
@@ -855,6 +860,7 @@ struct MapMarkerSlot {
     lv_obj_t *tag = nullptr;
     lv_obj_t *tag_label = nullptr;
     bool active = false;
+    bool has_tag = false; // whether this slot's tag/label should be visible
 };
 
 struct MapState {
@@ -879,8 +885,18 @@ static constexpr int kMapLocalDotPx = 9;
 static constexpr int kMapMinZoom = 7;
 static constexpr int kMapMaxZoom = 12;
 static constexpr int kMapDesiredTilePad = 1;
-static constexpr int kMapMaxTileSlots = 40;
+// Must fit in LV_CACHE_DEF_SIZE at 256 KB per decoded tile (9.5 MB cache holds
+// 30 with margin). The 2026-07 map-freeze was NOT a tile-count/cache issue —
+// it was LVGL's builtin lv_tlsf allocator infinite-looping during image decode
+// (fixed by the multi_heap custom allocator, crowpanel_lvgl_alloc.cpp).
+static constexpr int kMapMaxTileSlots = 30;
 static constexpr int kMapMaxMarkerSlots = 40;
+// Node name tags are only drawn at these zooms; below this it's dots only.
+static constexpr int kMapNameMinZoom = 11;
+// Screen-space grid cell (px) for marker clustering: nodes whose dots fall in
+// the same cell collapse into one dot + a count, so a crowded area doesn't draw
+// dozens of overlapping markers. Zoom in to pull them apart.
+static constexpr int kMapClusterCellPx = 40;
 static constexpr uint32_t kMapNodeRefreshMs = 4000;
 static constexpr uint32_t kMapMarkerRestoreDelayMs = 120;
 static constexpr int kMapRebuildEdgeMarginPx = 24;
@@ -1095,6 +1111,13 @@ static bool maps_ensure_sd_mounted()
 // is handed the equivalent "S:/..." path. Returns true if the tile is loaded.
 static bool maps_load_tile(MapTileSlot &ts, int z, int x, int y)
 {
+    // Fast path: this slot already resolved this exact tile — skip ALL SD I/O.
+    // The every-4s marker refresh and the post-drag marker restore rebuild the
+    // same view, so without this each redraw did 30-60 FAT stat() calls (~200 ms
+    // of pure SD latency, felt as periodic stutter and slow pan/zoom).
+    if (ts.cz == z && ts.cx == x && ts.cy == y)
+        return ts.cloaded;
+
     static const char *const kExts[] = {"png", "bin"};
 
     char diskPath[64];
@@ -1107,23 +1130,37 @@ static bool maps_load_tile(MapTileSlot &ts, int z, int x, int y)
             break;
         }
     }
-    if (!ext) return false;
+
+    ts.cz = z;
+    ts.cx = x;
+    ts.cy = y;
+
+    if (!ext) {
+        ts.cloaded = false;
+        return false;
+    }
 
     char fsPath[64];
     snprintf(fsPath, sizeof(fsPath), "S:/tiles/%d/%d/%d.%s", z, x, y, ext);
 
-    // Only re-validate and re-point the image when the source actually changes;
-    // otherwise reuse the already-decoded (cached) tile.
+    // Re-point the image only when the source actually changes; otherwise reuse
+    // the already-decoded (LVGL image-cache) tile. stat() above already proved
+    // the file exists, and set_src + the decode-on-render path handle a bad file
+    // gracefully, so the extra lv_image_decoder_get_info() open was dropped to
+    // halve SD reads per newly-exposed tile on pan/zoom.
     if (strcmp(ts.src, fsPath) != 0) {
-        lv_image_header_t hdr;
-        if (lv_image_decoder_get_info(fsPath, &hdr) != LV_RESULT_OK) return false;
         lv_image_set_src(ts.img, nullptr);
         strncpy(ts.src, fsPath, sizeof(ts.src) - 1);
         ts.src[sizeof(ts.src) - 1] = '\0';
         lv_image_set_src(ts.img, ts.src);
         lv_obj_set_size(ts.img, kMapTilePx, kMapTilePx);
-        lv_image_set_inner_align(ts.img, LV_IMAGE_ALIGN_STRETCH);
+        // Tiles are already native kMapTilePx (256) square, so no scaling is
+        // needed. STRETCH forced LVGL's transformed/scaled ARGB8888 draw path
+        // (slow, per-pixel alpha, and prone to stalling the SW renderer) even
+        // at a 1:1 ratio; TOP_LEFT keeps the plain, fast, non-transformed blit.
+        lv_image_set_inner_align(ts.img, LV_IMAGE_ALIGN_TOP_LEFT);
     }
+    ts.cloaded = true;
     return true;
 }
 
@@ -1132,6 +1169,8 @@ static void maps_clear_all_tiles()
     for (int i = 0; i < kMapMaxTileSlots; i++) {
         MapTileSlot &ts = s_map_tiles[i];
         ts.src[0] = '\0';
+        ts.cz = ts.cx = ts.cy = -1; // invalidate the SD-skip cache
+        ts.cloaded = false;
         if (ts.img) {
             lv_image_set_src(ts.img, nullptr);
             lv_obj_add_flag(ts.img, LV_OBJ_FLAG_HIDDEN);
@@ -1160,6 +1199,7 @@ static void maps_hide_all_markers()
 {
     for (int i = 0; i < kMapMaxMarkerSlots; i++) {
         s_map_markers[i].active = false;
+        s_map_markers[i].has_tag = false;
         if (s_map_markers[i].dot) lv_obj_add_flag(s_map_markers[i].dot, LV_OBJ_FLAG_HIDDEN);
         if (s_map_markers[i].tag) lv_obj_add_flag(s_map_markers[i].tag, LV_OBJ_FLAG_HIDDEN);
     }
@@ -1177,7 +1217,7 @@ static void maps_set_marker_visibility(bool visible)
                 lv_obj_add_flag(m.dot, LV_OBJ_FLAG_HIDDEN);
         }
         if (m.tag) {
-            if (visible)
+            if (visible && m.has_tag)
                 lv_obj_clear_flag(m.tag, LV_OBJ_FLAG_HIDDEN);
             else
                 lv_obj_add_flag(m.tag, LV_OBJ_FLAG_HIDDEN);
@@ -1221,7 +1261,8 @@ static bool maps_slot_position_from_node(const meshtastic_NodeInfoLite *node, in
     return !(*mx < -8 || *my < -8 || *mx > pan_w + 8 || *my > pan_h + 8);
 }
 
-static void maps_show_marker_slot(MapMarkerSlot &slot, const meshtastic_NodeInfoLite *node, bool is_local, int mx, int my)
+static void maps_show_marker_slot(MapMarkerSlot &slot, const meshtastic_NodeInfoLite *node, bool is_local, int mx, int my,
+                                  bool show_name)
 {
     if (!slot.dot) return;
 
@@ -1240,7 +1281,8 @@ static void maps_show_marker_slot(MapMarkerSlot &slot, const meshtastic_NodeInfo
     lv_obj_move_foreground(slot.dot);
     lv_obj_clear_flag(slot.dot, LV_OBJ_FLAG_HIDDEN);
 
-    if (slot.tag && slot.tag_label && node) {
+    // Name tag only at the closer zooms (kMapNameMinZoom+); otherwise dot only.
+    if (show_name && slot.tag && slot.tag_label && node) {
         char short_name[32];
         maps_node_short_name(node, short_name, sizeof(short_name));
         lv_label_set_text(slot.tag_label, short_name);
@@ -1248,6 +1290,38 @@ static void maps_show_marker_slot(MapMarkerSlot &slot, const meshtastic_NodeInfo
         lv_obj_set_pos(slot.tag, mx + 6, my - 10);
         lv_obj_move_foreground(slot.tag);
         lv_obj_clear_flag(slot.tag, LV_OBJ_FLAG_HIDDEN);
+        slot.has_tag = true;
+    } else if (slot.tag) {
+        lv_obj_add_flag(slot.tag, LV_OBJ_FLAG_HIDDEN);
+        slot.has_tag = false;
+    }
+
+    slot.active = true;
+}
+
+// A cluster marker: one dot standing in for `count` nearby nodes, with the
+// count shown in the same tag styling as a name. The count is drawn at every
+// zoom (it's the whole point of collapsing the group).
+static void maps_show_cluster_slot(MapMarkerSlot &slot, int count, int mx, int my)
+{
+    if (!slot.dot) return;
+
+    lv_obj_set_size(slot.dot, kMapMarkerDotPx, kMapMarkerDotPx);
+    lv_obj_set_pos(slot.dot, mx - (kMapMarkerDotPx / 2), my - (kMapMarkerDotPx / 2));
+    lv_obj_set_style_bg_color(slot.dot, lv_color_hex(0x4DA3FF), 0);
+    lv_obj_set_style_radius(slot.dot, 0, 0);
+    lv_obj_move_foreground(slot.dot);
+    lv_obj_clear_flag(slot.dot, LV_OBJ_FLAG_HIDDEN);
+
+    if (slot.tag && slot.tag_label) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%d", count);
+        lv_label_set_text(slot.tag_label, buf);
+        lv_obj_set_size(slot.tag, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_pos(slot.tag, mx + 6, my - 10);
+        lv_obj_move_foreground(slot.tag);
+        lv_obj_clear_flag(slot.tag, LV_OBJ_FLAG_HIDDEN);
+        slot.has_tag = true;
     }
 
     slot.active = true;
@@ -1259,24 +1333,65 @@ static int maps_draw_markers(int base_x, int base_y, int pan_w, int pan_h)
     if (!nodeDB || !s_map.pan) return 0;
 
     const uint32_t local_num = nodeDB->getNodeNum();
-    bool local_drawn = false;
-    int marker_idx = 0;
-    size_t n = nodeDB->getNumMeshNodes();
-    for (size_t i = 0; i < n && marker_idx < kMapMaxMarkerSlots; i++) {
+    const bool show_names = (s_map.zoom >= kMapNameMinZoom);
+
+    // Bin visible non-local nodes into screen-space grid cells. Nodes sharing a
+    // cell collapse to one marker: a single node keeps its dot (+ name at close
+    // zoom), several become one dot + a count. Deterministic (cell id = integer
+    // grid coords), and O(nodes * clusters) which is fine for a few hundred
+    // nodes. Static (single UI task) to keep it off the stack.
+    struct MapCluster {
+        int cx, cy;                          // grid cell
+        int count;                           // nodes in this cell
+        int sum_mx, sum_my;                  // for centroid placement
+        meshtastic_NodeInfoLite *node;       // representative (used when count == 1)
+    };
+    static MapCluster clusters[kMapMaxMarkerSlots];
+    int nclusters = 0;
+
+    const size_t n = nodeDB->getNumMeshNodes();
+    for (size_t i = 0; i < n; i++) {
         meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(i);
+        if (!node || node->num == local_num) continue; // local drawn separately
         int mx = 0, my = 0;
         if (!maps_slot_position_from_node(node, base_x, base_y, pan_w, pan_h, &mx, &my)) continue;
-        const bool is_local = (node->num == local_num);
-        maps_show_marker_slot(s_map_markers[marker_idx], node, is_local, mx, my);
-        if (is_local) local_drawn = true;
+
+        const int cx = (int)floor((double)mx / kMapClusterCellPx);
+        const int cy = (int)floor((double)my / kMapClusterCellPx);
+        int found = -1;
+        for (int c = 0; c < nclusters; c++) {
+            if (clusters[c].cx == cx && clusters[c].cy == cy) { found = c; break; }
+        }
+        if (found < 0) {
+            if (nclusters >= kMapMaxMarkerSlots) continue; // out of marker slots
+            found = nclusters++;
+            clusters[found] = {cx, cy, 0, 0, 0, node};
+        }
+        clusters[found].count++;
+        clusters[found].sum_mx += mx;
+        clusters[found].sum_my += my;
+    }
+
+    int marker_idx = 0;
+    for (int c = 0; c < nclusters && marker_idx < kMapMaxMarkerSlots; c++) {
+        MapCluster &cl = clusters[c];
+        const int cmx = cl.sum_mx / cl.count;
+        const int cmy = cl.sum_my / cl.count;
+        if (cl.count == 1)
+            maps_show_marker_slot(s_map_markers[marker_idx], cl.node, false, cmx, cmy, show_names);
+        else
+            maps_show_cluster_slot(s_map_markers[marker_idx], cl.count, cmx, cmy);
         marker_idx++;
     }
 
-    if (!local_drawn && marker_idx < kMapMaxMarkerSlots) {
+    // Local node: always its own marker (distinct style), never clustered.
+    if (marker_idx < kMapMaxMarkerSlots) {
         meshtastic_NodeInfoLite *local = nodeDB->getMeshNode(local_num);
         int mx = 0, my = 0;
-        if (maps_slot_position_from_node(local, base_x, base_y, pan_w, pan_h, &mx, &my))
-            maps_show_marker_slot(s_map_markers[marker_idx], local, true, mx, my);
+        if (maps_slot_position_from_node(local, base_x, base_y, pan_w, pan_h, &mx, &my)) {
+            maps_show_marker_slot(s_map_markers[marker_idx], local, true, mx, my, show_names);
+            marker_idx++;
+        }
     }
     return marker_idx;
 }

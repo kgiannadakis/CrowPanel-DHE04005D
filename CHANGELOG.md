@@ -5,6 +5,47 @@ documented in this file. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 follows simple `MAJOR.MINOR` versioning that matches the GitHub releases.
 
+## [2.0] - 2026-07-11
+
+This is a major revision. **Erase the device completely before flashing Version 2.0.**
+
+### Added
+
+- Added display-memory allocation support for the ESP32-P4 RGB panel in Meshtastic.
+- Added message character counting.
+- Integrated additional Meshtastic hardware, sensor, display, input, radio, and
+  protocol support from the updated upstream codebase.
+- Integrated new MeshCore boards, display drivers, radio variants, and tests
+  from the updated upstream codebase.
+
+### Changed
+
+- Updated the bundled MeshCore source tree to version 1.16.
+- Updated the bundled Meshtastic firmware and protobuf sources to version 2.7.26.54.
+- Revised the Meshtastic CrowPanel display implementation and PSRAM allocation
+  behavior.
+- Updated the dual-boot selector and partition layouts.
+- Updated the complete-device flashing script.
+- Regenerated the partition binary used by the combined installation.
+- Expanded support for newer boards and platform configurations in both
+  firmware trees.
+
+### Fixed
+
+- Improved ESP32-P4 display-memory management and allocation safety.
+- Improved CrowPanel backlight and STC8 controller integration.
+- Improved stability during UI, persistence, networking, and memory-intensive
+  operations.
+
+### Upgrade notes
+
+- **Erase the device before installing Version 2.0.**
+- Version 2.0 introduces a new dual-boot partition layout. Perform a
+  complete-device flash with `flash_all.py`; do not update only one firmware
+  partition.
+- The external DS3231 RTC remains optional but is recommended for retaining the
+  time while the device is powered off.
+
 ## [1.1] - 2026-06-21
 
 ### Added

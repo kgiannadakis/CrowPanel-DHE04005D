@@ -137,6 +137,7 @@ uint8_t g_deferred_sound = 0;
 bool   g_deferred_refresh_targets = false;
 bool   g_deferred_serialmon_dirty = false;
 bool   g_deferred_timelabel_dirty = false;
+bool   g_deferred_battery_dirty = false;
 bool   g_deferred_route_label_dirty = false;
 bool   g_deferred_wifi_status_dirty = false;
 bool   g_deferred_receipt_update = false;
@@ -355,7 +356,7 @@ class UIMesh : public BaseChatMesh, public ContactVisitor {
   void loadPrefs() {
     memset(&_prefs, 0, sizeof(_prefs));
     _prefs.airtime_factor = 1.0f;
-    strncpy(_prefs.node_name, "CrowPanel", sizeof(_prefs.node_name));
+    strncpy(_prefs.node_name, "DHE04005D", sizeof(_prefs.node_name));
     _prefs.freq = (float)LORA_FREQ;
     _prefs.tx_power_dbm = (int8_t)LORA_TX_POWER;
 
@@ -389,7 +390,70 @@ class UIMesh : public BaseChatMesh, public ContactVisitor {
     }
   }
 
+  bool contactsFileLooksComplete(const char* path) {
+    if (!_fs || !_fs->exists(path)) return false;
+#if defined(RP2040_PLATFORM)
+    File file = _fs->open(path, "r");
+#else
+    File file = _fs->open(path);
+#endif
+    if (!file) return false;
+    size_t size = file.size();
+    file.close();
+    return (size % sizeof(ContactRecord)) == 0;
+  }
+
+  void recoverContactsFile() {
+    const char* contacts_path = "/contacts";
+    const char* tmp_path = "/contacts.tmp";
+    const char* bak_path = "/contacts.bak";
+
+    if (contactsFileLooksComplete(contacts_path)) {
+      if (_fs->exists(tmp_path)) _fs->remove(tmp_path);
+      return;
+    }
+
+    if (contactsFileLooksComplete(bak_path)) {
+      _fs->remove(contacts_path);
+      if (_fs->rename(bak_path, contacts_path)) {
+        if (_fs->exists(tmp_path)) _fs->remove(tmp_path);
+        return;
+      }
+    }
+
+    if (contactsFileLooksComplete(tmp_path)) {
+      _fs->remove(contacts_path);
+      _fs->rename(tmp_path, contacts_path);
+    }
+  }
+
+  bool replaceContactsFile(const char* tmp_path) {
+    const char* contacts_path = "/contacts";
+    const char* bak_path = "/contacts.bak";
+
+    if (!contactsFileLooksComplete(tmp_path)) {
+      _fs->remove(tmp_path);
+      return false;
+    }
+
+    _fs->remove(bak_path);
+    bool had_contacts = _fs->exists(contacts_path);
+    if (had_contacts && !_fs->rename(contacts_path, bak_path)) {
+      _fs->remove(tmp_path);
+      return false;
+    }
+
+    if (_fs->rename(tmp_path, contacts_path)) return true;
+
+    if (had_contacts && _fs->exists(bak_path)) {
+      _fs->rename(bak_path, contacts_path);
+    }
+    _fs->remove(tmp_path);
+    return false;
+  }
+
   void loadContacts() {
+    recoverContactsFile();
     if (!_fs->exists("/contacts")) return;
 #if defined(RP2040_PLATFORM)
     File file = _fs->open("/contacts", "r");
@@ -419,16 +483,22 @@ class UIMesh : public BaseChatMesh, public ContactVisitor {
   }
 
   void saveContacts() {
+    // Transactional save: write the new list to a temp file first, then keep
+    // the previous contact database as /contacts.bak while swapping. If power
+    // drops during the swap, boot recovery restores the backup instead of
+    // starting with an empty contact/repeater list.
+    const char* tmp_path = "/contacts.tmp";
 #if defined(NRF52_PLATFORM)
-    _fs->remove("/contacts");
-    File file = _fs->open("/contacts", FILE_O_WRITE);
+    _fs->remove(tmp_path);
+    File file = _fs->open(tmp_path, FILE_O_WRITE);
 #elif defined(RP2040_PLATFORM)
-    File file = _fs->open("/contacts", "w");
+    File file = _fs->open(tmp_path, "w");
 #else
-    File file = _fs->open("/contacts", "w", true);
+    File file = _fs->open(tmp_path, "w", true);
 #endif
     if (!file) return;
 
+    bool ok = true;
     ContactsIterator iter;
     ContactInfo c;
     while (iter.hasNext(this, c)) {
@@ -444,9 +514,17 @@ class UIMesh : public BaseChatMesh, public ContactVisitor {
       memcpy(rec.out_path, c.out_path, 64);
       rec.gps_lat = c.gps_lat;
       rec.gps_lon = c.gps_lon;
-      if (file.write((const uint8_t*)&rec, sizeof(rec)) != sizeof(rec)) break;
+      if (file.write((const uint8_t*)&rec, sizeof(rec)) != sizeof(rec)) { ok = false; break; }
     }
     file.close();
+
+    if (!ok) {
+      _fs->remove(tmp_path);   // partial write — leave the existing /contacts untouched
+      return;
+    }
+    if (!replaceContactsFile(tmp_path)) {
+      Serial.println("CONTACTS: save failed, kept previous /contacts");
+    }
   }
 
   void ui_set_devname() {
@@ -2084,7 +2162,6 @@ public:
     ContactInfo* c = lookupContactByPubKey(pub_key, 32);
     if (!c) return false;
     if (c->type == ADV_TYPE_REPEATER) return false;
-    rebuild_contacts_file_excluding(c->id.pub_key);
     delete_chat_file_for_key(key_for_contact(c->id));
     if (_curr_recipient == c) { _curr_recipient = nullptr; _curr_kind = TargetKind::NONE; }
     ContactInfo copy = *c;
@@ -2097,7 +2174,6 @@ public:
     ContactInfo* c = lookupContactByPubKey(pub_key, 32);
     if (!c) return false;
     if (c->type != ADV_TYPE_REPEATER) return false;
-    rebuild_contacts_file_excluding(c->id.pub_key);
     ContactInfo copy = *c;
     removeContact(copy);
     saveContacts();
@@ -2160,13 +2236,6 @@ __attribute__((constructor(65534))) static void ctor_heartbeat_last() {
   ets_printf("[ctor] priority 65534 (last) ran\n");
 }
 
-#define CHECKPOINT(n) do { Serial.printf(">>> [%d]\n", n); Serial.flush(); } while (0)
-
-#define DBG_MAGIC 0xC0DEF00Du
-RTC_NOINIT_ATTR static uint32_t s_dbg_magic;
-RTC_NOINIT_ATTR static uint32_t s_dbg_last_stage;
-RTC_NOINIT_ATTR static uint32_t s_dbg_last_stage_ms;
-static constexpr bool kRuntimeDebugLogs = false;
 
 static const char* dbg_reset_reason_name(esp_reset_reason_t reason) {
   switch (reason) {
@@ -2184,73 +2253,16 @@ static const char* dbg_reset_reason_name(esp_reset_reason_t reason) {
   }
 }
 
-static const char* dbg_stage_name(uint32_t stage) {
-  switch (stage) {
-    case 100: return "loop-start";
-    case 110: return "lvgl-deferred";
-    case 120: return "translate";
-    case 130: return "mesh-loop";
-    case 140: return "pm-checks";
-    case 150: return "deferred-radio";
-    case 160: return "rtc-wifi";
-    case 170: return "wifi-services";
-    case 180: return "receipt-poll";
-    case 190: return "saves";
-    case 200: return "loop-end";
-    default:  return "unknown";
-  }
-}
-
-static void dbg_mark(uint32_t stage) {
-  if (!kRuntimeDebugLogs) return;
-  s_dbg_magic = DBG_MAGIC;
-  s_dbg_last_stage = stage;
-  s_dbg_last_stage_ms = millis();
-}
-
-static void dbg_print_memory(const char* tag) {
-  if (!kRuntimeDebugLogs) return;
-  Serial.printf("[dbg:%s] heap internal free=%u min=%u largest=%u dma free=%u largest=%u psram free=%u largest=%u stack=%u wifi=%d rssi=%d\n",
-                tag,
-                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
-                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-                (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
-                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
-                (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
-                (unsigned)uxTaskGetStackHighWaterMark(NULL),
-                (int)WiFi.status(),
-                (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0);
-}
-
-static void dbg_print_boot_state() {
-  esp_reset_reason_t reason = esp_reset_reason();
-  Serial.printf("[dbg:boot] reset=%s(%d)\n", dbg_reset_reason_name(reason), (int)reason);
-  if (s_dbg_magic == DBG_MAGIC) {
-    Serial.printf("[dbg:boot] last_stage=%lu(%s) last_ms=%lu\n",
-                  (unsigned long)s_dbg_last_stage,
-                  dbg_stage_name(s_dbg_last_stage),
-                  (unsigned long)s_dbg_last_stage_ms);
-  } else {
-    Serial.println("[dbg:boot] no previous breadcrumb");
-  }
-  dbg_mark(0);
-  dbg_print_memory("boot");
-  Serial.flush();
-}
-
 void setup() {
   Serial.begin(115200);
   delay(50);
   Serial.println(">>> setup() entered");
   Serial.printf("[fw] CrowPanel DHE04005D direct-RGB build %s %s\n", __DATE__, __TIME__);
-  dbg_print_boot_state();
+  const esp_reset_reason_t reset_reason = esp_reset_reason();
+  Serial.printf("[boot] reset reason: %s (%d)\n",
+                dbg_reset_reason_name(reset_reason), (int)reset_reason);
   Serial.flush();
-  CHECKPOINT(1);
-
   // 30-second watchdog (arduino-esp32 3.x API uses a config struct).
-  CHECKPOINT(2);
   {
     esp_task_wdt_config_t wdt_cfg = {};
     wdt_cfg.timeout_ms      = 30000;
@@ -2265,16 +2277,11 @@ void setup() {
   // settings-screen orientation toggle persists to NVS then esp_restart()s
   // so the new value is live on the next boot.
   g_landscape_mode = load_landscape_nvs();
-
-  CHECKPOINT(3);
   if (!display_init()) {
     Serial.println("display_init FAILED");
     while (1) delay(1000);
   }
-  CHECKPOINT(4);
   stc8_set_pwm_duty(STC8_PWM_LCD_BL_EN, 100);
-  CHECKPOINT(5);
-
   // SD card (separate SDMMC slot from ESP-Hosted, no conflict with WiFi).
   // Must be mounted BEFORE emoji_atlas_init() so the Noto Color Emoji
   // atlas can be loaded from /sdcard/emoji/. Graceful degradation if no
@@ -2301,7 +2308,6 @@ void setup() {
   // a hardwired 800×480 landscape — g_landscape_mode defaults to true (see
   // keyboard_helpers.cpp).
   init_layout_constants();
-  CHECKPOINT(55);
   ui_init();                               // SquareLine — creates screens
 
   // Post-ui_init wiring that v11's old init_display_and_ui() used to do —
@@ -2459,23 +2465,15 @@ void setup() {
   // appeared dark until WiFi associated. A handful of iterations gives
   // the panel at least one vsync flip with the home screen painted.
   for (int i = 0; i < 8; i++) { lv_timer_handler(); delay(5); }
-  CHECKPOINT(6);
-
   if (ui_repeaterscreen)
     lv_obj_add_event_cb(ui_repeaterscreen, cb_repeater_screen_loaded,
                         LV_EVENT_SCREEN_LOADED, nullptr);
   if (ui_chatpanel) g_chatpanel_orig_y = lv_obj_get_y(ui_chatpanel);
-  CHECKPOINT(7);
-
   display_touch_attach();                  // GT911 → LVGL indev
-  CHECKPOINT(8);
   // DHE04005D has no battery-backed RTC — NTP is the sole time source
   // (once WiFi is up). No RTC init/probe step on this variant.
   speaker_init();                          // I2S audio out (LRCK=21, BCLK=22, SDOUT=23)
-  CHECKPOINT(9);
-
   load_ui_prefs_nvs();
-  CHECKPOINT(10);
   if (ui_screentimeout) {
     char buf[16];
     snprintf(buf, sizeof(buf), "%lu", (unsigned long)g_screen_timeout_s);
@@ -2732,24 +2730,12 @@ void setup() {
 // ============================================================
 
 void loop() {
-  static uint32_t s_dbg_last_loop_start_ms = 0;
-  static uint32_t s_dbg_last_periodic_ms = 0;
-  uint32_t dbg_loop_start_ms = millis();
-  if (kRuntimeDebugLogs && s_dbg_last_loop_start_ms != 0) {
-    uint32_t prev_loop_ms = dbg_loop_start_ms - s_dbg_last_loop_start_ms;
-    if (prev_loop_ms > 750) {
-      Serial.printf("[dbg:slow-loop] dt=%lu last_stage=%lu(%s) last_stage_ms=%lu\n",
-                    (unsigned long)prev_loop_ms,
-                    (unsigned long)s_dbg_last_stage,
-                    dbg_stage_name(s_dbg_last_stage),
-                    (unsigned long)s_dbg_last_stage_ms);
-      dbg_print_memory("slow-loop");
-      Serial.flush();
-    }
-  }
-  s_dbg_last_loop_start_ms = dbg_loop_start_ms;
-  dbg_mark(100);
   esp_task_wdt_reset();
+
+  // Poll the onboard STC8 battery gauge OFF the LVGL lock (self-throttled to
+  // 5 s). The status-bar % is applied later under the lock via the deferred
+  // g_deferred_battery_dirty path.
+  battery_poll();
 
   if (g_confirm_action != ConfirmAction::NONE) {
     if ((int32_t)(millis() - g_confirm_deadline_ms) > 0) {
@@ -2851,6 +2837,7 @@ void loop() {
       g_deferred_refresh_targets ||
       g_deferred_serialmon_dirty ||
       g_deferred_timelabel_dirty ||
+      g_deferred_battery_dirty ||
       g_deferred_route_label_dirty ||
       g_deferred_wifi_status_dirty ||
       g_deferred_features_dirty ||
@@ -2978,6 +2965,11 @@ void loop() {
   if (g_deferred_timelabel_dirty) {
     g_deferred_timelabel_dirty = false;
     update_timelabel();
+  }
+  // 3c. Deferred battery indicator (cached by battery_poll())
+  if (g_deferred_battery_dirty) {
+    g_deferred_battery_dirty = false;
+    update_batterylabel();
   }
   if (g_deferred_route_label_dirty) {
     g_deferred_route_label_dirty = false;
@@ -3131,7 +3123,6 @@ void loop() {
   // widget ops above with rendering — the deferred-work section in this loop
   // mutates widgets without taking lvgl_lock(), so running lv_timer_handler()
   // on a separate core 0 task race-corrupts the dirty-area list.
-    dbg_mark(110);
     lvgl_unlock();
   }
 
@@ -3159,7 +3150,6 @@ void loop() {
   // deferred drain already created their bubbles.
   // While UI has pending work (scroll/rebuild/input), reduce network
   // translation pressure to keep gesture/render latency low.
-  dbg_mark(120);
   {
     static uint32_t s_translate_tick_ms = 0;
     const uint32_t now_ms = millis();
@@ -3171,7 +3161,6 @@ void loop() {
     }
   }
 
-  dbg_mark(130);
   if (g_mesh) {
 #if defined(ESP32)
     if (mesh_try_lock(0)) {
@@ -3183,13 +3172,11 @@ void loop() {
 #endif
   }
 
-  dbg_mark(140);
   if (g_uimesh) g_uimesh->checkPmRetryTimeout();
   if (g_uimesh) g_uimesh->checkPmHardTimeout();
   if (g_uimesh) g_uimesh->checkPmUnconfirmedExpiry();
 
   // Deferred radio actions
-  dbg_mark(150);
   if (g_deferred_flood_advert) {
     g_deferred_flood_advert = false;
     if (g_uimesh) {
@@ -3221,7 +3208,6 @@ void loop() {
   }
   if (g_deferred_preset_idx >= 0) { int idx = g_deferred_preset_idx; g_deferred_preset_idx = -1; if (g_uimesh) g_uimesh->applyPresetByIdx(idx, false); }
 
-  dbg_mark(160);
   rtc_clock.tick();
   wifi_loop();
   // WiFi-dependent loops don't need to poll at the main-loop rate.
@@ -3234,13 +3220,11 @@ void loop() {
         ui_interacting ? 1500 : (have_deferred_lvgl_work ? 800 : 250);
     if ((now_ms - s_wifi_loops_ms) >= wifi_interval_ms) {
       s_wifi_loops_ms = now_ms;
-      dbg_mark(170);
       ota_loop();
       webdash_loop();
       tgbridge_loop();
     }
   }
-  dbg_mark(180);
   poll_channel_receipt_if_due();
 
   if (g_del.kind != TargetKind::NONE &&
@@ -3301,7 +3285,6 @@ void loop() {
   // formatted lines and arms g_chat_flush_deadline_ms ~200 ms out;
   // drain once the deadline elapses so busy channels don't turn into
   // one flash open/append/close per incoming message.
-  dbg_mark(190);
   if (g_chat_flush_deadline_ms != 0 &&
       (int32_t)(millis() - g_chat_flush_deadline_ms) >= 0) {
     chat_append_flush_if_due();
@@ -3373,11 +3356,6 @@ void loop() {
   }
 
   // ---- Frame rate limiter ----
-  dbg_mark(200);
-  if (kRuntimeDebugLogs && (millis() - s_dbg_last_periodic_ms) >= 60000) {
-    s_dbg_last_periodic_ms = millis();
-    dbg_print_memory("periodic");
-  }
   delay(1);
 }
 
@@ -3444,7 +3422,7 @@ bool mesh_resend_pm_by_bubble_label(struct _lv_obj_t* status_label) {
   return g_uimesh ? g_uimesh->resendByStatusLabel((lv_obj_t*)status_label) : false;
 }
 const char* mesh_get_node_name() {
-  return g_uimesh ? g_uimesh->getNodeName() : "CrowPanel";
+  return g_uimesh ? g_uimesh->getNodeName() : "DHE04005D";
 }
 void mesh_get_fixed_position(double* lat, double* lon) {
   if (lat) *lat = g_fixed_position_valid ? g_fixed_position_lat : 0.0;
