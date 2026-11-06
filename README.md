@@ -85,47 +85,7 @@ See the [board guide](meshcore/variants/crowpanel_dhe04005d/README.md) for pin
 assignments and the [installation guide](docs/installation.md#optional-rtc) for
 the optional external RTC. Match the radio module and antenna to your band.
 
-## Build And Check
 
-Install Python 3.11, Git, PlatformIO and a C++17 compiler. The pinned P4 SDK
-and firmware dependencies are downloaded by PlatformIO on the first build.
-
-From the repository root:
-
-```sh
-python tools/check_repository.py
-platformio run -d selector -e dhe04005d-5inch-P4-selector
-platformio run -d meshcore -e dhe04005d-5inch-P4-meshcore
-platformio run -d meshtastic -e dhe04005d-5inch-P4-meshtastic
-```
-
-The checks do not access a device. Without a host compiler, the check runner can
-use an installed PlatformIO RISC-V compiler. `--python-only` deliberately skips
-the C++ policy checks; it is not a substitute for a complete build.
-
-For a routine firmware update, use the affected project's normal PlatformIO
-Upload action after verifying the installed partition layout. **Do not erase
-flash or upload a filesystem image as part of routine updates.** Full-device
-installation and flash-plan validation are documented separately in
-[Installation](docs/installation.md).
-
-## Repository Layout
-
-```text
-meshcore/       MeshCore source, board drivers, UI, tests and asset tools
-meshtastic/     Meshtastic source and CrowPanel customization
-selector/       Dual-boot selector and shared partition CSV
-docs/           User guides, screenshots and release emoji atlases
-tools/          Repository checks and portable development examples
-test/           Tests for repository and installation tooling
-.github/        CI checks, issue forms and pull-request template
-flash_all.py    Full-device installation helper; not a routine update tool
-partitions.bin  Distributed dual-boot partition table
-```
-
-Upstream examples, alternate board variants and vendored libraries retain their
-structure and license notices. Local build output, device logs and private
-configuration are excluded from Git; they are not release assets.
 
 ## Contributing And Support
 
