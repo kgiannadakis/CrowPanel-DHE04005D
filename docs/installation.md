@@ -34,7 +34,22 @@ It does not erase the entire chip or intentionally write the data partitions,
 but a wrong or changed layout can still make existing data inaccessible.
 Back up first and do not assume this operation preserves an unknown layout.
 
-Build all three projects, or let the helper build them before flashing:
+For the normal complete installation, clone the repository and use the single
+build-and-flash command:
+
+```sh
+git clone https://github.com/kgiannadakis/CrowPanel-DHE04005D.git
+cd CrowPanel-DHE04005D
+python flash_all.py YOUR_PORT
+```
+
+Replace `YOUR_PORT` with the device port, such as `COM20` on Windows,
+`/dev/ttyUSB0` on Linux, or `/dev/cu.usbserial` on macOS. The command builds all
+three projects, validates their images and partition layout, and flashes the
+complete set.
+
+The following commands are optional advanced alternatives for building or
+checking the images separately:
 
 ```sh
 platformio run -d selector -e dhe04005d-5inch-P4-selector

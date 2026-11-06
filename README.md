@@ -13,6 +13,29 @@ firmwares without reflashing.
 [Screenshots](docs/screenshots.md) | [Contributing](CONTRIBUTING.md) |
 [Release Checklist](docs/publishing.md)
 
+## Install And Flash
+
+Clone the repository and run `flash_all.py` to build the selector, MeshCore and
+Meshtastic, then install the complete dual-boot firmware set:
+
+```sh
+git clone https://github.com/kgiannadakis/CrowPanel-DHE04005D.git
+cd CrowPanel-DHE04005D
+python flash_all.py <PORT>
+```
+
+Replace `<PORT>` with the CrowPanel serial port, for example `COM20` on Windows,
+`/dev/ttyUSB0` on Linux, or `/dev/cu.usbserial` on macOS. The script validates
+the partition layout and firmware images before flashing. Building and flashing
+can take several minutes.
+
+Requirements: Python 3.11, Git, PlatformIO, and esptool. A standard PlatformIO
+installation normally includes the required PlatformIO CLI and esptool. Back up
+important device data and close any serial monitor before starting.
+
+For advanced options, pre-built binaries, updates, and troubleshooting, see the
+full [installation guide](docs/installation.md).
+
 ## Firmware
 
 | Project | Purpose | PlatformIO environment |
