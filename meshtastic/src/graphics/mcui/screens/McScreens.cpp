@@ -900,7 +900,7 @@ static constexpr int kMapTilePx = 256;
 static constexpr int kMapMarkerDotPx = 8;
 static constexpr int kMapLocalDotPx = 10;
 static constexpr int kMapMinZoom = 7;
-static constexpr int kMapMaxZoom = 12;
+static constexpr int kMapMaxZoom = 18;
 static constexpr int kMapDesiredTilePad = 1;
 // Must fit in LV_CACHE_DEF_SIZE at 256 KB per decoded tile (9.5 MB cache holds
 // 30 with margin). The 2026-07 map-freeze was NOT a tile-count/cache issue —

@@ -66,6 +66,8 @@ platform.
   backups, duplicate assets, and unused development artifacts.
 - Corrected and validated firmware offsets against the active partition tables.
 - Consolidated duplicate emoji atlases under `docs/`.
+- Extended both firmware map views to Z18. Detailed imagery requires matching
+  zoom-level tiles on the SD card; tile cache sizes are unchanged.
 
 ### Fixed
 

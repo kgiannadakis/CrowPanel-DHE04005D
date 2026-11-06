@@ -36,8 +36,7 @@ namespace {
 
 constexpr int kTilePx = 256;
 constexpr int kMinZoom = 7;
-// Allow z7..z12 as requested.
-constexpr int kMaxZoom = 12;
+constexpr int kMaxZoom = 18;
 constexpr double kInitLat = 51.21075;
 constexpr double kInitLon = 4.43384;
 constexpr int kInitZoom = 11;

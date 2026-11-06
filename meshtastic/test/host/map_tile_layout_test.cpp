@@ -36,6 +36,15 @@ int main()
     assert(layout(keys, 12, 101, 202, 4, 5) == 20);
     assert(layout(keys, 12, 101, 202, 5, 6) == 30);
 
+    MapTileKey detailed[30];
+    const int lastTile = (1 << 18) - 1;
+    assert(layout(detailed, 18, lastTile - 4, lastTile - 5, 5, 6) == 0);
+    assert(layout(detailed, 18, lastTile - 4, lastTile - 5, 5, 6) == 30);
+    assert(layout(detailed, 18, lastTile - 3, lastTile - 5, 5, 6) == 24);
+    assert(layout(detailed, 18, lastTile - 3, lastTile - 4, 5, 6) == 25);
+    assert(layout(detailed, 17, lastTile / 2, lastTile / 2, 5, 6) == 0);
+    assert(layout(detailed, 18, lastTile - 4, lastTile - 5, 5, 6) == 0);
+
     // Includes missing/out-of-world keys: failed lookups must also be reusable.
     MapTileKey edge[30];
     assert(layout(edge, 7, -1, -1, 5, 6) == 0);

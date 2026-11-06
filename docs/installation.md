@@ -101,6 +101,9 @@ Create `/emoji/` on the microSD card and copy
 [emoji_atlas_32.bin](emoji_atlas_32.bin) into it. Both firmwares use the same
 offline map tile layout, `/tiles/{z}/{x}/{y}.png`, on the card.
 
+Both map views support zoom levels Z7-Z18. Detailed Z18 imagery requires tiles
+under `/tiles/18/{x}/{y}.png`; increasing the zoom limit does not generate them.
+
 See the [emoji guide](../meshcore/tools/README-emoji.md) and
 [map guide](../meshcore/tools/README-maps.md). Country-scale downloads need an
 appropriate tile provider; do not bulk-download the public OpenStreetMap server.

@@ -53,7 +53,7 @@ placeholders are intentionally kept rather than risking user data; the normal
 Delete action can remove those individually. No chat history, passwords,
 channels or identity are purged.
 
-The view fits the located neighbours and the live repeater position at zoom 7-12.
+The view fits the located neighbours and the live repeater position at zoom 7-18.
 Lines follow pan and zoom, use cached projections, and are clipped before LVGL
 coordinate conversion. The close icon clears this overlay without deleting
 contacts and cancels outstanding position queries. A missing repeater position
