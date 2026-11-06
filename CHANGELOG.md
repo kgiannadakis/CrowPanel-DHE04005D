@@ -5,43 +5,93 @@ documented in this file. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 follows simple `MAJOR.MINOR` versioning that matches the GitHub releases.
 
-## [Unreleased]
+## [3.0] - 2026-11-06
+
+Major firmware and stability revision for the CrowPanel DHE04005D dual-boot
+platform.
+
+### Added
+
+#### MeshCore
+
+- Updated the bundled MeshCore firmware to version 1.17.1.
+- Added battery level and charging-state indicators across the main interface.
+- Added screen power-saving, touch-wake recovery, and awake-idle CPU scaling.
+- Added repeater-neighbour visualization on the map, including the logged-in
+  repeater's location and links to located neighbours.
+- Added secure per-repeater password storage with Remember Password and Show
+  Password controls.
+- Added persistent crash diagnostics and reboot history.
+- Added receive-health and route-width diagnostics through serial and the web API.
+- Added additional radio, display, Ethernet, vibration, rotary-input, routing,
+  configuration, and UTF-8 support inherited from the updated MeshCore codebase.
+- Added extensive policy and regression tests for power management, touch wake,
+  backlight control, battery handling, neighbour maps, repeater credentials,
+  routing, reception, persistence, and display recovery.
+
+#### Meshtastic
+
+- Added node search by long name, short name, or node ID.
+- Added improved offline map rendering with positioned-node markers, clustering,
+  optional node names, and saved map settings.
+- Added safer reusable text-editing and keyboard handling.
+- Added additional CrowPanel storage handling and storage-policy validation.
+- Added host-side policy tests for maps, nodes, radio reception, MQTT, storage,
+  positions, traceroute, and database retention.
+
+#### Repository and tooling
+
+- Added GitHub validation workflows and repository publishing checks.
+- Added consolidated installation, screenshot, development, and publishing
+  documentation.
+- Added a portable, importable full-device installation helper with a read-only
+  `--dry-run` mode.
+- Added validation for partition-table agreement, firmware-image size, image
+  type, overlap, and ambiguous build outputs.
 
 ### Changed
 
-- Added a CrowPanel-specific Meshtastic entry guide and portable policy-test
-  runner, and included Meshtastic documentation and policy coverage in the root
-  publishing checks. Firmware runtime behavior is unchanged by this preparation.
-- Removed stale machine-specific build notes and moved development guidance into
-  the component's developer guide.
-- Reorganized user/developer documentation, installation instructions and the
-  screenshot gallery, with one publishing checklist and component license notes.
-- Made the full-install helper importable and portable, added a read-only
-  `--dry-run`, and rejected mismatched partition tables and ambiguous image inputs.
-- Added repository/tooling tests and read-only GitHub CI checks with pinned actions.
-- Removed unreferenced loose boot/partition binaries, a duplicate component
-  manifest backup and an upstream-only CNAME.
-
-- Neighbour map requests no longer import or prioritise repeaters in the saved
-  list. Untouched generated placeholders are cleaned up on boot; map links are
-  solid black and originate at the logged-in repeater.
-- Documented the active CrowPanel MeshCore build, source ownership, feature
-  limitations, and pre-publish verification workflow.
-- Added a single command for Python source checks and C++ policy assertions.
-- Removed retired HTTPS/certificate artifacts, prototype backups, disabled
-  duplicate implementations, and unused monochrome font copies from the P4 app.
-- Kept local device data and temporary analysis output out of Git.
-- Consolidated identical emoji atlases under `docs/`, removing duplicate
-  generated copies from the tools directory.
-- Corrected the README's MeshCore flash offset to match the partition tables.
+- Updated the CrowPanel MeshCore base from 1.16 to the official 1.17.1 release.
+- Retained the CrowPanel Meshtastic base at 2.7.26.54 with extensive
+  CrowPanel-specific improvements.
+- Reworked MeshCore display and power handling while retaining the established
+  LCD timing and radio configuration.
+- Improved MeshCore maps, repeater management, chat persistence, translations,
+  battery display, settings, and web diagnostics.
+- Improved Meshtastic maps, nodes, keyboard behavior, MQTT handling, storage,
+  radio diagnostics, traceroute, and position validation.
+- Updated the selector screenshot and added the printable CrowPanel on/off-switch
+  model.
+- Reorganized project documentation and removed obsolete generated files,
+  backups, duplicate assets, and unused development artifacts.
+- Corrected and validated firmware offsets against the active partition tables.
+- Consolidated duplicate emoji atlases under `docs/`.
 
 ### Fixed
 
-- Removed RGB bounce refills that could access cached PSRAM from an IRAM-safe
-  interrupt during flash writes. LCD timing and radio settings are unchanged;
-  direct-DMA visual/wake behavior still needs hardware stress verification.
-- Standardized chat-flush render/queue lock ordering and serialized contact
-  replacement with UI history work, with additional retained crash breadcrumbs.
+- Fixed an ESP32-P4 display path that could access cached PSRAM from an
+  interrupt-safe context during flash writes.
+- Fixed display wake and backlight sequencing, including stalled-wake recovery.
+- Fixed chat-render and persistence lock ordering that could contribute to
+  crashes under concurrent UI activity.
+- Fixed repeater-neighbour map placeholders, origin selection, and link rendering.
+- Fixed battery-value filtering and propagation across lazily created screens.
+- Improved MeshCore receive servicing and diagnostics during prolonged UI,
+  storage, and networking activity.
+- Improved Meshtastic node-list refresh behavior, map coordinate validation,
+  traceroute state handling, MQTT buffer safety, and database retention.
+- Improved protection against mismatched partition tables and incorrect firmware
+  images during a full-device installation.
+
+### Upgrade notes
+
+- Back up important device data before upgrading.
+- Download and flash all five release assets: `bootloader.bin`,
+  `partitions.bin`, `selector.bin`, `meshcore.bin`, and `meshtastic.bin`.
+- Version 3.0 should be installed as a complete firmware set. Do not flash only
+  one application partition.
+- The external DS3231 RTC remains optional but is recommended for retaining the
+  time while the device is powered off.
 
 ## [2.0] - 2026-07-11
 
