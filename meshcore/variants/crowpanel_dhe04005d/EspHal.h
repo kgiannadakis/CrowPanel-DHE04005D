@@ -7,6 +7,8 @@
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/semphr.h>
+#include "../../examples/crowpanel_p4_lvgl_chat/crash_diagnostics.h"
 
 class EspHal : public RadioLibHal
 {
@@ -15,7 +17,9 @@ private:
   {
     int8_t sck, miso, mosi;
   } _spiPins = {-1, -1, -1};
-  spi_device_handle_t _spiHandle;
+  spi_device_handle_t _spiHandle = nullptr;
+  StaticSemaphore_t _spiMutexStorage;
+  SemaphoreHandle_t _spiMutex = nullptr;
   bool _spiInitialized = false;
   uint32_t _spiFrequency = 8000000; // 8MHz
 
@@ -129,6 +133,12 @@ public:
     if (_spiInitialized)
       return;
 
+    // Created during single-task radio initialization; never allocated in RX.
+    if (!_spiMutex) {
+      _spiMutex = xSemaphoreCreateMutexStatic(&_spiMutexStorage);
+      ESP_ERROR_CHECK(_spiMutex ? ESP_OK : ESP_ERR_NO_MEM);
+    }
+
     spi_bus_config_t buscfg = {
         .mosi_io_num = _spiPins.mosi,
         .miso_io_num = _spiPins.miso,
@@ -163,6 +173,11 @@ public:
 
   void spiBeginTransaction() override
   {
+    ESP_ERROR_CHECK(_spiInitialized && _spiMutex ? ESP_OK : ESP_ERR_INVALID_STATE);
+    crash_diagnostics_spi(1, 0, 0);
+    const BaseType_t locked = xSemaphoreTake(_spiMutex, portMAX_DELAY);
+    ESP_ERROR_CHECK(locked == pdTRUE ? ESP_OK : ESP_ERR_INVALID_STATE);
+    crash_diagnostics_spi(2, 0, 0);
   }
 
   void spiTransfer(uint8_t *out, size_t len, uint8_t *in) override
@@ -185,12 +200,19 @@ public:
           .user = nullptr,
           .tx_buffer = out ? (out + off) : nullptr,
           .rx_buffer = in  ? (in  + off) : nullptr};
+      crash_diagnostics_spi(3, out && len ? out[0] : 0, n);
       ESP_ERROR_CHECK(spi_device_transmit(_spiHandle, &t));
+      crash_diagnostics_spi(4, out && len ? out[0] : 0, n);
     }
   }
 
   void spiEndTransaction() override
   {
+    // RadioLib raises CS before this hook. Protect the whole command and all
+    // FIFO chunks, not only each spi_device_transmit() completion queue.
+    const BaseType_t released = xSemaphoreGive(_spiMutex);
+    ESP_ERROR_CHECK(released == pdTRUE ? ESP_OK : ESP_ERR_INVALID_STATE);
+    crash_diagnostics_spi(5, 0, 0);
   }
 
   void spiEnd() override

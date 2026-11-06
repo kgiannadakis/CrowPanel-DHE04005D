@@ -12,6 +12,9 @@
 #include "ui_homescreen.h"
 #include "ui_theme.h"
 #include "stc8.h"
+#include "battery_policy.h"
+#include "ui_battery.h"
+#include "display.h"
 
 // ---- I2C helpers ----
 // P4 port: v11 used a dumb I2C backlight chip at 0x30 addressed directly via
@@ -22,24 +25,20 @@
 // this also kills the periodic "could not acquire lock" / "NULL TX buffer"
 // spam from the ramp ticker.
 bool i2c_ok(uint8_t) { return true; }  // Wire is disabled; probe is a no-op
-void i2c_cmd(uint8_t level) {
-  // v11 levels are 0..BL_MAX(=0x10); STC8 expects duty in percent (0..100).
-  // BL_OFF (=0x05) is v11's "sleep command" for its I2C chip, NOT a dim
-  // level — treat anything ≤ BL_OFF as hardware-off so screen_sleep()
-  // actually turns the backlight off on our variant.
-  uint8_t duty;
-  if (level <= BL_OFF) {
-    duty = 0;
-  } else {
-    if (level > BL_MAX) level = BL_MAX;
-    duty = (uint32_t)level * 100u / BL_MAX;
-  }
-  stc8_set_pwm_duty(STC8_PWM_LCD_BL_EN, duty);
+bool i2c_cmd(uint8_t level) {
+  const uint8_t duty = level > BL_MAX ? BL_MAX : level;
+  return stc8_set_pwm_duty(STC8_PWM_LCD_BL_EN, duty) == ESP_OK;
 }
 
 // ---- Screen sleep/wake ----
 void screen_sleep() {
   if (!g_screen_awake) return;
+  if (ScreenPower::kDisplayTaskBacklight) {
+    g_screen_awake = false;
+    g_ramp_current = 0;
+    display_request_backlight(0);
+    return;
+  }
   i2c_cmd(BL_OFF);
   g_screen_awake = false;
   g_ramp_current = 0;
@@ -51,10 +50,22 @@ void screen_wake_soft(uint8_t target) {
   if (lvl < BL_MIN_VISIBLE) lvl = BL_MIN_VISIBLE;
   if (lvl > BL_MAX) lvl = BL_MAX;
   g_ramp_target  = lvl;
-  g_ramp_current = BL_MIN_VISIBLE;
-  i2c_cmd(g_ramp_current);
-  g_ramp_next_ms = millis() + RAMP_STEP_MS;
+  if (ScreenPower::kDisplayTaskBacklight) {
+    g_ramp_current = 0;
+  } else if (ScreenPower::kBacklightOnlySleep) {
+    // RGB never stopped: restore PWM here, not via a render gate/main-loop ramp.
+    const bool restored = i2c_cmd(lvl);
+    g_ramp_current = restored ? 0 : lvl;
+    g_ramp_next_ms = millis() + 1000;
+    Serial.printf("[power] backlight wake: duty=%u write=%s\n",
+                  (unsigned)lvl, restored ? "ok" : "failed; retry scheduled");
+  } else {
+    g_ramp_current = BL_MIN_VISIBLE;
+    g_ramp_next_ms = millis() + RAMP_STEP_MS;
+  }
   g_screen_awake = true;
+  if (ScreenPower::kDisplayTaskBacklight) display_request_backlight(lvl);
+  display_notify_service();
 }
 
 void screen_wake() {
@@ -108,72 +119,41 @@ void update_timelabel() {
 static bool     s_batt_have      = false;
 static int      s_batt_pct_cache = 0;
 static uint32_t s_batt_col_cache = TH_TEXT2;
-
-// Icon fill geometry: body is 24px wide with a 1px border + 1px inset each side.
-static constexpr int kBattFillMaxW = 24 - 4;
-
-// Battery % from the measured voltage via a piecewise-linear Li-ion resting-
-// voltage -> state-of-charge curve (4.10 V = 100%, 3.10 V = 0%). Follows the
-// real cell shape: a quick drop off full, a long flat plateau through the
-// middle, then a steep knee near empty. Tune the points to your pack if needed.
-static int batt_pct_from_mv(int mv) {
-  static const struct { int mv; int pct; } kCurve[] = {
-    {4100, 100}, {4000, 92}, {3900, 85}, {3850, 78}, {3800, 68},
-    {3750, 55},  {3700, 42}, {3650, 32}, {3600, 25}, {3500, 17},
-    {3400, 11},  {3300, 6},  {3200, 3},  {3100, 0},
-  };
-  const int n = (int)(sizeof(kCurve) / sizeof(kCurve[0]));
-  if (mv >= kCurve[0].mv) return 100;
-  if (mv <= kCurve[n - 1].mv) return 0;
-  for (int i = 1; i < n; i++) {
-    if (mv >= kCurve[i].mv) {
-      const int vlo = kCurve[i].mv,     plo = kCurve[i].pct;
-      const int vhi = kCurve[i - 1].mv, phi = kCurve[i - 1].pct;
-      return plo + (mv - vlo) * (phi - plo) / (vhi - vlo);
-    }
-  }
-  return 0;
-}
+static Battery::Estimate s_batt_estimate;
 
 void battery_poll() {
-  // Blocking STC8 I2C read, at most every 5 s. MUST be called WITHOUT the LVGL
+  // Blocking STC8 I2C read: retry startup at 1 s, then poll at 5 s, WITHOUT the LVGL
   // lock. Caches the reading and flags update_batterylabel() to apply it.
   static uint32_t s_last_ms = 0;
+  static bool s_polled = false;
   uint32_t nowm = millis();
-  if (s_last_ms != 0 && (uint32_t)(nowm - s_last_ms) < 5000) return;
+  s_batt_estimate.observeScreen(g_screen_awake, nowm);
+  if (s_polled && (uint32_t)(nowm - s_last_ms) < Battery::pollPeriodMs(s_batt_have)) return;
   s_last_ms = nowm;
+  s_polled = true;
 
   uint8_t  state = 0;
   uint16_t mv    = 0;
-  // Guard on a plausible battery range so a missing/uninitialised reading
-  // (0 mV) leaves the indicator blank rather than showing 0%.
-  if (stc8_read_battery(nullptr, &state, &mv) == ESP_OK && mv >= 2500 && mv <= 5000) {
-    int pct = batt_pct_from_mv((int)mv);
+  // Validate voltage independently of charger state: battery-only state is 3.
+  // Missing/invalid voltage leaves the visible indicator at --%, never a fake 0%.
+  if (stc8_read_battery(nullptr, &state, &mv) == ESP_OK &&
+      s_batt_estimate.sample(mv, Stc8Battery::isCharging(state), nowm)) {
+    int pct = s_batt_estimate.percent();
     uint32_t col = TH_TEXT2;
-    if (state == STC8_BAT_CHARGING || state == STC8_BAT_FULLY_CHARGED)
+    if (Stc8Battery::isCharging(state))
       col = 0x4CAF50;  // green while charging / full
     else if (pct <= 15)
       col = 0xE06060;  // red when low
+    const bool changed = !s_batt_have || pct != s_batt_pct_cache || col != s_batt_col_cache;
     s_batt_pct_cache = pct;
     s_batt_col_cache = col;
     s_batt_have  = true;
-    g_deferred_battery_dirty = true;
+    if (changed) g_deferred_battery_dirty = true;
   }
 }
 
 void update_batterylabel() {
-  if (!ui_batterylabel || !s_batt_have) return;
-  char bb[8];
-  snprintf(bb, sizeof(bb), "%d%%", s_batt_pct_cache);
-  lv_label_set_text(ui_batterylabel, bb);
-  lv_obj_set_style_text_color(ui_batterylabel, lv_color_hex(s_batt_col_cache), 0);
-  if (ui_batteryfill && ui_batterybody) {
-    int fill_w = s_batt_pct_cache * kBattFillMaxW / 100;
-    if (fill_w < 1 && s_batt_pct_cache > 0) fill_w = 1;  // keep a sliver visible
-    lv_obj_set_width(ui_batteryfill, fill_w);
-    lv_obj_set_style_bg_color(ui_batteryfill, lv_color_hex(s_batt_col_cache), 0);
-    lv_obj_clear_flag(ui_batterybody, LV_OBJ_FLAG_HIDDEN);
-  }
+  if (s_batt_have) ui_battery_update(s_batt_pct_cache, s_batt_col_cache);
 }
 
 String time_string_now() {
@@ -660,37 +640,6 @@ void serialmon_append_color(uint32_t /*rgb*/, const char* line) {
   // line — we lose per-line colour but keep correct text.
   serialmon_append_raw(line, strlen(line));
 }
-// Dead path below (kept commented out so the full recolor logic is
-// discoverable if we ever re-enable recolor on the monitor label):
-#if 0
-static void serialmon_append_color_legacy(uint32_t rgb, const char* line) {
-  if (!line) return;
-  char hex[8];
-  snprintf(hex, sizeof(hex), "%06lX", (unsigned long)(rgb & 0xFFFFFF));
-
-  char tagged[512];
-  size_t j = 0;
-  tagged[j++] = '#';
-  for (int k = 0; k < 6; k++) tagged[j++] = hex[k];
-  tagged[j++] = ' ';
-
-  for (size_t i = 0; line[i] && j < sizeof(tagged) - 16; i++) {
-    if (line[i] == '#') {
-      tagged[j++] = '#';
-      tagged[j++] = '#';
-      tagged[j++] = '#';
-      tagged[j++] = '#';
-      for (int k = 0; k < 6; k++) tagged[j++] = hex[k];
-      tagged[j++] = ' ';
-    } else {
-      tagged[j++] = line[i];
-    }
-  }
-  tagged[j++] = '#';
-  tagged[j] = '\0';
-  serialmon_append_raw(tagged, j);
-}
-#endif  // end of legacy recolor-escape implementation
 
 // ---- Speaker / Buzzer (I2S) ----
 // DHE04005D has an I2S audio header at LRCK=IO21, BCLK=IO22, SDOUT=IO23.
@@ -711,12 +660,28 @@ static void serialmon_append_color_legacy(uint32_t rgb, const char* line) {
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include "board_config.h"
 
 static i2s_chan_handle_t s_spk_tx    = nullptr;
 static bool              s_spk_ok    = false;
 static QueueHandle_t     s_beep_q    = nullptr;
 static TaskHandle_t      s_beep_task = nullptr;
+static SemaphoreHandle_t s_audio_idle_mutex = nullptr;
+
+bool speaker_try_idle_lock() {
+  if (!s_audio_idle_mutex) return !s_spk_ok;
+  if (xSemaphoreTake(s_audio_idle_mutex, 0) != pdTRUE) return false;
+  if (s_beep_q && uxQueueMessagesWaiting(s_beep_q)) {
+    xSemaphoreGive(s_audio_idle_mutex);
+    return false;
+  }
+  return true;
+}
+
+void speaker_idle_unlock() {
+  if (s_audio_idle_mutex) xSemaphoreGive(s_audio_idle_mutex);
+}
 static constexpr uint32_t SPK_SAMPLE_RATE_HZ = 32000;
 static constexpr size_t   SPK_CHUNK_FRAMES   = 256;
 
@@ -1186,6 +1151,7 @@ static void beep_task(void*) {
   for (;;) {
     if (xQueueReceive(s_beep_q, &cmd, portMAX_DELAY) != pdTRUE) continue;
     if (!g_speaker_enabled) continue;
+    xSemaphoreTake(s_audio_idle_mutex, portMAX_DELAY);
     const uint8_t op  = cmd_op(cmd);
     const uint8_t arg = cmd_arg(cmd);
     switch (op) {
@@ -1211,6 +1177,7 @@ static void beep_task(void*) {
         notification_sound_play_internal(arg);
         break;
     }
+    xSemaphoreGive(s_audio_idle_mutex);
   }
 }
 
@@ -1257,6 +1224,8 @@ void speaker_init() {
   // (18+) and LVGL (2) so the beep's blocking I2S writes never stall
   // those. 4-KB stack covers sinf() + i2s_channel_write's internal
   // buffers; the sine-generation scratch is in .bss not on this stack.
+  s_audio_idle_mutex = xSemaphoreCreateMutex();
+  if (!s_audio_idle_mutex) return;
   s_beep_q = xQueueCreate(4, sizeof(uint8_t));
   if (!s_beep_q) return;
   xTaskCreate(beep_task, "beep", 4096, nullptr, 1, &s_beep_task);

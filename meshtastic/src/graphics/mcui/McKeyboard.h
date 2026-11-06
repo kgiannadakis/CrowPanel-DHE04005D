@@ -8,6 +8,7 @@ void keyboard_attach(lv_obj_t *textarea);
 void keyboard_show();
 void keyboard_hide();
 bool keyboard_is_visible();
+bool keyboard_is_attached_to(lv_obj_t *textarea);
 lv_obj_t *keyboard_get();
 
 }

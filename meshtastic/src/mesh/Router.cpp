@@ -5,6 +5,7 @@
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "PositionPrecision.h"
+#include "PositionCoordinates.h"
 #include "RTC.h"
 
 #include "configuration.h"
@@ -393,9 +394,6 @@ ErrorCode Router::send(meshtastic_MeshPacket *p)
 #if !MESHTASTIC_EXCLUDE_MQTT
         // Only publish to MQTT if we're the original transmitter of the packet
         if (moduleConfig.mqtt.enabled && isFromUs(p) && mqtt) {
-#if defined(ARCH_ESP32P4) && defined(CROWPANEL_DHE04005D) && !defined(ARCH_PORTDUINO)
-            mqtt->pausePublicDownlink(15000, "local LoRa TX");
-#endif
             mqtt->onSend(*p, *p_decoded, chIndex);
         }
 #endif
@@ -779,6 +777,25 @@ void Router::handleReceived(meshtastic_MeshPacket *p, RxSource src)
     bool skipHandle = false;
     // Also, we should set the time from the ISR and it should have msec level resolution
     p->rx_time = getValidTime(RTCQualityFromNet); // store the arrival timestamp for the phone
+
+#if defined(CROWPANEL_DHE04005D)
+    if (p->via_mqtt && p->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
+        p->decoded.portnum == meshtastic_PortNum_POSITION_APP) {
+        // Store broker coordinates on the router thread, without triggering RF
+        // replies, NodeInfo requests, clock changes or an unused phone queue copy.
+        if (!moduleConfig.mqtt.mqtt_contact_discovery_enabled || config.lora.ignore_mqtt || !nodeDB)
+            return;
+        meshtastic_Position position = meshtastic_Position_init_zero;
+        if (!pb_decode_from_bytes(p->decoded.payload.bytes, p->decoded.payload.size, &meshtastic_Position_msg, &position) ||
+            !PositionCoordinates::isComplete(position.has_latitude_i, position.has_longitude_i,
+                                             position.latitude_i, position.longitude_i))
+            return;
+        nodeDB->updateFrom(*p);
+        if (nodeDB->getMeshNode(getFrom(p)))
+            nodeDB->updatePosition(getFrom(p), position);
+        return;
+    }
+#endif
 
     // Store a copy of the encrypted packet for MQTT.
     // Local, not a class member: handleReceived re-enters itself when a module

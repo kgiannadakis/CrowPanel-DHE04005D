@@ -11,8 +11,8 @@
 // emoji_font.cpp, so chat bubbles / headers / keyboard buttons now
 // render colour emojis inline.
 //
-// emoji_font_init() must have been called before lv_font_greek_init().
-// If it wasn't, g_emoji_font_small / g_emoji_font_big are NULL and
+// Call once before the initial UI paint, then again after emoji_font_init().
+// Before emoji initialization, g_emoji_font_small / g_emoji_font_big are NULL and
 // we just skip the emoji link in the chain -- Greek falls straight
 // through to Montserrat and no emojis get drawn.
 //

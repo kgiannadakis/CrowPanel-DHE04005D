@@ -3,18 +3,24 @@
 // ============================================================
 
 #include <Arduino.h>
+#include <atomic>
 #include <Wire.h>
 #include <lvgl.h>
 #include <extra/widgets/keyboard/lv_keyboard.h>
 #include <esp_task_wdt.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
+#include <esp_sleep.h>
+#include <esp_timer.h>
+#include <driver/gpio.h>
+#include "crash_diagnostics.h"
 #include <WiFi.h>
 // P4 port: v11's LovyanGFX driver is replaced by our direct esp_lcd_panel_rgb
 // bring-up in display.cpp. Also pull in the STC8 helper (backlight PWM) and
 // the SDIO pin macros (for WiFi via the on-board C6).
 #include "stc8.h"
 #include "board_config.h"
+#include "gt911.h"
 
 extern "C" void lv_font_greek_init(void);   // v11 Greek-overlay font shim init
 
@@ -60,6 +66,8 @@ extern "C" void _ui_screen_change(lv_obj_t** target, lv_scr_load_anim_t fademode
 #include "display.h"
 #include "settings_cb.h"
 #include "repeater_ui.h"
+#include "map_view.h"
+#include "neighbour_contact_policy.h"
 #include "mesh_api.h"
 #include "wifi_ntp.h"
 #include "features_ui.h"
@@ -184,8 +192,10 @@ uint8_t g_text_header_bytes   = 1;
 bool g_manual_discover_active = false;
 uint32_t g_discover_tag = 0;
 bool g_deferred_discover_done = false;
-char g_discover_names[MAX_DISCOVER_RESULTS][32] = {};
-int  g_discover_result_count = 0;
+static DiscoveryResults s_discovery_results;
+#if defined(ESP32)
+static portMUX_TYPE s_discovery_mux = portMUX_INITIALIZER_UNLOCKED;
+#endif
 bool g_purged_this_session   = false;
 bool    g_speaker_enabled = true;
 uint8_t g_speaker_volume  = 60;  // 0..100; persisted in NVS "ui/spk_vol"
@@ -309,6 +319,21 @@ static inline void mesh_unlock() {
 }
 #endif
 StdRNG fast_rng;
+static uint32_t s_rx_max_service_gap_ms = 0;
+static uint32_t s_rx_last_service_ms = 0;
+static uint32_t s_rx_channel_accepted[MAX_GROUP_CHANNELS] = {};
+static uint32_t s_rx_channel_last_epoch[MAX_GROUP_CHANNELS] = {};
+static uint32_t s_rx_channel_duplicates = 0;
+struct RxPathCounters {
+  uint32_t raw[4] = {};
+  uint32_t parsed[3] = {};
+  uint32_t decrypted[3] = {};
+  uint32_t accepted[3] = {};
+  uint32_t short_metadata = 0;
+  uint32_t unsupported_version = 0;
+};
+static RxPathCounters s_rx_paths;
+static void report_rx_paths_if_changed();
 SimpleMeshTables tables;
 
 
@@ -431,23 +456,33 @@ class UIMesh : public BaseChatMesh, public ContactVisitor {
     const char* contacts_path = "/contacts";
     const char* bak_path = "/contacts.bak";
 
+    crash_diagnostics_mark_current(CrashStage::Storage, 210);
     if (!contactsFileLooksComplete(tmp_path)) {
       _fs->remove(tmp_path);
       return false;
     }
 
+    crash_diagnostics_mark_current(CrashStage::Storage, 211);
     _fs->remove(bak_path);
+    crash_diagnostics_mark_current(CrashStage::Storage, 212);
     bool had_contacts = _fs->exists(contacts_path);
+    crash_diagnostics_mark_current(CrashStage::Storage, 213);
     if (had_contacts && !_fs->rename(contacts_path, bak_path)) {
       _fs->remove(tmp_path);
       return false;
     }
 
-    if (_fs->rename(tmp_path, contacts_path)) return true;
+    crash_diagnostics_mark_current(CrashStage::Storage, 214);
+    if (_fs->rename(tmp_path, contacts_path)) {
+      crash_diagnostics_mark_current(CrashStage::Storage, 217);
+      return true;
+    }
 
+    crash_diagnostics_mark_current(CrashStage::Storage, 215);
     if (had_contacts && _fs->exists(bak_path)) {
       _fs->rename(bak_path, contacts_path);
     }
+    crash_diagnostics_mark_current(CrashStage::Storage, 216);
     _fs->remove(tmp_path);
     return false;
   }
@@ -463,8 +498,9 @@ class UIMesh : public BaseChatMesh, public ContactVisitor {
     if (!file) return;
 
     ContactRecord rec;
+    unsigned removed_placeholders = 0;
     while (file.read((uint8_t*)&rec, sizeof(rec)) == sizeof(rec)) {
-      ContactInfo c;
+      ContactInfo c{};
       c.id = mesh::Identity(rec.pub_key);
       memcpy(c.name, rec.name, 32);
       c.name[31] = '\0';
@@ -477,17 +513,79 @@ class UIMesh : public BaseChatMesh, public ContactVisitor {
       c.gps_lat = rec.gps_lat;
       c.gps_lon = rec.gps_lon;
       c.lastmod = 0;
+      bool has_saved_route = c.out_path_len != OUT_PATH_UNKNOWN;
+      for (uint8_t hop : c.out_path) has_saved_route = has_saved_route || hop != 0;
+      if (NeighbourContactCleanup::shouldRemove(c.name, c.id.pub_key,
+            c.type == ADV_TYPE_REPEATER, c.last_advert_timestamp,
+            c.gps_lat, c.gps_lon, c.flags, has_saved_route)) {
+        ++removed_placeholders;
+        continue;
+      }
       addContact(c);
     }
     file.close();
+    if (removed_placeholders) {
+      // Existing transactional save retains the original list as /contacts.bak.
+      saveContacts();
+      Serial.printf("[neighbours] removed %u unused imported placeholders; known contacts kept\n",
+                    removed_placeholders);
+    }
   }
 
   void saveContacts() {
+    auto retry = []() { g_contacts_save_dirty = true; g_contacts_save_ms = millis(); };
+    static std::atomic_flag saving = ATOMIC_FLAG_INIT;
+    if (saving.test_and_set(std::memory_order_acquire)) { retry(); return; }
+    struct SaveGuard {
+      std::atomic_flag& flag;
+      ~SaveGuard() { flag.clear(std::memory_order_release); }
+    } guard{saving};
+    // Snapshot under mesh ownership; never iterate the live table during I/O.
+    // Keep bulk storage in PSRAM and stage flash writes through internal RAM.
+    auto* snapshot = static_cast<ContactRecord*>(heap_caps_malloc(
+        MAX_CONTACTS * sizeof(ContactRecord), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    constexpr size_t batch_records = 4;
+    auto* staging = static_cast<uint8_t*>(heap_caps_malloc(
+        batch_records * sizeof(ContactRecord), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (!snapshot || !staging || !mesh_try_lock(pdMS_TO_TICKS(5))) {
+      heap_caps_free(snapshot);
+      heap_caps_free(staging);
+      retry();
+      return;
+    }
+    size_t count = 0;
+    ContactsIterator iter = startContactsIterator();
+    ContactInfo c;
+    while (count < MAX_CONTACTS && iter.hasNext(this, c)) {
+      ContactRecord& rec = snapshot[count++];
+      memset(&rec, 0, sizeof(rec));
+      sanitize_ascii_inplace(c.name);
+      memcpy(rec.pub_key, c.id.pub_key, 32);
+      memcpy(rec.name, c.name, 32);
+      rec.type = c.type;
+      rec.flags = c.flags;
+      rec.out_path_len = c.out_path_len;
+      rec.last_advert_timestamp = c.last_advert_timestamp;
+      memcpy(rec.out_path, c.out_path, 64);
+      rec.gps_lat = c.gps_lat;
+      rec.gps_lon = c.gps_lon;
+    }
+    mesh_unlock();
+    // Do not replace contacts while the UI is loading/pruning a chat file or
+    // changing CPU/display state. Acquire only AFTER releasing mesh ownership.
+    if (!lvgl_lock(5)) {
+      heap_caps_free(snapshot);
+      heap_caps_free(staging);
+      retry();
+      return;
+    }
+    struct RenderUnlock { ~RenderUnlock() { lvgl_unlock(); } } render_unlock;
     // Transactional save: write the new list to a temp file first, then keep
     // the previous contact database as /contacts.bak while swapping. If power
     // drops during the swap, boot recovery restores the backup instead of
     // starting with an empty contact/repeater list.
     const char* tmp_path = "/contacts.tmp";
+    crash_diagnostics_mark_current(CrashStage::Storage, 200);
 #if defined(NRF52_PLATFORM)
     _fs->remove(tmp_path);
     File file = _fs->open(tmp_path, FILE_O_WRITE);
@@ -496,34 +594,36 @@ class UIMesh : public BaseChatMesh, public ContactVisitor {
 #else
     File file = _fs->open(tmp_path, "w", true);
 #endif
-    if (!file) return;
+    if (!file) {
+      heap_caps_free(snapshot);
+      heap_caps_free(staging);
+      retry();
+      return;
+    }
 
     bool ok = true;
-    ContactsIterator iter;
-    ContactInfo c;
-    while (iter.hasNext(this, c)) {
-      sanitize_ascii_inplace(c.name);
-
-      ContactRecord rec;
-      memcpy(rec.pub_key, c.id.pub_key, 32);
-      memcpy(rec.name, c.name, 32);
-      rec.type                  = c.type;
-      rec.flags                 = c.flags;
-      rec.out_path_len          = c.out_path_len;
-      rec.last_advert_timestamp = c.last_advert_timestamp;
-      memcpy(rec.out_path, c.out_path, 64);
-      rec.gps_lat = c.gps_lat;
-      rec.gps_lon = c.gps_lon;
-      if (file.write((const uint8_t*)&rec, sizeof(rec)) != sizeof(rec)) { ok = false; break; }
+    for (size_t offset = 0; offset < count; offset += batch_records) {
+      const size_t n = (count - offset < batch_records) ? count - offset : batch_records;
+      const size_t bytes = n * sizeof(ContactRecord);
+      memcpy(staging, snapshot + offset, bytes);
+      crash_diagnostics_mark_current(CrashStage::Storage, 201);
+      if (file.write(staging, bytes) != bytes) { ok = false; break; }
+      vTaskDelay(1);
     }
+    crash_diagnostics_mark_current(CrashStage::Storage, 202);
     file.close();
+    heap_caps_free(snapshot);
+    heap_caps_free(staging);
 
     if (!ok) {
       _fs->remove(tmp_path);   // partial write — leave the existing /contacts untouched
+      retry();
       return;
     }
+    crash_diagnostics_mark_current(CrashStage::Storage, 203);
     if (!replaceContactsFile(tmp_path)) {
       Serial.println("CONTACTS: save failed, kept previous /contacts");
+      retry();
     }
   }
 
@@ -579,6 +679,29 @@ class UIMesh : public BaseChatMesh, public ContactVisitor {
 protected:
   float getAirtimeBudgetFactor() const override { return _prefs.airtime_factor; }
   int calcRxDelay(float, uint32_t) const override { return 0; }
+  void logRxRaw(float, float, const uint8_t raw[], int len) override {
+    if (!raw || len < 1 || ((raw[0] >> PH_TYPE_SHIFT) & PH_TYPE_MASK) != PAYLOAD_TYPE_GRP_TXT) return;
+    if (((raw[0] >> PH_VER_SHIFT) & PH_VER_MASK) > PAYLOAD_VER_1)
+      ++s_rx_paths.unsupported_version;
+    const uint8_t route = raw[0] & PH_ROUTE_MASK;
+    const int path_offset = (route == ROUTE_TYPE_TRANSPORT_FLOOD ||
+                             route == ROUTE_TYPE_TRANSPORT_DIRECT) ? 5 : 1;
+    if (len <= path_offset) { ++s_rx_paths.short_metadata; return; }
+    ++s_rx_paths.raw[raw[path_offset] >> 6];
+  }
+  void logRx(mesh::Packet* packet, int, float) override {
+    if (packet->getPayloadType() != PAYLOAD_TYPE_GRP_TXT) return;
+    const uint8_t width = packet->getPathHashSize();
+    if (width >= 1 && width <= 3) ++s_rx_paths.parsed[width - 1];
+  }
+  void onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel,
+                       uint8_t* data, size_t len) override {
+    if (type == PAYLOAD_TYPE_GRP_TXT) {
+      const uint8_t width = packet->getPathHashSize();
+      if (width >= 1 && width <= 3) ++s_rx_paths.decrypted[width - 1];
+    }
+    BaseChatMesh::onGroupDataRecv(packet, type, channel, data, len);
+  }
   bool allowPacketForward(const mesh::Packet*) override { return g_packet_forward_enabled; }
   // Send one extra ACK ~300ms after the primary when a direct path is known.
   // Improves delivery-confirmation reliability on lossy return paths without
@@ -645,10 +768,13 @@ protected:
       uint32_t tag;
       memcpy(&tag, &packet->payload[2], 4);
 
-      bool is_manual  = (g_discover_tag != 0 && tag == g_discover_tag);
+      bool is_manual  = g_manual_discover_active && g_discover_tag != 0
+                        && tag == g_discover_tag;
       bool is_receipt = (g_channel_receipt.discover_tag != 0 &&
                          tag == g_channel_receipt.discover_tag);
       if (!is_manual && !is_receipt) return;
+      // Requests ask for the full identity; partial keys cannot identify a result safely.
+      if (packet->payload_len < 6 + PUB_KEY_SIZE) return;
 
       // Extract pub_key from response
       uint8_t pub_key[PUB_KEY_SIZE];
@@ -694,13 +820,17 @@ protected:
         }
         // NOTE: if existing contact is NOT a repeater, leave it untouched
 
+        char fallback_name[32];
+        snprintf(fallback_name, sizeof(fallback_name), "Repeater_%02X%02X", pub_key[0], pub_key[1]);
+#if defined(ESP32)
+        portENTER_CRITICAL(&s_discovery_mux);
+#endif
+        s_discovery_results.record(pub_key, existing ? existing->name : fallback_name,
+                                   packet->_rssi, packet->_snr, snr_x4);
+#if defined(ESP32)
+        portEXIT_CRITICAL(&s_discovery_mux);
+#endif
         if (existing) {
-          if (g_discover_result_count < MAX_DISCOVER_RESULTS) {
-            strncpy(g_discover_names[g_discover_result_count],
-                    existing->name, 31);
-            g_discover_names[g_discover_result_count][31] = '\0';
-            g_discover_result_count++;
-          }
           g_deferred_refresh_targets = true;
           g_deferred_discover_done = true;
         }
@@ -714,6 +844,15 @@ protected:
   }
 
   void onDiscoveredContact(ContactInfo& c, bool is_new, uint8_t, const uint8_t*) override {
+    // Keep valid LoRa advert locations even when automatic contact addition is off.
+    if (!g_purged_this_session && c.type == ADV_TYPE_REPEATER)
+      map_record_repeater_advert(c.id.pub_key, c.name, c.gps_lat, c.gps_lon, c.last_advert_timestamp);
+    // Persist advert updates to known repeaters even with auto-add off.
+    if (!g_purged_this_session && c.type == ADV_TYPE_REPEATER && lookupContactByPubKey(c.id.pub_key, 32)) {
+      g_contacts_save_dirty = true;
+      g_contacts_save_ms = millis();
+      g_deferred_refresh_targets = true;
+    }
     {
       bool is_repeater = (c.type == ADV_TYPE_REPEATER);
       if (is_repeater  && !g_auto_repeater_enabled && !g_manual_discover_active) return;
@@ -873,6 +1012,7 @@ protected:
   }
 
   void onCommandDataRecv(const ContactInfo& contact, mesh::Packet*, uint32_t, const char* text) override {
+    map_receive_repeater_position(contact.id.pub_key, text);
     wake_on_event();
     String safeName = sanitize_ascii_string(contact.name);
     String safeText = sanitize_ascii_string(text);
@@ -1112,6 +1252,7 @@ protected:
     // Deduplicate channel messages
     uint32_t fp = dedup_fingerprint(channel.hash, ts, text ? text : "");
     if (dedup_check_and_add(fp)) {
+      ++s_rx_channel_duplicates;
 #if SERIALMON_VERBOSE
       serialmon_append("RX CH duplicate - ignored");
 #endif
@@ -1125,6 +1266,13 @@ protected:
 
     ChannelDetails ch;
     if (!getChannel(idx, ch)) return;
+
+    if (idx < MAX_GROUP_CHANNELS) {
+      ++s_rx_channel_accepted[idx];
+      s_rx_channel_last_epoch[idx] = rtc_clock.getCurrentTime();
+    }
+    if (pkt && pkt->getPathHashSize() >= 1 && pkt->getPathHashSize() <= 3)
+      ++s_rx_paths.accepted[pkt->getPathHashSize() - 1];
 
     String safeCh = sanitize_ascii_string(ch.name);
     String safeText = sanitize_ascii_string(text);
@@ -1303,6 +1451,7 @@ protected:
     // ---- Channel receipt responses now handled via onControlDataRecv (multi-repeater) ----
 
     // ---- Neighbours response ----
+    map_receive_neighbours(contact.id.pub_key, data, len);
     if (g_neighbours_pending_key != 0 && len >= 8) {
       uint32_t tag; memcpy(&tag, data, 4);
       bool match = (tag == g_neighbours_pending_key) ||
@@ -1327,7 +1476,7 @@ protected:
           pos += snprintf(buf + pos, sizeof(buf) - pos, "  (none)");
         }
 
-        for (int i = 0; i < result_count && p + entry_sz <= end; i++, p += entry_sz) {
+        for (int i = 0; i < result_count && end - p >= entry_sz && pos < (int)sizeof(buf) - 1; i++, p += entry_sz) {
           uint32_t heard_ago; memcpy(&heard_ago, p + 4, 4);
           int8_t snr_raw; memcpy(&snr_raw, p + 8, 1);
           float snr_f = snr_raw / 4.0f;
@@ -1343,6 +1492,8 @@ protected:
               "%d. %02X%02X%02X%02X...\n   SNR: %.1f  |  heard %lus ago\n\n",
               i + 1, p[0], p[1], p[2], p[3], snr_f, (unsigned long)heard_ago);
           }
+          // snprintf returns the required length, not the bytes actually written.
+          if (pos >= (int)sizeof(buf)) pos = sizeof(buf) - 1;
         }
         repeater_update_monitor(buf);
       }
@@ -1350,9 +1501,17 @@ protected:
   }
 
 public:
+  static constexpr int kRadioPacketPoolSize = 16;
+
+
+  bool hasPendingRadioPackets() const {
+    // Includes delayed inbound/manual-held packets, not just queued TX.
+    return _mgr->getFreeCount() != kRadioPacketPoolSize;
+  }
+
   UIMesh(mesh::Radio& radio, mesh::RNG& rng, mesh::RTCClock& rtc, mesh::MeshTables& tables)
     : BaseChatMesh(radio, *new ArduinoMillis(), rng, rtc,
-                   *(new StaticPoolPacketManager(16)), tables) {
+                   *(new StaticPoolPacketManager(kRadioPacketPoolSize)), tables) {
     _fs = nullptr;
     _public = nullptr;
     _public_idx = -1;
@@ -1505,6 +1664,7 @@ public:
 
   uint32_t sendDiscoverRepeaters(bool flood = false, uint32_t delay_ms = 0) {
     uint32_t tag = (uint32_t)millis() ^ ((uint32_t)random(0xFFFF) << 16);
+    if (!tag) tag = 1;  // Zero denotes an inactive scan.
     uint8_t data[10];
     data[0] = 0x80;  // CTL_TYPE_NODE_DISCOVER_REQ, no prefix_only flag
     data[1] = (1 << ADV_TYPE_REPEATER);  // filter: repeaters only
@@ -2203,8 +2363,8 @@ public:
     purge_contacts_file_all();
 
     ContactInfo c;
-    for (uint32_t i=0; i<(uint32_t)getNumContacts(); i++) {
-      if (!getContactByIdx(i, c)) continue;
+    ContactsIterator contacts_it = startContactsIterator();
+    while (contacts_it.hasNext(this, c)) {
       ContactInfo* ptr = lookupContactByPubKey(c.id.pub_key, 32);
       if (!ptr) continue;
       ptr->name[0] = 0;
@@ -2216,12 +2376,77 @@ public:
     _curr_recipient = nullptr;
     _curr_channel_idx = -1;
     g_purged_this_session = true;
+    map_clear_advert_locations();
   }
 
   void onContactVisit(const ContactInfo&) override {}
 };
 
 static UIMesh* g_uimesh = nullptr;
+
+// Called only on the Arduino task, never while it holds the LVGL lock.
+// HTTP translation waits also use this path; callbacks remain on their
+// original task and only deposit deferred UI work.
+static void service_radio() {
+  if (!g_mesh || !mesh_try_lock(0)) return;
+  static uint32_t last_service_ms = 0;
+  static uint32_t last_warning_ms = 0;
+  static uint32_t last_errors = 0;
+  static uint32_t last_start_errors = 0;
+  const uint32_t now = millis();
+  const uint32_t gap = now - last_service_ms;
+  if (last_service_ms && gap > s_rx_max_service_gap_ms) s_rx_max_service_gap_ms = gap;
+  s_rx_last_service_ms = now;
+  const uint32_t errors = radio_driver.getPacketsRecvErrors();
+  const uint32_t start_errors = radio_driver.getRxStartErrors();
+  const bool delayed = last_service_ms && gap > (g_screen_awake ? 500UL : 1000UL);
+  if ((delayed || errors != last_errors || start_errors != last_start_errors) &&
+      (!last_warning_ms || now - last_warning_ms >= 10000UL)) {
+    Serial.printf("[rx-health] service gap=%lu ms; pending RX=%u; received=%lu; read errors=%lu; RX start errors=%lu (last=%d)\n",
+                  (unsigned long)gap, radio_driver.hasPendingReceiveInterrupt() ? 1u : 0u,
+                  (unsigned long)radio_driver.getPacketsRecv(), (unsigned long)errors,
+                  (unsigned long)start_errors, (int)radio_driver.getLastRxStartError());
+    last_warning_ms = now;
+    last_errors = errors;
+    last_start_errors = start_errors;
+  }
+  last_service_ms = now;
+  crash_diagnostics_mark(false, CrashStage::Radio);
+  g_mesh->loop();
+  crash_diagnostics_mark(false, CrashStage::Radio, 1);
+
+  static bool previous_awake = g_screen_awake;
+  static bool verify_pending = true;
+  static bool report_verification = true;
+  static uint32_t last_verify_ms = 0;
+  static uint32_t next_attempt_ms = 0;
+  if (previous_awake != g_screen_awake) {
+    previous_awake = g_screen_awake;
+    verify_pending = report_verification = true;
+    next_attempt_ms = now;
+  }
+  if (now - last_verify_ms >= 30000UL) verify_pending = true;
+  if (verify_pending && (int32_t)(now - next_attempt_ms) >= 0) {
+    int16_t error = 0;
+    crash_diagnostics_mark(false, CrashStage::Radio, 2);
+    const RxGainCheck check = radio_verify_rx_gain(error);
+    crash_diagnostics_mark(false, CrashStage::Radio, 3);
+    next_attempt_ms = now + (check == RxGainCheck::Failed ? 10000UL : 250UL);
+    if (check == RxGainCheck::Verified || check == RxGainCheck::Restored) {
+      if (report_verification || check == RxGainCheck::Restored) {
+        Serial.printf("[rx-health] RX gain %s; screen=%s; %s\n",
+                      SX126X_RX_BOOSTED_GAIN ? "boosted" : "normal",
+                      g_screen_awake ? "on" : "off",
+                      check == RxGainCheck::Restored ? "restored and verified" : "verified");
+      }
+      verify_pending = report_verification = false;
+      last_verify_ms = now;
+    } else if (check == RxGainCheck::Failed) {
+      Serial.printf("[rx-health] RX gain verification failed: %d; retry deferred\n", error);
+    }
+  }
+  mesh_unlock();
+}
 
 // ============================================================
 // setup()
@@ -2254,6 +2479,7 @@ static const char* dbg_reset_reason_name(esp_reset_reason_t reason) {
 }
 
 void setup() {
+  const uint32_t boot_started_ms = millis();
   Serial.begin(115200);
   delay(50);
   Serial.println(">>> setup() entered");
@@ -2261,6 +2487,8 @@ void setup() {
   const esp_reset_reason_t reset_reason = esp_reset_reason();
   Serial.printf("[boot] reset reason: %s (%d)\n",
                 dbg_reset_reason_name(reset_reason), (int)reset_reason);
+  crash_diagnostics_boot();
+  crash_diagnostics_mark(false, CrashStage::Boot);
   Serial.flush();
   // 30-second watchdog (arduino-esp32 3.x API uses a config struct).
   {
@@ -2277,30 +2505,18 @@ void setup() {
   // settings-screen orientation toggle persists to NVS then esp_restart()s
   // so the new value is live on the next boot.
   g_landscape_mode = load_landscape_nvs();
+  g_backlight_level = load_brightness_nvs();
+  g_ramp_target = g_backlight_level;
   if (!display_init()) {
     Serial.println("display_init FAILED");
     while (1) delay(1000);
   }
-  stc8_set_pwm_duty(STC8_PWM_LCD_BL_EN, 100);
-  // SD card (separate SDMMC slot from ESP-Hosted, no conflict with WiFi).
-  // Must be mounted BEFORE emoji_atlas_init() so the Noto Color Emoji
-  // atlas can be loaded from /sdcard/emoji/. Graceful degradation if no
-  // card: the emoji atlas falls back to a tiny bundled test set so the
-  // rest of the firmware stays fully functional.
-  sd_init();
+  stc8_set_pwm_duty(STC8_PWM_LCD_BL_EN, g_backlight_level);
+  Serial.printf("[boot] display ready: %lu ms from setup\n",
+                (unsigned long)(millis() - boot_started_ms));
 
-  // Color-emoji atlas + imgfont. The atlas lives in PSRAM; the imgfont
-  // wraps it so LVGL can look up glyphs by codepoint. Must run BEFORE
-  // lv_font_greek_init() so the fallback-chain setup can thread the
-  // imgfont into every Montserrat size.
-  emoji_atlas_init();
-  emoji_font_init();
-
-  // Initialise the Greek-overlay font shims (forward-declared at the top of
-  // the file). v11 did this inside init_display_and_ui(); if we skip it,
-  // every `lv_font_montserrat_16` reference (remapped by lv_font_greek.h to
-  // the SRAM-resident lv_font_mg_16) points at a zeroed struct and the first
-  // label crashes with a NULL get_glyph_dsc.
+  // First frame uses built-in Latin/Greek/German fonts. The chain safely
+  // skips the NULL emoji fonts; SD access must not delay this first paint.
   lv_font_greek_init();
   // Populate SCR_W/SCR_H and friends from g_landscape_mode before ui_init():
   // SquareLine screens read those globals when laying out widgets, so they
@@ -2309,6 +2525,27 @@ void setup() {
   // keyboard_helpers.cpp).
   init_layout_constants();
   ui_init();                               // SquareLine — creates screens
+
+  // Top-layer ownership keeps this visible across startup list rebuilds.
+  lv_obj_t* boot_banner = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(boot_banner);
+  lv_obj_set_width(boot_banner, lv_pct(84));
+  lv_obj_set_style_max_width(boot_banner, 380, 0);
+  lv_obj_set_height(boot_banner, LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_color(boot_banner, lv_color_hex(TH_SURFACE2), 0);
+  lv_obj_set_style_bg_opa(boot_banner, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(boot_banner, 1, 0);
+  lv_obj_set_style_border_color(boot_banner, lv_color_hex(TH_ACCENT), 0);
+  lv_obj_set_style_radius(boot_banner, 6, 0);
+  lv_obj_set_style_pad_all(boot_banner, 18, 0);
+  lv_obj_clear_flag(boot_banner, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_center(boot_banner);
+  lv_obj_t* boot_label = lv_label_create(boot_banner);
+  lv_obj_set_width(boot_label, lv_pct(100));
+  lv_obj_set_style_text_font(boot_label, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(boot_label, lv_color_hex(TH_TEXT), 0);
+  lv_obj_set_style_text_align(boot_label, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_text(boot_label, "Booting, please wait");
 
   // Post-ui_init wiring that v11's old init_display_and_ui() used to do —
   // we replaced that function with our display_init() but forgot to port
@@ -2458,6 +2695,10 @@ void setup() {
     lv_obj_add_event_cb(noise_btn, cb_floor_noise, LV_EVENT_CLICKED, nullptr);
   }
 
+  // First gauge sample before the startup frame; no LVGL task/mutex is active yet.
+  battery_poll();
+  update_batterylabel();
+
   // Paint the first frame NOW. Everything after this (board.begin, radio
   // init, MeshCore, WiFi.mode, WiFi.begin…) can block for several seconds,
   // and without a tick of lv_timer_handler() the RGB framebuffer stays at
@@ -2465,11 +2706,14 @@ void setup() {
   // appeared dark until WiFi associated. A handful of iterations gives
   // the panel at least one vsync flip with the home screen painted.
   for (int i = 0; i < 8; i++) { lv_timer_handler(); delay(5); }
+  Serial.printf("[boot] first UI frame submitted: %lu ms from setup\n",
+                (unsigned long)(millis() - boot_started_ms));
+
+  uint32_t stage_started_ms = millis();
   if (ui_repeaterscreen)
     lv_obj_add_event_cb(ui_repeaterscreen, cb_repeater_screen_loaded,
                         LV_EVENT_SCREEN_LOADED, nullptr);
   if (ui_chatpanel) g_chatpanel_orig_y = lv_obj_get_y(ui_chatpanel);
-  display_touch_attach();                  // GT911 → LVGL indev
   // DHE04005D has no battery-backed RTC — NTP is the sole time source
   // (once WiFi is up). No RTC init/probe step on this variant.
   speaker_init();                          // I2S audio out (LRCK=21, BCLK=22, SDOUT=23)
@@ -2481,6 +2725,7 @@ void setup() {
   }
 
   board.begin();
+  stage_started_ms = millis();
   if (!radio_init()) {
     serialmon_append("Radio init failed");
     while (1) delay(1000);
@@ -2488,6 +2733,7 @@ void setup() {
 
   StdRNG& rng = fast_rng;
   rng.begin(radio_get_rng_seed());
+  chat_persistence_init();
 
 #if defined(NRF52_PLATFORM)
   InternalFS.begin();
@@ -2516,6 +2762,9 @@ void setup() {
   #error "need to define filesystem"
 #endif
 
+  Serial.printf("[boot] radio and mesh storage: %lu ms\n",
+                (unsigned long)(millis() - stage_started_ms));
+
   {
     double saved_lat = 0.0;
     double saved_lon = 0.0;
@@ -2534,7 +2783,7 @@ void setup() {
   // Keep chat/CLI text framing in legacy 1-byte mode for interoperability.
   g_uimesh->setTextHeaderBytes(1);
 
-  // No RTC on this variant — clock stays at epoch until NTP sync lands.
+  // The optional external RTC was loaded during board initialization.
 
   radio_set_params(g_uimesh->getFreqPref(), (float)LORA_BW, (uint8_t)LORA_SF, (uint8_t)LORA_CR);
   radio_set_tx_power(g_uimesh->getTxPowerPref());
@@ -2542,6 +2791,11 @@ void setup() {
   if (ui_devicenamelabel) lv_label_set_text(ui_devicenamelabel, g_uimesh->getNodeName());
 
   ui_refresh_targets();
+  // Saved names stay UTF-8 in the mesh/list model. Paint chats before optional
+  // SD assets and network services; emoji glyphs will join the font chain later.
+  for (int i = 0; i < 8; i++) { lv_timer_handler(); delay(5); }
+  Serial.printf("[boot] chat list frame submitted: %lu ms from setup\n",
+                (unsigned long)(millis() - boot_started_ms));
   ui_populate_presets();
   ui_populate_timezone_dropdown();
   reg(ui_timezonedropdown, cb_timezone, LV_EVENT_VALUE_CHANGED);
@@ -2615,6 +2869,11 @@ void setup() {
   }
 
   reg(ui_brightnessslider, cb_brightness, LV_EVENT_VALUE_CHANGED);
+  reg(ui_brightnessslider, cb_brightness, LV_EVENT_RELEASED);
+  if (ui_brightnessslider)
+    lv_slider_set_value(ui_brightnessslider,
+        ScreenPower::sliderFromBrightness(g_backlight_level,
+            lv_slider_get_max_value(ui_brightnessslider)), LV_ANIM_OFF);
 
   // Volume slider: live-update g_speaker_volume on every drag delta
   // (VALUE_CHANGED) but only persist to NVS and preview-beep on
@@ -2683,7 +2942,7 @@ void setup() {
 
   // Translation wiring is in features_cb.cpp (Web Apps screen)
 
-  // (SD and emoji init moved up, before lv_font_greek_init().)
+  // Optional SD and emoji assets are loaded last, after the chat list is visible.
 
   // WiFi subsystem init — non-blocking. wifi_init() wires SDIO pins, loads
   // saved NVS credentials (bootstrapping from compile-time WIFI_SSID/_PASS
@@ -2719,18 +2978,201 @@ void setup() {
 
   ui_refresh_targets();
 
+  // Last boot stage: no input device or LVGL service task can use a half-built
+  // font chain. Atlas data is initialized once; stored names/messages are intact.
+  stage_started_ms = millis();
+  sd_init();
+  Serial.printf("[boot] SD mount: %lu ms\n", (unsigned long)(millis() - stage_started_ms));
+  esp_task_wdt_reset();
+  stage_started_ms = millis();
+  emoji_atlas_init();
+  emoji_font_init();
+  lv_font_greek_init();
+  lv_obj_report_style_change(nullptr);
+  g_homescreen_list_is_current = false;
+  ui_refresh_targets();
+  lv_obj_invalidate(lv_scr_act());
+  for (int i = 0; i < 8; i++) { lv_timer_handler(); delay(5); }
+  Serial.printf("[boot] emoji assets and chat refresh: %lu ms\n",
+                (unsigned long)(millis() - stage_started_ms));
+  esp_task_wdt_reset();
+  display_touch_attach();                  // Enable interaction only after fonts are ready.
+
+  // Initialization is complete; deletion invalidates the covered area for
+  // the first serviced frame. No LVGL task is running during this deletion.
+  lv_obj_del(boot_banner);
+
   // All setup-time widget creation is done — safe to start the LVGL service
   // task now. From this point on, anything touching LVGL from outside the
   // task must use lvgl_lock()/lvgl_unlock().
   display_start_lvgl_task();
+  Serial.printf("[boot] UI service ready: %lu ms from setup\n",
+                (unsigned long)(millis() - boot_started_ms));
 }
 
 // ============================================================
 // loop()
 // ============================================================
 
+static void cpu_light_sleep_poll() {
+  if (!ScreenPower::kCpuLightSleep) return;
+  static bool disabled = false;
+  static bool dark_session = false;
+  static bool blocked_reported = false;
+  static bool domains_configured = false;
+  static uint32_t sleeps = 0, radio_wakes = 0, touch_wakes = 0, rejects = 0;
+  static uint64_t elapsed_us = 0;
+  if (g_screen_awake) {
+    if (dark_session && (sleeps || rejects)) {
+      Serial.printf("[power] CPU light sleep: intervals=%lu elapsed=%llu ms radio_wakes=%lu touch_wakes=%lu rejects=%lu\n",
+          (unsigned long)sleeps, (unsigned long long)(elapsed_us / 1000),
+          (unsigned long)radio_wakes, (unsigned long)touch_wakes, (unsigned long)rejects);
+    }
+    dark_session = false;
+    return;
+  }
+  if (!dark_session) {
+    dark_session = true;
+    blocked_reported = false;
+    sleeps = radio_wakes = touch_wakes = rejects = 0;
+    elapsed_us = 0;
+  }
+  if (disabled) return;
+  if (!wifi_cpu_sleep_safe()) {
+    if (!blocked_reported) {
+      Serial.println("[power] CPU light sleep blocked: hosted WiFi used; reboot with WiFi off");
+      blocked_reported = true;
+    }
+    return;
+  }
+
+  // Match UI callbacks' LVGL -> mesh lock order. Audio holds neither lock.
+  if (!lvgl_lock(0)) return;
+  if (!mesh_try_lock(0)) { lvgl_unlock(); return; }
+  if (!ScreenPower::cpuSleepReady(display_cpu_sleep_ready(), wifi_cpu_sleep_safe(),
+          radio_driver.isReceiveIdleForCpuSleep(),
+          !g_uimesh || g_uimesh->hasPendingRadioPackets())
+      || !speaker_try_idle_lock()) {
+    mesh_unlock();
+    lvgl_unlock();
+    return;
+  }
+
+  esp_err_t err = ESP_OK;
+  if (!domains_configured) {
+    // Retain SPI/I2C/PPA state and external RAM/flash supplies. Only clock-gate.
+    err = esp_sleep_pd_config(ESP_PD_DOMAIN_TOP, ESP_PD_OPTION_ON);
+    if (err == ESP_OK) err = esp_sleep_pd_config(ESP_PD_DOMAIN_CNNT, ESP_PD_OPTION_ON);
+    if (err == ESP_OK) err = esp_sleep_pd_config(ESP_PD_DOMAIN_VDDSDIO, ESP_PD_OPTION_ON);
+    domains_configured = err == ESP_OK;
+  }
+  constexpr gpio_num_t dio = static_cast<gpio_num_t>(P_LORA_DIO_1);
+  constexpr gpio_num_t touch = static_cast<gpio_num_t>(Touch_GPIO_INT);
+  const int touch_level = ScreenPower::kTouchIrqSleep ? gt911_interrupt_wake_level() : -1;
+  bool irq_masked = false;
+  bool touch_armed = false;
+  bool touch_setup_attempted = false;
+  bool touch_pending = false;
+  bool radio_pending = false;
+  bool attempted = false;
+  uint64_t duration_us = 0;
+  esp_sleep_wakeup_cause_t cause = ESP_SLEEP_WAKEUP_UNDEFINED;
+  if (err == ESP_OK) {
+    err = gpio_intr_disable(dio);
+    irq_masked = err == ESP_OK;
+  }
+  // GPIO wake shares intr_type with the CPU ISR. Mask it before enabling level
+  // wake to avoid an interrupt storm while SX1262 keeps RxDone asserted.
+  if (err == ESP_OK) err = gpio_wakeup_enable(dio, GPIO_INTR_HIGH_LEVEL);
+  if (err == ESP_OK && touch_level >= 0) {
+    touch_setup_attempted = true;
+    esp_err_t touch_err = gpio_intr_disable(touch);
+    if (touch_err == ESP_OK)
+      touch_err = gpio_wakeup_enable(touch,
+          touch_level ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL);
+    touch_armed = touch_err == ESP_OK;
+    if (!touch_armed) {
+      // Do not lose the known-good radio/polling sleep path on a touch GPIO
+      // setup error. Disable only this optimization for the rest of the boot.
+      gt911_disable_interrupt_wake();
+      Serial.printf("[power] touch GPIO wake unavailable (%d); keeping 80 ms polling\n", (int)touch_err);
+    }
+  }
+  const uint32_t sleep_ms = ScreenPower::cpuSleepPeriodMs(touch_armed);
+  if (err == ESP_OK) err = esp_sleep_enable_gpio_wakeup();
+  if (err == ESP_OK) err = esp_sleep_enable_timer_wakeup(sleep_ms * 1000ULL);
+  touch_pending = touch_armed && gpio_get_level(touch) == touch_level;
+  if (err == ESP_OK && radio_driver.isReceiveIdleForCpuSleep()
+      && ScreenPower::wakeInputsQuiet(gpio_get_level(dio) != 0,
+          touch_armed, touch_pending, g_screen_awake)) {
+    attempted = true;
+    const int64_t start_us = esp_timer_get_time();
+    err = esp_light_sleep_start();
+    duration_us = esp_timer_get_time() - start_us;
+    cause = esp_sleep_get_wakeup_cause();
+  }
+  radio_pending = gpio_get_level(dio) != 0;
+  touch_pending = touch_pending || (touch_armed && gpio_get_level(touch) == touch_level);
+
+  esp_err_t restore_err = ESP_OK;
+  if (touch_setup_attempted) {
+    restore_err = gpio_wakeup_disable(touch);
+    const esp_err_t touch_restore_err = gpio_set_intr_type(touch, GPIO_INTR_DISABLE);
+    if (restore_err == ESP_OK) restore_err = touch_restore_err;
+  }
+  if (irq_masked) {
+    const esp_err_t radio_restore_err = gpio_wakeup_disable(dio);
+    if (restore_err == ESP_OK) restore_err = radio_restore_err;
+    const esp_err_t edge_err = gpio_set_intr_type(dio, GPIO_INTR_POSEDGE);
+    const esp_err_t enable_err = gpio_intr_enable(dio);
+    if (restore_err == ESP_OK) restore_err = edge_err;
+    if (restore_err == ESP_OK) restore_err = enable_err;
+    // A rising edge during the masked window is otherwise lost. Leave the
+    // SX1262 FIFO/IRQ untouched; recvRaw() handles it on the next mesh loop.
+    if (gpio_get_level(dio)) radio_driver.latchReceiveInterruptAfterCpuSleep();
+  }
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+  if (ScreenPower::touchRequestedWake(touch_armed, touch_pending,
+          attempted && cause == ESP_SLEEP_WAKEUP_GPIO, radio_pending)) {
+    // Preserve a short, verified touch IRQ even if its coordinate read is late.
+    g_swallow_touch = true;
+    g_touch_was_press = false;
+    note_touch_activity();
+  }
+  speaker_idle_unlock();
+  mesh_unlock();
+  lvgl_unlock();
+  if (attempted || touch_pending) display_notify_service();
+
+  if (restore_err != ESP_OK || (err != ESP_OK
+      && (!attempted || err != ESP_ERR_SLEEP_REJECT))) {
+    disabled = true;
+    Serial.printf("[power] CPU light sleep disabled: sleep=%d restore=%d\n", (int)err, (int)restore_err);
+  } else if (attempted && err == ESP_OK) {
+    elapsed_us += duration_us;
+    if (cause == ESP_SLEEP_WAKEUP_GPIO) {
+      if (radio_pending) ++radio_wakes;
+      // A GT911 edge-mode pulse can end before this sample; its unread touch
+      // buffer remains pending. The only other GPIO wake source here is LoRa.
+      if (touch_armed && (touch_pending || !radio_pending)) ++touch_wakes;
+    }
+    if (++sleeps == 1)
+      Serial.printf("[power] CPU light sleep active: timer=%lu ms; LoRa DIO1 wake; touch=%s; RX stays on\n",
+          (unsigned long)sleep_ms, touch_armed ? "GPIO wake" : "polling fallback");
+  } else if (attempted) {
+    ++rejects;
+  }
+}
+
 void loop() {
+  crash_diagnostics_poll_serial();
+  crash_diagnostics_mark(false, CrashStage::Input);
+  crash_diagnostics_sample(false);
   esp_task_wdt_reset();
+
+  // Drain a completed RX before battery/I2C, history widgets or networking.
+  service_radio();
 
   // Poll the onboard STC8 battery gauge OFF the LVGL lock (self-throttled to
   // 5 s). The status-bar % is applied later under the lock via the deferred
@@ -2758,7 +3200,7 @@ void loop() {
     // mutation must happen under the LVGL mutex — otherwise we hit
     // `_lv_inv_area: detected modifying dirty areas in render` (and
     // worse, can corrupt the dirty-area list). Wrap with lvgl_lock.
-    if (!timelabel_primed || (now_ms - last_time_update_ms >= 60000UL)) {
+    if (g_screen_awake && (!timelabel_primed || (now_ms - last_time_update_ms >= 60000UL))) {
       // Recompute DST on the first paint: load_ui_prefs_nvs() ran during
       // setup() before the RTC had loaded a valid epoch from the chip,
       // so the offset is currently locked at the standard-time value
@@ -2782,7 +3224,8 @@ void loop() {
   uint32_t timeout_ms = g_screen_timeout_s * 1000UL;
 
   if (g_screen_awake) {
-    if (timeout_ms >= 5000UL && (now - g_last_touch_ms) > timeout_ms) {
+    if (ScreenPower::screenTimeoutDue(now, g_last_touch_ms, timeout_ms,
+                                     display_backlight_ready())) {
       screen_sleep();
     }
   } else {
@@ -2793,13 +3236,17 @@ void loop() {
   }
 
   // ---- Soft wake-up ramp tick ----
-  if (g_ramp_current > 0 && g_ramp_current < g_ramp_target &&
+  if (!ScreenPower::kDisplayTaskBacklight && g_screen_awake && display_backlight_ready() && g_ramp_current > 0 &&
       (int32_t)(now - g_ramp_next_ms) >= 0) {
-    g_ramp_current++;
-    if (g_ramp_current > g_ramp_target) g_ramp_current = g_ramp_target;
-    i2c_cmd(g_ramp_current);
-    g_ramp_next_ms = now + RAMP_STEP_MS;
-    if (g_ramp_current >= g_ramp_target) g_ramp_current = 0;
+    const uint8_t next_level = ScreenPower::nextRampLevel(g_ramp_current, g_ramp_target);
+    if (i2c_cmd(next_level)) {
+      g_ramp_current = next_level;
+      g_ramp_next_ms = now + RAMP_STEP_MS;
+      if (g_ramp_current >= g_ramp_target) g_ramp_current = 0;
+    } else {
+      // Do not finish the ramp on an I2C failure and leave PWM stuck at zero.
+      g_ramp_next_ms = now + 1000;
+    }
   }
 
   bool pm_ui_dirty = false;
@@ -2834,14 +3281,11 @@ void loop() {
       g_ppa_recovery_redraw_pending ||
       (g_deferred_msg_count > 0) ||
       (g_deferred_msg_dropped > 0) ||
-      g_deferred_refresh_targets ||
-      g_deferred_serialmon_dirty ||
-      g_deferred_timelabel_dirty ||
-      g_deferred_battery_dirty ||
-      g_deferred_route_label_dirty ||
-      g_deferred_wifi_status_dirty ||
-      g_deferred_features_dirty ||
-      g_deferred_discover_done ||
+      (g_screen_awake && (g_deferred_refresh_targets ||
+       g_deferred_serialmon_dirty || g_deferred_timelabel_dirty ||
+       g_deferred_battery_dirty || g_deferred_route_label_dirty ||
+       g_deferred_wifi_status_dirty || g_deferred_features_dirty ||
+       g_deferred_discover_done)) ||
       g_deferred_receipt_update ||
       g_deferred_repeater_mon_dirty ||
       (g_deferred_repeater_btns != 0) ||
@@ -2857,6 +3301,7 @@ void loop() {
 
   // ---- Drain deferred LVGL work under the shared LVGL mutex ----
   if (have_deferred_lvgl_work && lvgl_lock(5)) {
+    crash_diagnostics_mark(false, CrashStage::UiWork);
 
   // 0. PPA-recovery: if flush_cb just reset the PPA client because of
   // a timeout, force an invalidation of the whole active screen so the
@@ -2907,7 +3352,7 @@ void loop() {
     lv_obj_t* act = lv_scr_act();
     const bool on_home = (act == ui_homescreen);
     const uint32_t refresh_interval_ms = on_home ? 300 : 1500;
-    if (g_deferred_refresh_targets &&
+    if (g_screen_awake && g_deferred_refresh_targets &&
         (millis() - s_last_refresh_ms) >= refresh_interval_ms) {
       g_deferred_refresh_targets = false;
       s_last_refresh_ms = millis();
@@ -2934,7 +3379,7 @@ void loop() {
     // dropped because the window didn't exist yet. Now those logs
     // accumulate in g_serial_buf and show up here on the first
     // post-ui_init drain.
-    if (g_deferred_serialmon_dirty && ui_serialmonitorwindow && !serialLabel) {
+    if (g_screen_awake && g_deferred_serialmon_dirty && ui_serialmonitorwindow && !serialLabel) {
       serialLabel = lv_label_create(ui_serialmonitorwindow);
       lv_obj_set_width(serialLabel, lv_pct(100));
       lv_label_set_long_mode(serialLabel, LV_LABEL_LONG_WRAP);
@@ -2950,7 +3395,7 @@ void loop() {
       // Serial messages are ASCII anyway.
       lv_obj_set_style_text_font(serialLabel, &lv_font_plain_14, 0);
     }
-    if (g_deferred_serialmon_dirty && serialLabel &&
+    if (g_screen_awake && g_deferred_serialmon_dirty && serialLabel &&
         lv_disp_get_scr_act(NULL) == ui_settingscreen &&
         (millis() - s_serialmon_last_refresh_ms) >= SERIALMON_MIN_INTERVAL_MS) {
       g_deferred_serialmon_dirty = false;
@@ -2962,28 +3407,28 @@ void loop() {
   }
 
   // 3b. Deferred time label
-  if (g_deferred_timelabel_dirty) {
+  if (g_screen_awake && g_deferred_timelabel_dirty) {
     g_deferred_timelabel_dirty = false;
     update_timelabel();
   }
   // 3c. Deferred battery indicator (cached by battery_poll())
-  if (g_deferred_battery_dirty) {
+  if (g_screen_awake && g_deferred_battery_dirty) {
     g_deferred_battery_dirty = false;
     update_batterylabel();
   }
-  if (g_deferred_route_label_dirty) {
+  if (g_screen_awake && g_deferred_route_label_dirty) {
     g_deferred_route_label_dirty = false;
     chat_update_route_label();
   }
-  if (g_deferred_wifi_status_dirty) {
+  if (g_screen_awake && g_deferred_wifi_status_dirty) {
     g_deferred_wifi_status_dirty = false;
     wifi_ui_update_status();
   }
-  if (g_deferred_features_dirty) {
+  if (g_screen_awake && g_deferred_features_dirty) {
     g_deferred_features_dirty = false;
     features_update_status_labels();
   }
-  if (g_deferred_discover_done) {
+  if (g_screen_awake && g_deferred_discover_done) {
     g_deferred_discover_done = false;
     repeater_populate_dropdown();
   }
@@ -3126,6 +3571,7 @@ void loop() {
     lvgl_unlock();
   }
 
+  service_radio();
   if (pm_file_dirty) {
     for (int i = 0; i < PM_RING_SIZE; i++) {
       OutboundPM& s = g_pm_ring[i];
@@ -3136,18 +3582,10 @@ void loop() {
     }
   }
 
-  // translate_loop() MUST run before g_mesh->loop(). When a message
-  // arrives mid-iteration, the MeshCore callback queues a bubble via
-  // deferred_msg_push() AND a translate request via
-  // translate_request_to_file(). The bubble isn't actually added to
-  // ui_chatpanel until the deferred drain at the top of the NEXT
-  // iteration. If translate_loop() runs after g_mesh->loop() in the
-  // same iteration, it drains the just-queued request, finds no
-  // matching bubble (not created yet), and the live-update no-ops —
-  // the translation hits disk but only shows up when the user exits
-  // and re-enters the chat. By running translate_loop() first, it
-  // drains requests queued in iteration N-1, after that iteration's
-  // deferred drain already created their bubbles.
+  // The early radio pass precedes the deferred bubble drain above.
+  // Translation dequeues just one request before servicing more radio
+  // callbacks during HTTP waits; those new requests wait for the next
+  // iteration and its bubble drain before they can be translated.
   // While UI has pending work (scroll/rebuild/input), reduce network
   // translation pressure to keep gesture/render latency low.
   {
@@ -3155,22 +3593,15 @@ void loop() {
     const uint32_t now_ms = millis();
     const uint32_t translate_interval_ms =
         ui_interacting ? 1400 : (have_deferred_lvgl_work ? 900 : 350);
-    if ((now_ms - s_translate_tick_ms) >= translate_interval_ms) {
+    if (g_deferred_msg_count == 0 &&
+        (now_ms - s_translate_tick_ms) >= translate_interval_ms) {
       s_translate_tick_ms = now_ms;
-      translate_loop();
+      crash_diagnostics_mark(false, CrashStage::Translation);
+      translate_loop(service_radio);
     }
   }
 
-  if (g_mesh) {
-#if defined(ESP32)
-    if (mesh_try_lock(0)) {
-      g_mesh->loop();
-      mesh_unlock();
-    }
-#else
-    g_mesh->loop();
-#endif
-  }
+  service_radio();
 
   if (g_uimesh) g_uimesh->checkPmRetryTimeout();
   if (g_uimesh) g_uimesh->checkPmHardTimeout();
@@ -3209,6 +3640,7 @@ void loop() {
   if (g_deferred_preset_idx >= 0) { int idx = g_deferred_preset_idx; g_deferred_preset_idx = -1; if (g_uimesh) g_uimesh->applyPresetByIdx(idx, false); }
 
   rtc_clock.tick();
+  crash_diagnostics_mark(false, CrashStage::Network);
   wifi_loop();
   // WiFi-dependent loops don't need to poll at the main-loop rate.
   // During heavy UI work, run them even less often so scroll/render
@@ -3228,7 +3660,7 @@ void loop() {
   poll_channel_receipt_if_due();
 
   if (g_del.kind != TargetKind::NONE &&
-      (millis() - g_del.armed_ms) > 2000) {
+      (millis() - g_del.armed_ms) > 2000 && lvgl_lock(5)) {
     // del_warn_clear is in home_ui — but we need the inline version here
     // since home_ui.cpp's del_warn_clear calls build_homescreen_list
     if (ui_searchfield) {
@@ -3237,6 +3669,7 @@ void loop() {
     }
     g_del = {};
     g_long_press_just_fired = false;
+    lvgl_unlock();
   }
 
   // PM ring: evict expired entries. 'U' slots are transitioned to 'N' by
@@ -3252,16 +3685,26 @@ void loop() {
     }
   }
 
-  if (g_notifications_dirty) {
-    g_notifications_dirty = false;
-    save_notifications_nvs();
+  if (g_notifications_dirty && lvgl_lock(5)) {
+    // Serialize with UI chat loads/flushes; drain text before persisting badges.
+    crash_diagnostics_mark(false, CrashStage::Storage, 5);
+    const bool text_saved = chat_append_flush_sync();
+    lvgl_unlock();
+    if (text_saved) {
+      crash_diagnostics_mark(false, CrashStage::Storage, 1);
+      g_notifications_dirty = false;
+      save_notifications_nvs();
+    }
+    crash_diagnostics_mark(false, CrashStage::Idle);
   }
 
   // Debounced contact save
   if (g_contacts_save_dirty && (millis() - g_contacts_save_ms) > 5000) {
+    crash_diagnostics_mark(false, CrashStage::Storage, 2);
     g_contacts_save_dirty = false;
     esp_task_wdt_reset();
     if (g_uimesh) g_uimesh->saveContactsNow();
+    crash_diagnostics_mark(false, CrashStage::Idle);
   }
 
   // Debounced UI-prefs save. save_ui_prefs_nvs() just marks dirty; we
@@ -3269,16 +3712,20 @@ void loop() {
   // toggle fans (user flipping Notify / Auto-Contact / Speaker in a
   // burst) become a single write instead of N.
   if (g_ui_prefs_save_dirty && (millis() - g_ui_prefs_save_ms) > 500) {
+    crash_diagnostics_mark(false, CrashStage::Storage, 3);
     g_ui_prefs_save_dirty = false;
     save_ui_prefs_nvs_now();
+    crash_diagnostics_mark(false, CrashStage::Idle);
   }
 
   // Debounced map-viewport save. Pan/zoom fires this flag; we coalesce
   // rapid pan bursts into one NVS write.
   extern void map_viewport_save_if_dirty_flush();
   if (g_map_viewport_save_dirty && (millis() - g_map_viewport_save_ms) > 500) {
+    crash_diagnostics_mark(false, CrashStage::Storage, 4);
     g_map_viewport_save_dirty = false;
     map_viewport_save_if_dirty_flush();
+    crash_diagnostics_mark(false, CrashStage::Idle);
   }
 
   // Coalesced chat-line append flush. append_chat_to_file() buffers
@@ -3286,10 +3733,14 @@ void loop() {
   // drain once the deadline elapses so busy channels don't turn into
   // one flash open/append/close per incoming message.
   if (g_chat_flush_deadline_ms != 0 &&
-      (int32_t)(millis() - g_chat_flush_deadline_ms) >= 0) {
+      (int32_t)(millis() - g_chat_flush_deadline_ms) >= 0 && lvgl_lock(5)) {
+    crash_diagnostics_mark(false, CrashStage::Storage, 5);
     chat_append_flush_if_due();
+    lvgl_unlock();
+    crash_diagnostics_mark(false, CrashStage::Idle);
   }
 
+  crash_diagnostics_mark(false, CrashStage::Network, 1);
   bool login_pending = (g_login_pending_key[0] | g_login_pending_key[1] |
                         g_login_pending_key[2] | g_login_pending_key[3]) != 0;
   if (login_pending && g_login_timeout_ms && (int32_t)(millis() - g_login_timeout_ms) > 0) {
@@ -3321,7 +3772,7 @@ void loop() {
       uint8_t key4[4] = { g_login_pending_key[0], g_login_pending_key[1],
                           g_login_pending_key[2], g_login_pending_key[3] };
       if ((key4[0] | key4[1] | key4[2] | key4[3]) != 0) {
-        ContactsIterator it;
+        ContactsIterator it = g_mesh->startContactsIterator();
         ContactInfo c;
         while (it.hasNext(g_mesh, c)) {
           if (c.type == ADV_TYPE_REPEATER && memcmp(c.id.pub_key, key4, 4) == 0) {
@@ -3356,6 +3807,11 @@ void loop() {
   }
 
   // ---- Frame rate limiter ----
+  report_rx_paths_if_changed();
+  service_radio();
+  crash_diagnostics_mark(false, CrashStage::Sleep);
+  cpu_light_sleep_poll();
+  crash_diagnostics_mark(false, CrashStage::Idle);
   delay(1);
 }
 
@@ -3363,12 +3819,164 @@ void loop() {
 // mesh_api wrappers — let extracted modules call UIMesh methods
 // ============================================================
 
+bool mesh_try_get_current_rssi(float& rssi) {
+  if (!g_mesh || !mesh_try_lock(0)) return false;
+  rssi = radio_driver.getCurrentRSSI();
+  mesh_unlock();
+  return true;
+}
+
+static void report_rx_paths_if_changed() {
+  static uint32_t last_report_ms = 0;
+  static uint32_t last_raw = 0;
+  const uint32_t now = millis();
+  if ((uint32_t)(now - last_report_ms) < 60000 || !mesh_try_lock(0)) return;
+  const RxPathCounters snapshot = s_rx_paths;
+  mesh_unlock();
+  last_report_ms = now;
+  const uint32_t total = snapshot.raw[0] + snapshot.raw[1] + snapshot.raw[2] + snapshot.raw[3]
+                        + snapshot.short_metadata;
+  if (total == last_raw) return;
+  last_raw = total;
+  Serial.printf("[rx-path] group text raw/parsed/decrypted/accepted: 1B=%lu/%lu/%lu/%lu 2B=%lu/%lu/%lu/%lu 3B=%lu/%lu/%lu/%lu; reserved=%lu short=%lu version=%lu\n",
+      (unsigned long)snapshot.raw[0], (unsigned long)snapshot.parsed[0],
+      (unsigned long)snapshot.decrypted[0], (unsigned long)snapshot.accepted[0],
+      (unsigned long)snapshot.raw[1], (unsigned long)snapshot.parsed[1],
+      (unsigned long)snapshot.decrypted[1], (unsigned long)snapshot.accepted[1],
+      (unsigned long)snapshot.raw[2], (unsigned long)snapshot.parsed[2],
+      (unsigned long)snapshot.decrypted[2], (unsigned long)snapshot.accepted[2],
+      (unsigned long)snapshot.raw[3], (unsigned long)snapshot.short_metadata,
+      (unsigned long)snapshot.unsupported_version);
+}
+
+String mesh_rx_report() {
+  struct Snapshot {
+    uint32_t received, errors, sent, start_errors, gap, last_service, duplicates;
+    int read_error, start_error;
+    bool pending;
+    uint32_t accepted[MAX_GROUP_CHANNELS], epoch[MAX_GROUP_CHANNELS];
+    RxPathCounters paths;
+  } snapshot{};
+  if (!g_mesh || !mesh_try_lock(pdMS_TO_TICKS(5))) return "Radio busy; retry shortly.\n";
+  snapshot.received = radio_driver.getPacketsRecv();
+  snapshot.errors = radio_driver.getPacketsRecvErrors();
+  snapshot.sent = radio_driver.getPacketsSent();
+  snapshot.start_errors = radio_driver.getRxStartErrors();
+  snapshot.read_error = radio_driver.getLastRxReadError();
+  snapshot.start_error = radio_driver.getLastRxStartError();
+  snapshot.pending = radio_driver.hasPendingReceiveInterrupt();
+  snapshot.gap = s_rx_max_service_gap_ms;
+  snapshot.last_service = s_rx_last_service_ms;
+  snapshot.duplicates = s_rx_channel_duplicates;
+  snapshot.paths = s_rx_paths;
+  memcpy(snapshot.accepted, s_rx_channel_accepted, sizeof(snapshot.accepted));
+  memcpy(snapshot.epoch, s_rx_channel_last_epoch, sizeof(snapshot.epoch));
+  mesh_unlock();
+  char line[320];
+  snprintf(line, sizeof(line), "uptime_s=%lu screen=%s\nreceived=%lu read_errors=%lu last_read_error=%d sent=%lu\nRX_start_errors=%lu last_start_error=%d pending_IRQ=%u\nmax_service_gap_ms=%lu last_service_age_ms=%lu channel_duplicates=%lu\n",
+      (unsigned long)(millis() / 1000), g_screen_awake ? "on" : "off",
+      (unsigned long)snapshot.received, (unsigned long)snapshot.errors, snapshot.read_error,
+      (unsigned long)snapshot.sent, (unsigned long)snapshot.start_errors, snapshot.start_error,
+      snapshot.pending ? 1u : 0u, (unsigned long)snapshot.gap,
+      (unsigned long)(millis() - snapshot.last_service), (unsigned long)snapshot.duplicates);
+  String report(line);
+  report += "Counts since reboot; last_read_error is the last failure, not current radio status.\n";
+  for (int width = 0; width < 3; ++width) {
+    snprintf(line, sizeof(line), "path_hash_bytes=%d group_raw=%lu parsed=%lu decrypted=%lu accepted=%lu\n",
+        width + 1, (unsigned long)snapshot.paths.raw[width],
+        (unsigned long)snapshot.paths.parsed[width], (unsigned long)snapshot.paths.decrypted[width],
+        (unsigned long)snapshot.paths.accepted[width]);
+    report += line;
+  }
+  snprintf(line, sizeof(line), "group_reserved_path=%lu short_metadata=%lu unsupported_payload_version=%lu\n",
+      (unsigned long)snapshot.paths.raw[3], (unsigned long)snapshot.paths.short_metadata,
+      (unsigned long)snapshot.paths.unsupported_version);
+  report += line;
+  for (int i = 0; i < MAX_GROUP_CHANNELS; ++i) {
+    if (!snapshot.accepted[i]) continue;
+    snprintf(line, sizeof(line), "channel=%d accepted=%lu last_receive_epoch=%lu\n", i,
+             (unsigned long)snapshot.accepted[i], (unsigned long)snapshot.epoch[i]);
+    report += line;
+  }
+  return report;
+}
+
 void mesh_set_tx_power_pref(int8_t dbm)               { if (g_uimesh) g_uimesh->setTxPowerPref(dbm); }
 void mesh_set_text_header_bytes(uint8_t bytes)        { if (g_uimesh) g_uimesh->setTextHeaderBytes(bytes); }
 void mesh_set_path_hash_bytes(uint8_t bytes)          { if (g_uimesh) g_uimesh->setPathHashBytes(bytes); }
 uint8_t mesh_get_path_hash_bytes()                    { return g_uimesh ? g_uimesh->getPathHashBytes() : 1; }
 void mesh_send_zero_hop_advert(int delay_ms)           { if (g_uimesh) g_uimesh->sendZeroHopAdvert(delay_ms); }
-uint32_t mesh_send_discover_repeaters()                { return g_uimesh ? g_uimesh->sendDiscoverRepeaters() : 0; }
+uint32_t mesh_send_discover_repeaters() {
+  if (!g_uimesh) return 0;
+#if defined(ESP32)
+  if (!mesh_try_lock(pdMS_TO_TICKS(20))) return 0;
+#endif
+  const uint32_t tag = g_manual_discover_active ? 0 : g_uimesh->sendDiscoverRepeaters();
+#if defined(ESP32)
+  mesh_unlock();
+#endif
+  return tag;
+}
+
+uint32_t mesh_begin_repeater_discovery() {
+  if (!g_uimesh) return 0;
+#if defined(ESP32)
+  if (!mesh_try_lock(pdMS_TO_TICKS(20))) return 0;
+#endif
+  uint32_t tag = 0;
+  if (!g_manual_discover_active) {
+    mesh_clear_discovery_results();
+    g_uimesh->sendFloodAdvert(100);
+    tag = g_uimesh->sendDiscoverRepeaters();
+    g_discover_tag = tag;
+    g_manual_discover_active = tag != 0;
+  }
+#if defined(ESP32)
+  mesh_unlock();
+#endif
+  return tag;
+}
+
+bool mesh_finish_repeater_discovery() {
+#if defined(ESP32)
+  if (!mesh_try_lock(0)) return false;
+#endif
+  g_manual_discover_active = false;
+  g_discover_tag = 0;
+#if defined(ESP32)
+  mesh_unlock();
+#endif
+  return true;
+}
+void mesh_clear_discovery_results() {
+#if defined(ESP32)
+  portENTER_CRITICAL(&s_discovery_mux);
+#endif
+  s_discovery_results.clear();
+#if defined(ESP32)
+  portEXIT_CRITICAL(&s_discovery_mux);
+#endif
+}
+int mesh_get_discovery_results(DiscoveryResult* out, int capacity) {
+#if defined(ESP32)
+  portENTER_CRITICAL(&s_discovery_mux);
+#endif
+  const int count = s_discovery_results.snapshot(out, capacity);
+#if defined(ESP32)
+  portEXIT_CRITICAL(&s_discovery_mux);
+#endif
+  return count;
+}
+bool mesh_get_discovery_result(const uint8_t* key, DiscoveryResult& out) {
+#if defined(ESP32)
+  portENTER_CRITICAL(&s_discovery_mux);
+#endif
+  const bool found = s_discovery_results.find(key, out);
+#if defined(ESP32)
+  portEXIT_CRITICAL(&s_discovery_mux);
+#endif
+  return found;
+}
 void mesh_send_flood_advert(int delay_ms)              { if (g_uimesh) g_uimesh->sendFloodAdvert(delay_ms); }
 void mesh_rename_if_non_empty(const char* name)        { if (g_uimesh) g_uimesh->renameIfNonEmpty(name); }
 int  mesh_join_hashtag_channel(const String& raw)      { return g_uimesh ? g_uimesh->joinHashtagChannel(raw) : -1; }
@@ -3454,7 +4062,7 @@ bool mesh_clear_fixed_position() {
 void mesh_populate_repeater_list() {
   if (!g_uimesh) return;
   g_repeater_count = 0;
-  ContactsIterator it;
+  ContactsIterator it = g_uimesh->startContactsIterator();
   ContactInfo c;
   while (it.hasNext(g_uimesh, c)) {
     if (c.type == ADV_TYPE_REPEATER && g_repeater_count < MAX_DD_ENTRIES) {
@@ -3545,18 +4153,45 @@ int mesh_repeater_request_status(const uint8_t* pub_key) {
   return 0;
 }
 
-int mesh_repeater_request_neighbours(const uint8_t* pub_key) {
-  if (!g_uimesh || !g_repeater_logged_in) return -1;
-  ContactInfo* c = g_uimesh->lookupContactByPubKey(pub_key, 32);
-  if (!c) return -1;
-  uint8_t req[11] = {0x06, 0, 20, 0, 0, 0, 4, 0, 0, 0, 0};
-  uint32_t tag, est_timeout;
-  int result = g_uimesh->sendRequest(*c, req, sizeof(req), tag, est_timeout);
+
+static int request_repeater_neighbours(const uint8_t* pub_key, bool show_map) {
+  if (!g_uimesh || !pub_key || !g_repeater_logged_in ||
+      !mesh_try_lock(pdMS_TO_TICKS(20))) return -1;
+  ContactInfo* contact = g_uimesh->lookupContactByPubKey(pub_key, 32);
+  if (!contact || contact->type != ADV_TYPE_REPEATER) {
+    mesh_unlock();
+    return -1;
+  }
+  uint8_t source[32];
+  char name[32];
+  memcpy(source, contact->id.pub_key, sizeof(source));
+  memcpy(name, contact->name, sizeof(name));
+  name[31] = '\0';
+  // Prefix/SNR snapshot for display only: never add or modify contacts.
+  uint8_t request[11] = {0x06, 0, 20, 0, 0, 0, 4, 0, 0, 0, 0};
+  uint32_t tag = 0, timeout = 60000;
+  const int result = g_uimesh->sendRequest(*contact, request, sizeof(request), tag, timeout);
+  if (result != MSG_SEND_FAILED) {
+    g_neighbours_pending_key = tag;
+    g_selected_repeater = contact;
+  }
+  mesh_unlock();
   if (result == MSG_SEND_FAILED) return -1;
-  g_neighbours_pending_key = tag;
-  g_selected_repeater      = c;
+  // The UI caller already owns LVGL. Web requests do not touch the map.
+  if (show_map) map_show_neighbours(tag, source, name, timeout);
+  if (show_map)
+    Serial.printf("[neighbour-diag] request: version=%u count=%u offset=0 order=%u prefix_bytes=%u; reply header=8 stride=9 (key=4 age=4 SNR=1); compare keys, not names\n",
+                  request[1], request[2], request[5], request[6]);
   repeater_update_monitor("Neighbours request sent, waiting...");
   return 0;
+}
+
+int mesh_repeater_show_neighbours(const uint8_t* pub_key) {
+  return request_repeater_neighbours(pub_key, true);
+}
+
+int mesh_repeater_request_neighbours(const uint8_t* pub_key) {
+  return request_repeater_neighbours(pub_key, false);
 }
 
 int mesh_repeater_send_advert(const uint8_t* pub_key) {

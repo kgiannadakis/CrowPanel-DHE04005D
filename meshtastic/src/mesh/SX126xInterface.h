@@ -33,6 +33,8 @@ template <class T> class SX126xInterface : public RadioLibInterface
     void setTCXOVoltage(float voltage) { tcxoVoltage = voltage; }
 
   protected:
+    void checkRxHealth() override;
+
     float currentLimit = 140; // Higher OCP limit for SX126x PA
     float tcxoVoltage = 0.0;
 
@@ -79,6 +81,14 @@ template <class T> class SX126xInterface : public RadioLibInterface
     uint32_t getPacketTime(uint32_t pl, bool received) override { return computePacketTime(lora, pl, received); }
 
   private:
+    void logRxSettings(const char *context);
+
+#if defined(CROWPANEL_DHE04005D)
+    bool isIdleForRxMaintenance();
+    uint32_t lastRxHealthAttempt = 0;
+    uint32_t rxHealthIntervalMs = 0;
+#endif
+
     /** Some boards require GPIO control of tx vs rx paths */
     void setTransmitEnable(bool txon);
 };

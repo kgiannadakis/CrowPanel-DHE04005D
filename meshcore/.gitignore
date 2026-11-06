@@ -17,3 +17,17 @@ compile_commands.json
 .venv/
 venv/
 platformio.local.ini
+
+# Local device data, analysis output, and generated assets
+/tmp/
+/sdcard/
+/logs/
+/tools/tiles/
+/tools/emoji_atlas_*.bin
+__pycache__/
+*.pyc
+*.log
+*.bak
+*.orig
+dash_cert.pem
+dash_key.pem

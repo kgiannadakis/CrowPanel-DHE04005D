@@ -35,6 +35,22 @@ const lv_font_t *font_16()
     return &font;
 }
 
+const lv_font_t *font_keyboard()
+{
+#if LV_FONT_MONTSERRAT_20
+    static lv_font_t font;
+    static bool initialized = false;
+    if (!initialized) {
+        font = lv_font_montserrat_20;
+        font.fallback = font_16();
+        initialized = true;
+    }
+    return &font;
+#else
+    return font_16();
+#endif
+}
+
 }
 
 #endif

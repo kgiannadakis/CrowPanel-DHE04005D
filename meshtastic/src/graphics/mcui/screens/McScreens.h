@@ -12,6 +12,8 @@ void settings_maybe_show_onboarding();
 void chats_screen_tick();
 
 void nodes_screen_tick();
+void nodes_screen_on_show();
+void nodes_screen_on_hide();
 
 void maps_screen_tick();
 void maps_storage_prewarm();

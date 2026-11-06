@@ -1,18 +1,15 @@
 #pragma once
 // ============================================================
-// map_view.h — Phase 1 map screen
+// map_view.h - Offline map screen and repeater neighbour overlays
 // ------------------------------------------------------------
-// Standalone screen that displays a single hardcoded OSM-format
-// PNG tile loaded from the SD card. The plumbing proves out SD
-// mount + LVGL POSIX-FS driver + PNG decode in one screen; Phase 2
-// adds the multi-tile composite, pan, and zoom.
+// SD-backed OSM tiles with pan/zoom, clustered contact markers, optional
+// names and neighbour link overlays. Radio callbacks deposit bounded data;
+// the LVGL task applies map updates.
 //
 // Tile path convention (matches OSM's slippy-map scheme):
 //   /sdcard/tiles/{z}/{x}/{y}.png
 //
-// Phase 1 displays the Brussels-region tile at zoom 10:
-//   /sdcard/tiles/10/521/343.png
-// See tools/fetch_one_tile.py for how to produce it.
+// See tools/README-maps.md for tile preparation.
 // ============================================================
 
 #ifdef __cplusplus
@@ -33,6 +30,15 @@ void ui_mapscreen_screen_init(void);
 
 // Tear down. Mirrors ui_*screen_destroy helpers elsewhere.
 void ui_mapscreen_screen_destroy(void);
+
+// UI thread starts a view; radio thread only deposits a bounded reply.
+void map_show_neighbours(uint32_t tag, const uint8_t* source, const char* name, uint32_t timeout_ms);
+void map_receive_neighbours(const uint8_t* source, const uint8_t* data, size_t len);
+void map_receive_repeater_position(const uint8_t* source, const char* text);
+void map_record_repeater_advert(const uint8_t* key, const char* name, int32_t lat, int32_t lon, uint32_t timestamp);
+void map_clear_advert_locations(void);
+bool map_get_repeater_advert(const uint8_t* key, char* name, size_t name_size,
+                             int32_t* lat, int32_t* lon, uint32_t* timestamp);
 
 #ifdef __cplusplus
 }

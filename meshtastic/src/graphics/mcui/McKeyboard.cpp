@@ -1,6 +1,7 @@
 #if HAS_TFT && USE_MCUI
 
 #include "McKeyboard.h"
+#include "McTextEdit.h"
 #include "McTheme.h"
 #include "McUI.h"
 
@@ -233,7 +234,7 @@ static void kb_dispatch_key(lv_obj_t *kb, const char *txt)
         return;
     }
     if (strcmp(txt, LV_SYMBOL_OK) == 0) {
-
+        text_edit_close();
         lv_obj_t *ta = (lv_obj_t *)lv_obj_get_user_data(kb);
         if (ta) lv_obj_send_event(ta, LV_EVENT_READY, nullptr);
         return;
@@ -241,17 +242,23 @@ static void kb_dispatch_key(lv_obj_t *kb, const char *txt)
     if (strcmp(txt, LV_SYMBOL_NEW_LINE) == 0) {
 
         lv_obj_t *ta = (lv_obj_t *)lv_obj_get_user_data(kb);
-        if (ta) lv_textarea_add_char(ta, '\n');
+        if (ta && !lv_textarea_get_one_line(ta)) {
+            text_edit_before_key(ta);
+            lv_textarea_add_char(ta, '\n');
+        }
         return;
     }
     if (strcmp(txt, LV_SYMBOL_BACKSPACE) == 0) {
         lv_obj_t *ta = (lv_obj_t *)lv_obj_get_user_data(kb);
-        if (ta) lv_textarea_delete_char(ta);
+        if (ta && !text_edit_before_key(ta)) lv_textarea_delete_char(ta);
         return;
     }
 
     lv_obj_t *ta = (lv_obj_t *)lv_obj_get_user_data(kb);
-    if (ta) lv_textarea_add_text(ta, txt);
+    if (ta) {
+        text_edit_before_key(ta);
+        lv_textarea_add_text(ta, txt);
+    }
     if (s_mode == KB_UC) apply_map(kb, KB_LC);
 }
 
@@ -274,6 +281,14 @@ static void keyboard_layout()
     lv_obj_set_align(s_kb, LV_ALIGN_TOP_LEFT);
     lv_obj_set_size(s_kb, SCR_W, keyboard_height());
     lv_obj_set_pos(s_kb, 0, SCR_H - keyboard_height());
+}
+
+static void keyboard_deleted(lv_event_t *e)
+{
+    if (lv_event_get_current_target(e) != s_kb) return;
+    text_edit_close();
+    s_kb = nullptr;
+    s_visible = false;
 }
 
 lv_obj_t *keyboard_create(lv_obj_t *parent)
@@ -307,7 +322,7 @@ lv_obj_t *keyboard_create(lv_obj_t *parent)
     lv_obj_set_style_bg_color(s_kb, lv_color_hex(TH_INPUT), LV_PART_ITEMS);
     lv_obj_set_style_bg_opa(s_kb, LV_OPA_COVER, LV_PART_ITEMS);
     lv_obj_set_style_text_color(s_kb, lv_color_hex(TH_TEXT), LV_PART_ITEMS);
-    lv_obj_set_style_text_font(s_kb, MCUI_FONT_16, LV_PART_ITEMS);
+    lv_obj_set_style_text_font(s_kb, font_keyboard(), LV_PART_ITEMS);
     lv_obj_set_style_radius(s_kb, 0, LV_PART_ITEMS);
     lv_obj_set_style_border_width(s_kb, 0, LV_PART_ITEMS);
 
@@ -316,13 +331,26 @@ lv_obj_t *keyboard_create(lv_obj_t *parent)
 
     lv_obj_add_event_cb(s_kb, kb_event_cb, LV_EVENT_PRESSED, nullptr);
     lv_obj_add_event_cb(s_kb, kb_event_cb, LV_EVENT_LONG_PRESSED_REPEAT, nullptr);
+    lv_obj_add_event_cb(s_kb, keyboard_deleted, LV_EVENT_DELETE, nullptr);
     lv_obj_add_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
     s_visible = false;
     return s_kb;
 }
 
+static void attached_field_deleted(lv_event_t *e)
+{
+    if (s_kb && lv_obj_get_user_data(s_kb) == lv_event_get_current_target(e))
+        lv_obj_set_user_data(s_kb, nullptr);
+}
+
 void keyboard_attach(lv_obj_t *textarea)
 {
+    if (!keyboard_is_attached_to(textarea)) text_edit_close();
+    if (textarea) {
+        text_edit_register_field(textarea);
+        lv_obj_remove_event_cb(textarea, attached_field_deleted);
+        lv_obj_add_event_cb(textarea, attached_field_deleted, LV_EVENT_DELETE, nullptr);
+    }
     if (s_kb) lv_obj_set_user_data(s_kb, textarea);
 }
 
@@ -337,6 +365,7 @@ void keyboard_show()
 
 void keyboard_hide()
 {
+    text_edit_close();
     if (!s_kb) return;
     lv_obj_t *ta = (lv_obj_t *)lv_obj_get_user_data(s_kb);
     if (ta) lv_obj_remove_state(ta, LV_STATE_FOCUSED);
@@ -345,6 +374,7 @@ void keyboard_hide()
 }
 
 bool keyboard_is_visible() { return s_visible; }
+bool keyboard_is_attached_to(lv_obj_t *textarea) { return s_kb && lv_obj_get_user_data(s_kb) == textarea; }
 lv_obj_t *keyboard_get() { return s_kb; }
 
 }

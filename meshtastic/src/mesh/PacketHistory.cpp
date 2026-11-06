@@ -18,7 +18,7 @@
 
 PacketHistory::PacketHistory(uint32_t size) : recentPacketsCapacity(0) // Initialize members
 {
-    if (size < 4 || size > PACKETHISTORY_MAX) { // Copilot suggested - makes sense
+    if (size < 4 || size > PACKETHISTORY_MAX) {
         LOG_WARN("Packet History - Invalid size %d, using default %d", size, PACKETHISTORY_MAX);
         size = PACKETHISTORY_MAX; // Use default size if invalid
     }

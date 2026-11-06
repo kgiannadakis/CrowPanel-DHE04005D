@@ -3,6 +3,7 @@
 
 #include "ui.h"
 #include "ui_tabbar.h"
+#include "ui_battery.h"
 
 // ── Widget pointers ─────────────────────────────────────────
 
@@ -21,6 +22,9 @@ lv_obj_t * ui_repeatermonitor      = NULL;
 lv_obj_t * ui_rebootbutton         = NULL;
 lv_obj_t * ui_Label26              = NULL;
 lv_obj_t * ui_repeaterpassword     = NULL;
+lv_obj_t * ui_repeaterpasswordoptions = NULL;
+lv_obj_t * ui_repeaterrememberpassword = NULL;
+lv_obj_t * ui_repeatershowpassword = NULL;
 lv_obj_t * ui_Label17              = NULL;
 lv_obj_t * ui_statusbutton         = NULL;
 lv_obj_t * ui_Label19              = NULL;
@@ -128,6 +132,7 @@ void ui_repeaterscreen_screen_init(void) {
     lv_obj_set_style_text_color(title, lv_color_hex(TH_TEXT), 0);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
     lv_obj_center(title);
+    ui_battery_create(hdr);
 
     // ── SCROLLABLE BODY ─────────────────────────────────────
 
@@ -179,9 +184,31 @@ void ui_repeaterscreen_screen_init(void) {
     lv_obj_set_size(ui_repeaterpassword, lv_pct(100), 40);
     lv_textarea_set_one_line(ui_repeaterpassword, true);
     lv_textarea_set_password_mode(ui_repeaterpassword, true);
+    lv_textarea_set_password_show_time(ui_repeaterpassword, 0);
+    lv_textarea_set_max_length(ui_repeaterpassword, 15);
     lv_textarea_set_placeholder_text(ui_repeaterpassword,
                                       LV_SYMBOL_EDIT " Password...");
     style_ta(ui_repeaterpassword);
+
+    ui_repeaterpasswordoptions = lv_obj_create(body);
+    lv_obj_remove_style_all(ui_repeaterpasswordoptions);
+    lv_obj_set_size(ui_repeaterpasswordoptions, lv_pct(100), 38);
+    lv_obj_set_flex_flow(ui_repeaterpasswordoptions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ui_repeaterpasswordoptions, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                         LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(ui_repeaterpasswordoptions, LV_OBJ_FLAG_SCROLLABLE);
+    ui_repeaterrememberpassword = lv_checkbox_create(ui_repeaterpasswordoptions);
+    ui_repeatershowpassword = lv_checkbox_create(ui_repeaterpasswordoptions);
+    lv_checkbox_set_text(ui_repeaterrememberpassword, "Remember Password");
+    lv_checkbox_set_text(ui_repeatershowpassword, "Show Password");
+    lv_obj_t * password_checks[] = {ui_repeaterrememberpassword, ui_repeatershowpassword};
+    for (unsigned i = 0; i < 2; ++i) {
+        lv_obj_set_size(password_checks[i], lv_pct(49), 36);
+        lv_obj_set_style_text_font(password_checks[i], &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(password_checks[i], lv_color_hex(TH_TEXT), 0);
+        lv_obj_set_style_pad_top(password_checks[i], 8, 0);
+    }
+    lv_obj_add_state(ui_repeatershowpassword, LV_STATE_DISABLED);
 
     // ── Login button ────────────────────────────────────────
 
@@ -339,4 +366,7 @@ void ui_repeaterscreen_screen_init(void) {
 
 void ui_repeaterscreen_screen_destroy(void) {
     if (ui_repeaterscreen) { lv_obj_del(ui_repeaterscreen); ui_repeaterscreen = NULL; }
+    ui_repeaterpasswordoptions = NULL;
+    ui_repeaterrememberpassword = NULL;
+    ui_repeatershowpassword = NULL;
 }

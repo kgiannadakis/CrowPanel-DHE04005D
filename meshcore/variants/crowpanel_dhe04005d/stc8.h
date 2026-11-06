@@ -10,6 +10,7 @@
 //
 #include <stdint.h>
 #include <esp_err.h>
+#include "stc8_battery_state.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,14 +29,6 @@ enum {
   STC8_GPIO_OUT_AUDIO_SD,
   STC8_GPIO_OUT_LCD_BL_POWER,
   STC8_GPIO_OUT_MAX,
-};
-
-// Battery charge state reported by the STC8 (EM_BAT_CHARGE_STATE in Elecrow's
-// factory firmware), at battery register offset 9.
-enum {
-  STC8_BAT_DISCHARGING   = 0,
-  STC8_BAT_CHARGING      = 1,
-  STC8_BAT_FULLY_CHARGED = 2,
 };
 
 // Read battery info from the STC8 (I2C 0x2F, register block starting at 0x00).

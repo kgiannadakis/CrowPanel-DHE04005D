@@ -3,15 +3,10 @@
 //       TLS certificate validation is disabled (setInsecure).
 //       This is NOT the official Google Cloud Translation API.
 //
-// Inline drain model, ported verbatim from the DIS02050A (S3) build.
-// An earlier P4 iteration used a dedicated FreeRTOS task with mutex
-// and a webdash-toggle "settle window" to work around AsyncTCP heap
-// contention; that was fragile (mbedtls ALLOC_FAILED under load,
-// stale bubble pointers when chat navigation raced the task) and
-// it's been replaced with the simpler one-per-loop drain. Running
-// the TLS handshake on the Arduino loop() task keeps it serialised
-// with every other consumer of the mbedtls heap, so contention
-// disappears.
+// Queue draining, file updates and UI updates remain on the Arduino
+// task. A single HTTP-only helper lets that task service LoRa while
+// waiting for a network response. It does not advance other network
+// consumers, and the helper never accesses widgets or chat files.
 //
 // Queue entries are now keyed on (chat_key, text) rather than on an
 // lv_obj_t* bubble pointer. This means the queue survives chat
@@ -121,7 +116,7 @@ static inline int q_next(int idx) {
 // translate_request_to_file from either — LVGL task via long-press /
 // load_chat_from_file, main task via on_contact_recv / channel RX.
 // A lightweight mutex makes the enqueue/dequeue indices safe across
-// tasks without reintroducing the old async-worker architecture. On
+// tasks; the HTTP-only helper never touches this queue. On
 // DIS02050A this wasn't needed because LovyanGFX drew LVGL inline and
 // everything ran on a single task.
 static SemaphoreHandle_t s_q_mux = nullptr;
@@ -336,7 +331,6 @@ static bool do_translate_https(const char* text, const char* target_lang, char* 
     }
     http.addHeader("User-Agent", "Mozilla/5.0");
 
-    esp_task_wdt_reset();
     int code = http.GET();
 
     if (code != 200) {
@@ -376,7 +370,6 @@ static bool do_translate_http(const char* text, const char* target_lang, char* r
     }
     http.addHeader("User-Agent", "Mozilla/5.0");
 
-    esp_task_wdt_reset();
     int code = http.GET();
     if (code != 200) {
         Serial.printf("Translate: HTTP %d (http)\n", code);
@@ -395,6 +388,63 @@ static bool do_translate_http(const char* text, const char* target_lang, char* r
 
     utf8_strlcpy(result, (size_t)result_size, translated.c_str());
     return true;
+}
+
+// One outstanding request, published through FreeRTOS semaphores. Fixed
+// buffers avoid borrowing pointers to a chat widget or caller's stack.
+struct TranslationNetworkJob {
+    char text[TRANSLATE_TEXT_MAX];
+    char language[8];
+    char result[TRANSLATE_TEXT_MAX];
+    bool plain_http;
+    bool ok;
+};
+static TranslationNetworkJob s_network_job = {};
+static SemaphoreHandle_t s_network_start = nullptr;
+static SemaphoreHandle_t s_network_done = nullptr;
+static TaskHandle_t s_network_task = nullptr;
+
+static void translation_network_task(void*) {
+    for (;;) {
+        xSemaphoreTake(s_network_start, portMAX_DELAY);
+        s_network_job.ok = s_network_job.plain_http
+            ? do_translate_http(s_network_job.text, s_network_job.language,
+                                s_network_job.result, sizeof(s_network_job.result))
+            : do_translate_https(s_network_job.text, s_network_job.language,
+                                 s_network_job.result, sizeof(s_network_job.result));
+        xSemaphoreGive(s_network_done);
+    }
+}
+
+static bool ensure_translation_network_task() {
+    if (s_network_task) return true;
+    if (!s_network_start) s_network_start = xSemaphoreCreateBinary();
+    if (!s_network_done) s_network_done = xSemaphoreCreateBinary();
+    if (!s_network_start || !s_network_done) return false;
+    // Created lazily, before the memory guard, so TLS headroom includes
+    // this internal-RAM stack. The idle helper blocks without polling.
+    return xTaskCreate(translation_network_task, "translate-http", 12288,
+                       nullptr, 1, &s_network_task) == pdPASS;
+}
+
+static bool translate_with_radio_service(const char* text, const char* language,
+                                        bool plain_http, char* result, size_t size,
+                                        void (*service_radio)()) {
+    strlcpy(s_network_job.text, text, sizeof(s_network_job.text));
+    strlcpy(s_network_job.language, language, sizeof(s_network_job.language));
+    s_network_job.plain_http = plain_http;
+    s_network_job.ok = false;
+    s_network_job.result[0] = '\0';
+    xSemaphoreGive(s_network_start);
+    // Never abandon a running job: the helper must finish before its
+    // buffers can be reused or another main-loop TLS consumer can run.
+    while (xSemaphoreTake(s_network_done, pdMS_TO_TICKS(5)) != pdTRUE) {
+        if (service_radio) service_radio();
+        esp_task_wdt_reset();
+    }
+    if (service_radio) service_radio();
+    if (s_network_job.ok) strlcpy(result, s_network_job.result, size);
+    return s_network_job.ok;
 }
 
 #endif // ESP32
@@ -483,9 +533,7 @@ void translate_init() {
 #if defined(ESP32)
     if (!s_q_mux) s_q_mux = xSemaphoreCreateMutex();
 #endif
-    // Language / g_auto_translate_enabled settings are loaded by
-    // persistence.cpp. There's no worker task to spawn — translate_loop
-    // runs directly off the main Arduino loop.
+    // HTTP helper is allocated lazily only when a translation is queued.
 }
 
 static void translate_request_enqueue(const char* text, const char* chat_key, bool manual) {
@@ -601,7 +649,7 @@ void translate_request_manual_to_file(const char* text, const char* chat_key) {
     translate_request_enqueue(text, chat_key, true);
 }
 
-void translate_loop() {
+void translate_loop(void (*service_radio)()) {
 #if defined(ESP32)
     if (!g_wifi_connected || WiFi.status() != WL_CONNECTED) return;
 
@@ -623,6 +671,15 @@ void translate_loop() {
     const uint32_t now_ms = millis();
     if (!peek.manual && (int32_t)(now_ms - s_translate_backoff_until_ms) < 0) return;
     if (now_ms - s_last_attempt_ms < (peek.manual ? 250UL : 500UL)) return;
+
+    static uint32_t network_retry_ms = 0;
+    if (!s_network_task && (int32_t)(now_ms - network_retry_ms) < 0) return;
+    if (!ensure_translation_network_task()) {
+        s_last_attempt_ms = now_ms;
+        network_retry_ms = now_ms + 15000UL;
+        Serial.println("Translate: HTTP helper unavailable; request kept queued");
+        return;
+    }
 
     // --- Memory guard -------------------------------------------------
     // HTTPS/TLS needs much more contiguous internal/DMA heap than plain HTTP.
@@ -698,9 +755,8 @@ void translate_loop() {
         s_translate_http_fallback_until_ms = 0;
         use_http_for_this = false;
     }
-    const bool ok = use_http_for_this
-                      ? do_translate_http(req.text, lang, result, sizeof(result))
-                      : do_translate_https(req.text, lang, result, sizeof(result));
+    const bool ok = translate_with_radio_service(req.text, lang, use_http_for_this,
+                                                result, sizeof(result), service_radio);
     if (!ok) {
         // Exponential-ish backoff to reduce TLS/SDIO pressure on repeated fails.
         if (s_translate_fail_streak < 6) s_translate_fail_streak++;
@@ -750,202 +806,3 @@ void translate_loop() {
     if (req.manual) serialmon_append("Translate done");
 #endif
 }
-
-#if 0
-void translate_request_to_file_old_dead_code(const char* text, const char* chat_key) {
-    if (!text || !text[0]) return;
-    if (!chat_key || !chat_key[0]) return;
-
-    char safe_text[TRANSLATE_TEXT_MAX];
-    {
-        String cleaned = sanitize_for_font_string(text, &lv_font_montserrat_14);
-        // Bound request length before queueing/networking to reduce heap churn.
-        if (cleaned.length() >= (TRANSLATE_TEXT_MAX - 1)) {
-            cleaned = cleaned.substring(0, TRANSLATE_TEXT_MAX - 1);
-        }
-        utf8_strlcpy(safe_text, sizeof(safe_text), cleaned.c_str());
-    }
-    if (!safe_text[0]) return;
-
-    bool queued = false;
-    bool full   = false;
-    bool dropped_oldest = false;
-
-    q_lock();
-    // Dedup + enqueue under one critical section. Producers call from
-    // either the LVGL task (long-press, load_chat_from_file Layer C)
-    // or the main Arduino task (on_contact_recv, channel RX); without
-    // this lock the head/tail indices can tear and the dedup scan can
-    // observe an inconsistent snapshot.
-    bool duplicate = false;
-    for (int i = s_queue_tail; i != s_queue_head; i = (i + 1) % TRANSLATE_QUEUE_SIZE) {
-        if (strcmp(s_queue[i].chat_key, chat_key) == 0 &&
-            strcmp(s_queue[i].text, safe_text) == 0) {
-            duplicate = true;
-            break;
-        }
-    }
-    if (!duplicate) {
-        int next = (s_queue_head + 1) % TRANSLATE_QUEUE_SIZE;
-        if (next == s_queue_tail) {
-            // Queue full: drop oldest to keep freshest incoming context.
-            s_queue_tail = (s_queue_tail + 1) % TRANSLATE_QUEUE_SIZE;
-            dropped_oldest = true;
-            full = true;
-        }
-        TranslateRequest& req = s_queue[s_queue_head];
-        strncpy(req.chat_key, chat_key, sizeof(req.chat_key) - 1);
-        req.chat_key[sizeof(req.chat_key) - 1] = '\0';
-        utf8_strlcpy(req.text, sizeof(req.text), safe_text);
-        s_queue_head = (s_queue_head + 1) % TRANSLATE_QUEUE_SIZE;
-        queued = true;
-    }
-    q_unlock();
-
-    if (!queued) return;
-    if (dropped_oldest || full) Serial.println("Translate: queue full, dropped oldest");
-
-    static uint32_t s_last_queue_log_ms = 0;
-    uint32_t now_q = millis();
-    if (now_q - s_last_queue_log_ms > 2000) {
-        s_last_queue_log_ms = now_q;
-        Serial.printf("Translate: queued '%.40s' -> %s\n",
-                      safe_text, translate_lang_code(g_translate_lang_idx));
-    }
-}
-
-void translate_loop() {
-#if defined(ESP32)
-    if (!g_wifi_connected || WiFi.status() != WL_CONNECTED) return;
-
-    // Peek the queue first without dequeuing. If empty, we skip the
-    // rate-limit + heap-probe work (heap_caps_get_free_size walks a
-    // free-block list) — this function runs on every main-loop tick.
-    q_lock();
-    const bool queue_empty = (s_queue_head == s_queue_tail);
-    q_unlock();
-    if (queue_empty) return;
-
-    // --- Rate limit / backoff -----------------------------------------
-    // Cap translate to at most one TLS handshake per 500 ms. Each
-    // handshake needs ~30-40 KB of contiguous DMA-capable internal
-    // SRAM for mbedtls AES. Back-to-back handshakes race SDIO RX for
-    // the same memory pool and can push us into OOM → the sdio_drv
-    // sdio_rx_get_buffer assert that crashed the device when a big
-    // chat-open enqueued 15 messages at once. 500 ms gives WiFi stack
-    // + SDIO time to refill their buffers between ours.
-    static uint32_t s_last_attempt_ms = 0;
-    const uint32_t now_ms = millis();
-    if ((int32_t)(now_ms - s_translate_backoff_until_ms) < 0) return;
-    if (now_ms - s_last_attempt_ms < 500) return;
-
-    // --- Memory guard -------------------------------------------------
-    // Skip this tick if DMA-capable internal SRAM is too low to safely
-    // run a TLS handshake. 48 KB covers the common mbedtls peak with
-    // headroom so we don't try-and-fail (which fragments the heap).
-    const size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA);
-    const size_t int_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    const size_t dma_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
-    const size_t int_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-    const bool mem_too_low =
-        (dma_free < 48 * 1024 || int_free < 72 * 1024 ||
-         dma_largest < 28 * 1024 || int_largest < 28 * 1024);
-    if (mem_too_low) {
-        static uint32_t s_last_warn_ms = 0;
-        if (s_translate_mem_blocked_since_ms == 0) s_translate_mem_blocked_since_ms = now_ms;
-        if (now_ms - s_last_warn_ms > 15000) {
-            Serial.printf("Translate: low mem skip dma=%u int=%u dma_lg=%u int_lg=%u\n",
-                          (unsigned)dma_free, (unsigned)int_free,
-                          (unsigned)dma_largest, (unsigned)int_largest);
-            s_last_warn_ms = now_ms;
-        }
-        s_translate_mem_blocked = true;
-        if ((now_ms - s_translate_mem_blocked_since_ms) > 60000UL) {
-            s_translate_http_fallback = true;
-            s_translate_http_fallback_until_ms = now_ms + 120000UL;
-        }
-        // Brief cooling window to avoid tight-loop probing when memory is low.
-        s_translate_backoff_until_ms = now_ms + 1500;
-        return;
-    }
-    if (s_translate_mem_blocked) {
-        Serial.printf("Translate: mem recovered dma=%u int=%u dma_lg=%u int_lg=%u\n",
-                      (unsigned)dma_free, (unsigned)int_free,
-                      (unsigned)dma_largest, (unsigned)int_largest);
-        s_translate_mem_blocked = false;
-        s_translate_mem_blocked_since_ms = 0;
-        s_translate_http_fallback = false;
-        s_translate_http_fallback_until_ms = 0;
-    }
-
-    // Now actually dequeue — we know we can proceed.
-    TranslateRequest req;
-    bool have = false;
-    q_lock();
-    if (s_queue_head != s_queue_tail) {
-        req = s_queue[s_queue_tail];
-        s_queue_tail = (s_queue_tail + 1) % TRANSLATE_QUEUE_SIZE;
-        have = true;
-    }
-    q_unlock();
-    if (!have) return;  // Race: enqueue drained between peek and dequeue.
-
-    s_last_attempt_ms = now_ms;  // We committed — start the rate-limit timer.
-
-    const char* lang = translate_lang_code(g_translate_lang_idx);
-
-    char result[TRANSLATE_TEXT_MAX];
-    esp_task_wdt_reset();
-    if (s_translate_http_fallback &&
-        (int32_t)(now_ms - s_translate_http_fallback_until_ms) >= 0) {
-        s_translate_http_fallback = false;
-        s_translate_http_fallback_until_ms = 0;
-    }
-    const bool ok = s_translate_http_fallback
-                      ? do_translate_http(req.text, lang, result, sizeof(result))
-                      : do_translate_https(req.text, lang, result, sizeof(result));
-    if (!ok) {
-        // Exponential-ish backoff to reduce TLS/SDIO pressure on repeated fails.
-        if (s_translate_fail_streak < 6) s_translate_fail_streak++;
-        uint32_t backoff_ms = 1000u << (s_translate_fail_streak - 1);  // 1s..32s
-        if (backoff_ms > 12000u) backoff_ms = 12000u;
-        s_translate_backoff_until_ms = now_ms + backoff_ms;
-        if (!s_translate_http_fallback && s_translate_fail_streak >= 3) {
-            s_translate_http_fallback = true;
-            s_translate_http_fallback_until_ms = now_ms + 120000UL;
-        }
-        Serial.printf("Translate: fail streak=%u backoff=%lums mode=%s\n",
-                      (unsigned)s_translate_fail_streak,
-                      (unsigned long)backoff_ms,
-                      s_translate_http_fallback ? "http" : "https");
-        return;
-    }
-    s_translate_fail_streak = 0;
-    s_translate_backoff_until_ms = 0;
-
-    // Google returns the source verbatim for no-op translations (e.g.
-    // the user's target language matches the already-typed language).
-    // Skip persistence in that case — there's nothing to show.
-    if (strcmp(result, req.text) == 0) return;
-
-    // Always persist to disk, keyed by body-text match so that the
-    // translation lands on the correct RX line even when multiple
-    // untranslated messages are pending.
-    append_translation_to_last_rx(String(req.chat_key), req.text, result);
-
-    // If the user is currently viewing this chat, update the visible
-    // bubble in place so the translation appears without needing a
-    // chat reload. Take lvgl_lock FIRST, then check g_current_chat_key
-    // under the lock — every writer to that key (load_chat_from_file,
-    // exit_chat_mode, delete-confirm) runs from LVGL event callbacks
-    // under lvgl_lock, so this check is race-free.
-    if (lvgl_lock(100)) {
-        if (strcmp(g_current_chat_key, req.chat_key) == 0) {
-            lv_obj_t* bubble = find_bubble_for_source(req.text);
-            if (bubble) attach_translation_label(bubble, result);
-        }
-        lvgl_unlock();
-    }
-#endif
-}
-#endif

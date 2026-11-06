@@ -8,6 +8,8 @@
 #include "display.h"
 #include "persistence.h"
 #include "mesh_api.h"
+#include "repeater_credentials.h"
+#include "map_view.h"
 
 #include <lvgl.h>
 
@@ -30,6 +32,79 @@ static bool    s_selected_repeater_pubkey_set = false;
 // Copied name snapshot — readable from any task / endpoint without
 // dereferencing g_selected_repeater. See repeater_get_selected_name().
 static char    s_selected_repeater_name[32]  = {0};
+
+static bool s_password_using_saved = false;
+static bool s_password_setting_text = false;
+static_assert(sizeof(g_login_last_pw) == RepeaterPassword::kBufferBytes,
+              "Saved passwords and login retry buffer must match the wire limit");
+
+static void repeater_password_mask() {
+  if (ui_repeatershowpassword) lv_obj_clear_state(ui_repeatershowpassword, LV_STATE_CHECKED);
+  if (ui_repeaterpassword) {
+    lv_textarea_set_password_show_time(ui_repeaterpassword, 0);
+    lv_textarea_set_password_mode(ui_repeaterpassword, true);
+  }
+}
+
+static void repeater_password_restore() {
+  char saved[RepeaterPassword::kBufferBytes];
+  s_password_using_saved = s_selected_repeater_pubkey_set
+      && repeater_password_load(s_selected_repeater_pubkey, saved);
+  memset(saved, 0, sizeof(saved));
+  repeater_password_mask();
+  s_password_setting_text = true;
+  if (ui_repeaterpassword) {
+    // A remembered secret is NEVER copied into an editable/revealable widget.
+    lv_textarea_set_text(ui_repeaterpassword, "");
+    lv_textarea_set_placeholder_text(ui_repeaterpassword,
+        s_password_using_saved ? "Password saved" : "Password...");
+  }
+  s_password_setting_text = false;
+  if (ui_repeaterrememberpassword) {
+    if (s_password_using_saved) lv_obj_add_state(ui_repeaterrememberpassword, LV_STATE_CHECKED);
+    else lv_obj_clear_state(ui_repeaterrememberpassword, LV_STATE_CHECKED);
+  }
+  if (ui_repeatershowpassword) lv_obj_add_state(ui_repeatershowpassword, LV_STATE_DISABLED);
+}
+
+static void cb_repeater_pw_changed(lv_event_t*) {
+  if (s_password_setting_text || !ui_repeaterpassword) return;
+  s_password_using_saved = false;
+  lv_textarea_set_placeholder_text(ui_repeaterpassword, "Password...");
+  const bool has_text = lv_textarea_get_text(ui_repeaterpassword)[0] != '\0';
+  if (ui_repeatershowpassword) {
+    if (has_text) lv_obj_clear_state(ui_repeatershowpassword, LV_STATE_DISABLED);
+    else {
+      repeater_password_mask();
+      lv_obj_add_state(ui_repeatershowpassword, LV_STATE_DISABLED);
+    }
+  }
+}
+
+static void cb_repeater_pw_show(lv_event_t*) {
+  if (!ui_repeaterpassword || !ui_repeatershowpassword) return;
+  const bool reveal = RepeaterPassword::canReveal(s_password_using_saved,
+      lv_textarea_get_text(ui_repeaterpassword)[0] != '\0',
+      lv_obj_has_state(ui_repeatershowpassword, LV_STATE_CHECKED));
+  lv_textarea_set_password_mode(ui_repeaterpassword, !reveal);
+}
+
+static void cb_repeater_pw_remember(lv_event_t*) {
+  if (!ui_repeaterrememberpassword || !s_selected_repeater_pubkey_set) return;
+  if (!lv_obj_has_state(ui_repeaterrememberpassword, LV_STATE_CHECKED)) {
+    if (!repeater_password_forget(s_selected_repeater_pubkey)) {
+      lv_obj_add_state(ui_repeaterrememberpassword, LV_STATE_CHECKED);
+      repeater_update_monitor("Could not forget saved password. Try again.");
+      return;
+    }
+    s_password_using_saved = false;
+    if (ui_repeaterpassword) lv_textarea_set_placeholder_text(ui_repeaterpassword, "Password...");
+  }
+}
+
+static void cb_repeater_pw_screen_unloaded(lv_event_t*) {
+  repeater_password_restore();
+}
 
 // Sticky repeater cache so manually-discovered repeaters do not vanish
 // from the dropdown as soon as the live contact array churns.
@@ -210,6 +285,7 @@ void repeater_cli_handle_response(const uint8_t* sender_pubkey, const char* text
 
 static void cli_mode_enter() {
   if (s_cli_mode) return;
+  repeater_password_mask();
   s_cli_mode = true;
   // Initialise the terminal buffer with a header so the user knows
   // they're in CLI mode.
@@ -222,6 +298,7 @@ static void cli_mode_enter() {
   // Swap the password textarea for the CLI textarea.
   if (ui_repeaterpassword)  lv_obj_add_flag(ui_repeaterpassword,    LV_OBJ_FLAG_HIDDEN);
   if (ui_repeaterloginbutton) lv_obj_add_flag(ui_repeaterloginbutton, LV_OBJ_FLAG_HIDDEN);
+  if (ui_repeaterpasswordoptions) lv_obj_add_flag(ui_repeaterpasswordoptions, LV_OBJ_FLAG_HIDDEN);
   if (ui_repeatercliinput) {
     lv_obj_clear_flag(ui_repeatercliinput, LV_OBJ_FLAG_HIDDEN);
     lv_textarea_set_text(ui_repeatercliinput, "");
@@ -241,6 +318,7 @@ static void cli_mode_exit() {
   if (ui_Keyboard3)           lv_keyboard_set_textarea(ui_Keyboard3, nullptr);
   if (ui_repeaterpassword)    lv_obj_clear_flag(ui_repeaterpassword,    LV_OBJ_FLAG_HIDDEN);
   if (ui_repeaterloginbutton) lv_obj_clear_flag(ui_repeaterloginbutton, LV_OBJ_FLAG_HIDDEN);
+  if (ui_repeaterpasswordoptions) lv_obj_clear_flag(ui_repeaterpasswordoptions, LV_OBJ_FLAG_HIDDEN);
   set_btn_text(ui_clibutton, "CLI");
   // Keep the terminal text on the monitor so the user can read what
   // came back. The next Status/Advert/etc click will overwrite it.
@@ -260,7 +338,7 @@ void clear_channel_receipt_poll() {
 int count_zero_hop_repeaters() {
   if (!g_mesh) return 0;
   int count = 0;
-  ContactsIterator it;
+  ContactsIterator it = g_mesh->startContactsIterator();
   ContactInfo c;
   while (it.hasNext(g_mesh, c)) {
     if (c.type == ADV_TYPE_REPEATER && c.out_path_len == 0)
@@ -315,7 +393,7 @@ void repeater_populate_dropdown() {
     ++g_repeater_count;
   };
 
-  ContactsIterator it;
+  ContactsIterator it = g_mesh->startContactsIterator();
   ContactInfo c;
   while (it.hasNext(g_mesh, c)) {
     if (c.type != ADV_TYPE_REPEATER) continue;
@@ -355,11 +433,15 @@ void repeater_populate_dropdown() {
     }
   }
 
-  static char opts[MAX_DD_ENTRIES * 36];
+  static char opts[MAX_DD_ENTRIES * 64];
   opts[0] = '\0';
   for (int i = 0; i < g_repeater_count; i++) {
-    char row[40];
-    if (live_flags[i]) {
+    char row[64];
+    DiscoveryResult signal;
+    if (mesh_get_discovery_result(g_repeater_list[i].pub_key, signal)) {
+      snprintf(row, sizeof(row), "%s%s | %.1f dBm", g_repeater_list[i].name,
+               live_flags[i] ? "" : " *", signal.rssi);
+    } else if (live_flags[i]) {
       snprintf(row, sizeof(row), "%s", g_repeater_list[i].name);
     } else {
       snprintf(row, sizeof(row), "%s *", g_repeater_list[i].name);
@@ -433,6 +515,7 @@ void repeater_reset_state() {
   g_login_last_pw[0]       = '\0';
   g_status_pending_key     = 0;
   g_neighbours_pending_key = 0;
+  repeater_password_restore();
 }
 
 void repeater_reset_login() {
@@ -484,14 +567,22 @@ static void cb_repeater_dropdown_changed(lv_event_t*) {
   memset(g_login_pending_key, 0, 4);
   repeater_set_action_buttons_visible(false);
   repeater_set_path_button_visible(g_selected_repeater != nullptr);
-  if (ui_repeaterpassword) lv_textarea_set_text(ui_repeaterpassword, "");
-  char msg[96];
+  repeater_password_restore();
+  char msg[256];
   if (g_selected_repeater) {
     snprintf(msg, sizeof(msg), "Selected: %s\nEnter password to login.",
              g_repeater_list[sel].name);
   } else {
     snprintf(msg, sizeof(msg), "Selected: %s\nNot currently heard.\nRun discovery first.",
              g_repeater_list[sel].name);
+  }
+  DiscoveryResult signal;
+  if (mesh_get_discovery_result(s_selected_repeater_pubkey, signal)) {
+    size_t used = strlen(msg);
+    snprintf(msg + used, sizeof(msg) - used,
+             "\nLast scan RX: %.1f dBm | SNR: %+.2f dB\nRequest SNR: %+.2f dB | Replies: %u",
+             signal.rssi, signal.rx_snr_x4 / 4.0f, signal.request_snr_x4 / 4.0f,
+             (unsigned)signal.replies);
   }
   repeater_update_monitor(msg);
 }
@@ -509,6 +600,34 @@ static void cb_repeater_login(lv_event_t*) {
     repeater_update_monitor("Repeater no longer in contacts.");
     return;
   }
+  char password[RepeaterPassword::kBufferBytes] = {};
+  const char* typed = ui_repeaterpassword ? lv_textarea_get_text(ui_repeaterpassword) : "";
+  if (s_password_using_saved) {
+    if (!repeater_password_load(s_selected_repeater_pubkey, password)) {
+      repeater_password_restore();
+      repeater_update_monitor("Saved password unavailable. Enter it again.");
+      return;
+    }
+  } else {
+    if (strlen(typed) > RepeaterPassword::kMaxBytes) {
+      repeater_update_monitor("Password must be at most 15 UTF-8 bytes.");
+      return;
+    }
+    memcpy(password, typed, strlen(typed));
+  }
+  const bool remember = ui_repeaterrememberpassword
+      && lv_obj_has_state(ui_repeaterrememberpassword, LV_STATE_CHECKED);
+  const bool stored = remember ? repeater_password_save(s_selected_repeater_pubkey, password)
+                               : repeater_password_forget(s_selected_repeater_pubkey);
+  if (!stored) {
+    memset(password, 0, sizeof(password));
+    repeater_update_monitor("Could not update saved password. Check storage and try again.");
+    return;
+  }
+  memcpy(g_login_last_pw, password, sizeof(password));
+  memset(password, 0, sizeof(password));
+  const char* pw = g_login_last_pw;
+  repeater_password_restore();
   kb_hide(ui_Keyboard3, ui_repeaterpassword);
 
   if (ui_repeaterloginbutton) {
@@ -519,11 +638,6 @@ static void cb_repeater_login(lv_event_t*) {
     }, 3000, nullptr);
     (void)t;
   }
-
-  const char* pw = "";
-  if (ui_repeaterpassword) pw = lv_textarea_get_text(ui_repeaterpassword);
-  strncpy(g_login_last_pw, pw, sizeof(g_login_last_pw) - 1);
-  g_login_last_pw[sizeof(g_login_last_pw) - 1] = '\0';
 
   // Only do pre-login discovery when we genuinely don't have a path.
   // If a usable route already exists, forcing discovery each login adds
@@ -616,20 +730,7 @@ static void cb_repeater_neighbours(lv_event_t*) {
     repeater_update_monitor("Repeater no longer in contacts.");
     return;
   }
-  uint8_t req[11];
-  req[0] = 0x06;
-  req[1] = 0;
-  req[2] = 20;
-  req[3] = 0; req[4] = 0;
-  req[5] = 0;
-  req[6] = 4;
-  req[7] = 0; req[8] = 0; req[9] = 0; req[10] = 0;
-  uint32_t tag, est_timeout;
-  int result = g_mesh->sendRequest(*g_selected_repeater, req, sizeof(req), tag, est_timeout);
-  if (result != MSG_SEND_FAILED) {
-    g_neighbours_pending_key = tag;
-    repeater_update_monitor("Neighbours request sent, waiting...");
-  } else {
+  if (mesh_repeater_show_neighbours(s_selected_repeater_pubkey) != 0) {
     repeater_update_monitor("Neighbours request failed to send.");
   }
 }
@@ -723,6 +824,7 @@ void repeater_cli_hide_keyboard() {
 // DEFOCUSED never fires on a background tap; instead we geometry-test the press
 // against the keyboard + input rects and request a deferred dismiss.
 void repeater_cli_dismiss_kb_if_outside(int x, int y) {
+  if (kb_edit_touch_contains(x, y)) return;
   if (!s_cli_mode || !ui_Keyboard3) return;
   if (lv_obj_has_flag(ui_Keyboard3, LV_OBJ_FLAG_HIDDEN)) return;
 
@@ -774,7 +876,14 @@ void setup_repeater_screen_callbacks() {
     lv_obj_add_event_cb(ui_repeaterpassword, cb_repeater_pw_focused,   LV_EVENT_FOCUSED,   nullptr);
     lv_obj_add_event_cb(ui_repeaterpassword, cb_repeater_pw_focused,   LV_EVENT_CLICKED,   nullptr);
     lv_obj_add_event_cb(ui_repeaterpassword, cb_repeater_pw_defocused, LV_EVENT_DEFOCUSED, nullptr);
+    lv_obj_add_event_cb(ui_repeaterpassword, cb_repeater_pw_changed, LV_EVENT_VALUE_CHANGED, nullptr);
   }
+  if (ui_repeaterrememberpassword)
+    lv_obj_add_event_cb(ui_repeaterrememberpassword, cb_repeater_pw_remember, LV_EVENT_VALUE_CHANGED, nullptr);
+  if (ui_repeatershowpassword)
+    lv_obj_add_event_cb(ui_repeatershowpassword, cb_repeater_pw_show, LV_EVENT_VALUE_CHANGED, nullptr);
+  if (ui_repeaterscreen)
+    lv_obj_add_event_cb(ui_repeaterscreen, cb_repeater_pw_screen_unloaded, LV_EVENT_SCREEN_UNLOAD_START, nullptr);
 
   if (ui_repeaterloginbutton)
     lv_obj_add_event_cb(ui_repeaterloginbutton,  cb_repeater_login,      LV_EVENT_CLICKED, nullptr);
@@ -818,6 +927,7 @@ void cb_repeater_screen_loaded(lv_event_t*) {
   if (!login_pending && !g_repeater_logged_in && !s_selected_repeater_pubkey_set)
     repeater_reset_login();
   repeater_populate_dropdown();
+  repeater_password_restore();
   if (s_selected_repeater_pubkey_set) {
     // Keep context sticky when user leaves/re-enters repeater screen.
     g_selected_repeater = g_mesh ? g_mesh->lookupContactByPubKey(s_selected_repeater_pubkey, 32) : nullptr;

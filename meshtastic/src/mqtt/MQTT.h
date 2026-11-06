@@ -6,6 +6,7 @@
 #include "concurrency/OSThread.h"
 #include "mesh/Channels.h"
 #include "mesh/generated/meshtastic/mqtt.pb.h"
+#include <memory>
 #if !defined(ARCH_NRF52) || NRF52_USE_JSON
 #include "serialization/JSON.h"
 #endif
@@ -15,12 +16,23 @@
 #include <WiFiClientSecure.h>
 #endif
 #if defined(ARCH_ESP32P4) && defined(CROWPANEL_DHE04005D) && !defined(ARCH_PORTDUINO)
+#include "MqttFrameBuffer.h"
 class CrowPanelMqttClient : public WiFiClient
 {
   public:
     size_t write(uint8_t data) override;
     size_t write(const uint8_t *buf, size_t size) override;
+    int available() override;
+    int read() override;
+    int read(uint8_t *buf, size_t size) override;
+    int peek() override;
+    uint8_t connected() override;
+    void stop() override;
     using WiFiClient::write;
+
+  private:
+    MqttFrameBuffer<1024> rxFrame;
+    uint32_t rxFrameStartedMs = 0;
 };
 #endif
 #endif
@@ -65,8 +77,6 @@ class MQTT : private concurrency::OSThread
      * MQTT is disabled / proxied / no link is wanted. */
     void prewarmConnect();
 
-    void pausePublicDownlink(uint32_t durationMs, const char *reason);
-
     bool publish(const char *topic, const char *payload, bool retained);
 
     bool publish(const char *topic, const uint8_t *payload, size_t length, const bool retained);
@@ -87,8 +97,14 @@ class MQTT : private concurrency::OSThread
     struct QueueEntry {
         std::string topic;
         std::basic_string<uint8_t> envBytes; // binary/pb_encode_to_bytes ServiceEnvelope
+        bool binaryPublished = false;
+#if !defined(ARCH_NRF52) || NRF52_USE_JSON
+        std::string jsonPublishTopic;
+        std::string jsonPayload;
+#endif
     };
     PointerQueue<QueueEntry> mqttQueue;
+    std::unique_ptr<QueueEntry> pendingPublish;
 
     int reconnectCount = 0;
     bool isConfiguredForDefaultServer = true;

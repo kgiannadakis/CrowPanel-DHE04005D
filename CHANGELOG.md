@@ -5,6 +5,44 @@ documented in this file. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 follows simple `MAJOR.MINOR` versioning that matches the GitHub releases.
 
+## [Unreleased]
+
+### Changed
+
+- Added a CrowPanel-specific Meshtastic entry guide and portable policy-test
+  runner, and included Meshtastic documentation and policy coverage in the root
+  publishing checks. Firmware runtime behavior is unchanged by this preparation.
+- Removed stale machine-specific build notes and moved development guidance into
+  the component's developer guide.
+- Reorganized user/developer documentation, installation instructions and the
+  screenshot gallery, with one publishing checklist and component license notes.
+- Made the full-install helper importable and portable, added a read-only
+  `--dry-run`, and rejected mismatched partition tables and ambiguous image inputs.
+- Added repository/tooling tests and read-only GitHub CI checks with pinned actions.
+- Removed unreferenced loose boot/partition binaries, a duplicate component
+  manifest backup and an upstream-only CNAME.
+
+- Neighbour map requests no longer import or prioritise repeaters in the saved
+  list. Untouched generated placeholders are cleaned up on boot; map links are
+  solid black and originate at the logged-in repeater.
+- Documented the active CrowPanel MeshCore build, source ownership, feature
+  limitations, and pre-publish verification workflow.
+- Added a single command for Python source checks and C++ policy assertions.
+- Removed retired HTTPS/certificate artifacts, prototype backups, disabled
+  duplicate implementations, and unused monochrome font copies from the P4 app.
+- Kept local device data and temporary analysis output out of Git.
+- Consolidated identical emoji atlases under `docs/`, removing duplicate
+  generated copies from the tools directory.
+- Corrected the README's MeshCore flash offset to match the partition tables.
+
+### Fixed
+
+- Removed RGB bounce refills that could access cached PSRAM from an IRAM-safe
+  interrupt during flash writes. LCD timing and radio settings are unchanged;
+  direct-DMA visual/wake behavior still needs hardware stress verification.
+- Standardized chat-flush render/queue lock ordering and serialized contact
+  replacement with UI history work, with additional retained crash breadcrumbs.
+
 ## [2.0] - 2026-07-11
 
 This is a major revision. **Erase the device completely before flashing Version 2.0.**

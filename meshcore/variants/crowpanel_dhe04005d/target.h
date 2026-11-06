@@ -15,3 +15,7 @@ bool     radio_init();
 void     radio_set_params(float freq_mhz, float bw_khz, uint8_t sf, uint8_t cr);
 void     radio_set_tx_power(int8_t dbm);
 uint32_t radio_get_rng_seed();
+
+enum class RxGainCheck { Deferred, Verified, Restored, Failed };
+// Caller holds the mesh mutex. Never stops RX or checks during TX/a packet.
+RxGainCheck radio_verify_rx_gain(int16_t& error);

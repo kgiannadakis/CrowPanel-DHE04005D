@@ -3,6 +3,7 @@
 // ============================================================
 
 #include "home_ui.h"
+#include "crash_diagnostics.h"
 #include "chat_ui.h"
 #include "utils.h"
 #include "persistence.h"
@@ -458,8 +459,8 @@ void ui_refresh_targets() {
   }
 
   ContactInfo c;
-  for (uint32_t i=0; i<(uint32_t)g_mesh->getNumContacts(); i++) {
-    if (!g_mesh->getContactByIdx(i, c)) continue;
+  ContactsIterator contacts_it = g_mesh->startContactsIterator();
+  while (contacts_it.hasNext(g_mesh, c)) {
     if (c.name[0] == 0 || (c.flags & CONTACT_FLAG_HIDDEN)) continue;
     if (c.type == ADV_TYPE_REPEATER) continue;
 
@@ -482,6 +483,7 @@ void ui_refresh_targets() {
 
 // ---- Enter / Exit chat mode ----
 void enter_chat_mode(TargetKind kind, int ch_idx, const uint8_t* pub_key) {
+  crash_diagnostics_mark_current(CrashStage::ChatOpen, ch_idx);
   g_in_chat_mode = true;
   g_search_filter[0] = '\0';
   if (ui_searchfield) {

@@ -11,6 +11,8 @@
 #include "MeshService.h"
 #include "MessageStore.h"
 #include "NodeDB.h"
+#include "NodeDatabaseCodec.h"
+#include "NodeRetentionPolicy.h"
 #include "PacketHistory.h"
 #include "PowerFSM.h"
 #include "RTC.h"
@@ -46,14 +48,12 @@
 #include <soc/soc.h>
 #endif
 
+#if !defined(CROWPANEL_DHE04005D)
 static uint32_t newNodeSaveIntervalMs()
 {
-#if defined(CROWPANEL_DHE04005D)
-    return 120000;
-#else
     return 5000;
-#endif
 }
+#endif
 
 static bool mqttContactDiscoveryEnabled()
 {
@@ -180,22 +180,7 @@ uint32_t get_st7789_id(uint8_t cs, uint8_t sck, uint8_t mosi, uint8_t dc, uint8_
 
 bool meshtastic_NodeDatabase_callback(pb_istream_t *istream, pb_ostream_t *ostream, const pb_field_iter_t *field)
 {
-    if (ostream) {
-        std::vector<meshtastic_NodeInfoLite> const *vec = (std::vector<meshtastic_NodeInfoLite> *)field->pData;
-        for (auto item : *vec) {
-            if (!pb_encode_tag_for_field(ostream, field))
-                return false;
-            pb_encode_submessage(ostream, meshtastic_NodeInfoLite_fields, &item);
-        }
-    }
-    if (istream) {
-        meshtastic_NodeInfoLite node; // this gets good data
-        std::vector<meshtastic_NodeInfoLite> *vec = (std::vector<meshtastic_NodeInfoLite> *)field->pData;
-
-        if (istream->bytes_left && pb_decode(istream, meshtastic_NodeInfoLite_fields, &node))
-            vec->push_back(node);
-    }
-    return true;
+    return nodeDatabaseFieldCodec(istream, ostream, field, MAX_NUM_NODES);
 }
 
 /** The current change # for radio settings.  Starts at 0 on boot and any time the radio settings
@@ -333,6 +318,11 @@ NodeDB::NodeDB()
     if (!FSCom.exists(nodeDatabaseFileName)) {
         saveNodeDatabaseToDisk();
     }
+#if defined(CROWPANEL_DHE04005D)
+    else if (nodeDbRecoveredFromBackup || !FSCom.exists(nodeDatabaseBackupFileName)) {
+        saveNodeDatabaseToDisk();
+    }
+#endif
 #endif
 
 #ifdef ARCH_ESP32
@@ -1104,7 +1094,7 @@ void NodeDB::removeNodeByNum(NodeNum nodeNum)
             removed++;
     }
     numMeshNodes -= removed;
-    std::fill(nodeDatabase.nodes.begin() + numMeshNodes, nodeDatabase.nodes.begin() + numMeshNodes + 1,
+    std::fill(nodeDatabase.nodes.begin() + numMeshNodes, nodeDatabase.nodes.begin() + numMeshNodes + removed,
               meshtastic_NodeInfoLite());
     LOG_DEBUG("NodeDB::removeNodeByNum purged %d entries. Save changes", removed);
     saveNodeDatabaseToDisk();
@@ -1125,7 +1115,11 @@ void NodeDB::cleanupMeshDB()
 {
     int newPos = 0, removed = 0;
     for (int i = 0; i < numMeshNodes; i++) {
-        if (meshNodes->at(i).has_user) {
+        if (meshNodes->at(i).has_user
+#if defined(CROWPANEL_DHE04005D)
+            || meshNodes->at(i).num != 0
+#endif
+        ) {
             if (meshNodes->at(i).user.public_key.size > 0) {
                 if (memfll(meshNodes->at(i).user.public_key.bytes, 0, meshNodes->at(i).user.public_key.size)) {
                     meshNodes->at(i).user.public_key.size = 0;
@@ -1220,6 +1214,11 @@ LoadFileResult NodeDB::loadProto(const char *filename, size_t protoSize, size_t 
 
     if (f) {
         LOG_INFO("Load %s", filename);
+#if defined(CROWPANEL_DHE04005D)
+        // The bounded node decoder also accepts saves from a larger-capacity build.
+        if (fields == &meshtastic_NodeDatabase_msg)
+            protoSize = f.size();
+#endif
         pb_istream_t stream = {&readcb, &f, protoSize};
         if (fields != &meshtastic_NodeDatabase_msg) // contains a vector object
             memset(dest_struct, 0, objSize);
@@ -1289,9 +1288,27 @@ void NodeDB::loadFromDisk()
     }
 
 #endif
+#if defined(CROWPANEL_DHE04005D)
+    // Bound the decoder's allocation to the same capacity used at runtime.
+    nodeDatabase.nodes.clear();
+    nodeDatabase.version = 0;
+    nodeDatabase.nodes.reserve(MAX_NUM_NODES);
+#endif
     auto state = loadProto(nodeDatabaseFileName, getMaxNodesAllocatedSize(), sizeof(meshtastic_NodeDatabase),
                            &meshtastic_NodeDatabase_msg, &nodeDatabase);
-    if (nodeDatabase.version < DEVICESTATE_MIN_VER) {
+#if defined(CROWPANEL_DHE04005D)
+    if (state != LoadFileResult::LOAD_SUCCESS || nodeDatabase.version < DEVICESTATE_MIN_VER || nodeDatabase.nodes.empty()) {
+        nodeDatabase.nodes.clear();
+        nodeDatabase.version = 0;
+        state = loadProto(nodeDatabaseBackupFileName, getMaxNodesAllocatedSize(), sizeof(meshtastic_NodeDatabase),
+                          &meshtastic_NodeDatabase_msg, &nodeDatabase);
+        nodeDbRecoveredFromBackup = state == LoadFileResult::LOAD_SUCCESS &&
+            nodeDatabase.version >= DEVICESTATE_MIN_VER && !nodeDatabase.nodes.empty();
+        if (nodeDbRecoveredFromBackup)
+            LOG_WARN("Recovered %u saved nodes from backup", (unsigned)nodeDatabase.nodes.size());
+    }
+#endif
+    if (state != LoadFileResult::LOAD_SUCCESS || nodeDatabase.version < DEVICESTATE_MIN_VER) {
         LOG_WARN("NodeDatabase %d is old, discard", nodeDatabase.version);
         installDefaultNodeDatabase();
     } else {
@@ -1516,11 +1533,13 @@ bool NodeDB::saveProto(const char *filename, size_t protoSize, const pb_msgdesc_
         okay = true;
     }
 
-    bool writeSucceeded = f.close();
+    // Never publish a partial protobuf, even if its bytes read back correctly.
+    bool writeSucceeded = okay && f.close();
 
     if (!okay || !writeSucceeded) {
         LOG_ERROR("Can't write prefs!");
     }
+    okay = okay && writeSucceeded;
 #else
     LOG_ERROR("ERROR: Filesystem not implemented");
 #endif
@@ -1581,8 +1600,21 @@ bool NodeDB::saveNodeDatabaseToDisk()
     spiLock->unlock();
 #endif
     size_t nodeDatabaseSize;
-    pb_get_encoded_size(&nodeDatabaseSize, meshtastic_NodeDatabase_fields, &nodeDatabase);
+    if (!pb_get_encoded_size(&nodeDatabaseSize, meshtastic_NodeDatabase_fields, &nodeDatabase))
+        return false;
+#if defined(CROWPANEL_DHE04005D)
+    if (!saveProto(nodeDatabaseFileName, nodeDatabaseSize, &meshtastic_NodeDatabase_msg, &nodeDatabase, true))
+        return false;
+    if (!saveProto(nodeDatabaseBackupFileName, nodeDatabaseSize, &meshtastic_NodeDatabase_msg, &nodeDatabase, true))
+        LOG_WARN("Node database saved, but backup refresh failed; previous backup retained");
+    nodeDbBatchPendingSince = 0;
+    nodeDbBatchPendingCount = 0;
+    nodeDbBatchHasNewNodes = false;
+    nodeDbRecoveredFromBackup = false;
+    return true;
+#else
     return saveProto(nodeDatabaseFileName, nodeDatabaseSize, &meshtastic_NodeDatabase_msg, &nodeDatabase, false);
+#endif
 }
 
 bool NodeDB::saveToDiskNoRetry(int saveWhat)
@@ -1651,13 +1683,6 @@ bool NodeDB::saveToDiskNoRetry(int saveWhat)
 bool NodeDB::saveToDisk(int saveWhat)
 {
     LOG_DEBUG("Save to disk %d", saveWhat);
-#if defined(CROWPANEL_DHE04005D)
-    if (saveWhat & SEGMENT_NODEDATABASE) {
-        // Any nodedb write (batched, shutdown, settings...) satisfies the batch.
-        nodeDbBatchPendingSince = 0;
-        nodeDbBatchPendingCount = 0;
-    }
-#endif
 
     // do not try to save anything if power level is not safe. In many cases flash will be lock-protected
     // and all writes will fail anyway. Device should be sleeping at this point anyway.
@@ -1793,6 +1818,7 @@ void NodeDB::updatePosition(uint32_t nodeId, const meshtastic_Position &p, RxSou
             info->position.time = tmp_time;
     }
     info->has_position = true;
+    markNodeDbSavePending();
     updateGUIforNode = info;
     notifyObservers(true); // Force an update whether or not our node counts have changed
 }
@@ -1816,6 +1842,7 @@ void NodeDB::updateTelemetry(uint32_t nodeId, const meshtastic_Telemetry &t, RxS
     }
     info->device_metrics = t.variant.device_metrics;
     info->has_device_metrics = true;
+    markNodeDbSavePending();
     updateGUIforNode = info;
     notifyObservers(true); // Force an update whether or not our node counts have changed
 }
@@ -1885,13 +1912,21 @@ void NodeDB::addFromContact(meshtastic_SharedContact contact)
 
 /** Update user info and channel for this node based on received user data
  */
-bool NodeDB::updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelIndex)
+bool NodeDB::updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelIndex, bool viaMqtt)
 {
-    meshtastic_NodeInfoLite *info = getOrCreateMeshNode(nodeId);
+    meshtastic_NodeInfoLite *info = getOrCreateMeshNode(nodeId, viaMqtt);
     if (!info) {
         return false;
     }
     const bool isNewNode = !info->has_user;
+#if defined(CROWPANEL_DHE04005D)
+    const bool originChanged = info->via_mqtt && !viaMqtt;
+    if (originChanged) {
+        info->via_mqtt = false;
+        nodeMembershipRevision.fetch_add(1, std::memory_order_release);
+        markNodeDbSavePending();
+    }
+#endif
 
 #if !(MESHTASTIC_EXCLUDE_PKI)
     if (p.public_key.size == 32 && nodeId != nodeDB->getNodeNum()) {
@@ -1932,6 +1967,9 @@ bool NodeDB::updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelInde
     // Both of info->user and p start as filled with zero so I think this is okay
     auto lite = TypeConversions::ConvertToUserLite(p);
     bool changed = memcmp(&info->user, &lite, sizeof(info->user)) || (info->channel != channelIndex);
+#if defined(CROWPANEL_DHE04005D)
+    changed = changed || originChanged;
+#endif
 
     info->user = lite;
     if (info->user.public_key.size == 32) {
@@ -1950,24 +1988,11 @@ bool NodeDB::updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelInde
         // We just changed something about a User. Persist aggressively for newly discovered
         // nodes (to survive quick reboot/power loss), but keep a slower cadence for updates
         // to existing nodes to reduce flash churn.
+#if defined(CROWPANEL_DHE04005D)
+        markNodeDbSavePending(isNewNode);
+#else
         uint32_t saveInterval = isNewNode ? newNodeSaveIntervalMs() : ONE_MINUTE_MS;
         uint32_t &lastSaveRef = isNewNode ? lastNodeDbNewNodeSave : lastNodeDbSave;
-#if defined(CROWPANEL_DHE04005D)
-        // Batch new-node persistence. The previous immediate-save-per-node policy
-        // (added when the board crashed often and lost learned names) made MQTT
-        // contact-discovery bursts rewrite the whole nodes.proto file dozens of
-        // times a minute. A batch flushes after 10 new nodes or 30 s (see
-        // flushPendingNodeDbSave, also ticked from updateFrom on packet activity),
-        // so a discovery burst costs a couple of flash writes instead of dozens
-        // while a freshly learned name still hits flash within seconds.
-        if (isNewNode) {
-            if (nodeDbBatchPendingSince == 0)
-                nodeDbBatchPendingSince = millis();
-            nodeDbBatchPendingCount++;
-            flushPendingNodeDbSave(nodeDbBatchPendingCount >= 10);
-            return changed;
-        }
-#endif
         if (saveInterval == 0 || !Throttle::isWithinTimespanMs(lastSaveRef, saveInterval)) {
             saveToDisk(SEGMENT_NODEDATABASE);
             const uint32_t now = millis();
@@ -1978,25 +2003,40 @@ bool NodeDB::updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelInde
         } else {
             LOG_DEBUG("Defer NodeDB saveToDisk for now");
         }
+#endif
     }
 
     return changed;
 }
 
-/// given a subpacket sniffed from the network, update our DB state
-/// we updateGUI and updateGUIforNode if we think our this change is big enough for a redraw
+void NodeDB::markNodeDbSavePending(bool newNode)
+{
+#if defined(CROWPANEL_DHE04005D)
+    if (nodeDbBatchPendingSince == 0) nodeDbBatchPendingSince = millis();
+    nodeDbBatchHasNewNodes |= newNode;
+    if (newNode && nodeDbBatchPendingCount < UINT16_MAX) ++nodeDbBatchPendingCount;
+#else
+    (void)newNode;
+#endif
+}
+
 void NodeDB::flushPendingNodeDbSave(bool force)
 {
 #if defined(CROWPANEL_DHE04005D)
     if (nodeDbBatchPendingSince == 0)
         return;
-    if (!force && Throttle::isWithinTimespanMs(nodeDbBatchPendingSince, 30000))
-        return;
+    if (!force) {
+        const uint32_t interval = nodeDbBatchHasNewNodes ? 5000 : 30000;
+        if (Throttle::isWithinTimespanMs(nodeDbBatchPendingSince, interval) ||
+            Throttle::isWithinTimespanMs(nodeDbLastSaveAttempt, 5000))
+            return;
+    }
+    nodeDbLastSaveAttempt = millis();
     LOG_DEBUG("Flush batched NodeDB save (%u new nodes)", (unsigned)nodeDbBatchPendingCount);
-    saveToDisk(SEGMENT_NODEDATABASE); // clears the pending batch
-    const uint32_t now = millis();
-    lastNodeDbNewNodeSave = now;
-    lastNodeDbSave = now;
+    if (saveToDisk(SEGMENT_NODEDATABASE)) {
+        lastNodeDbNewNodeSave = millis();
+        lastNodeDbSave = lastNodeDbNewNodeSave;
+    }
 #else
     (void)force;
 #endif
@@ -2008,7 +2048,6 @@ void NodeDB::updateFrom(const meshtastic_MeshPacket &mp)
         LOG_DEBUG("Ignore update from self");
         return;
     }
-    flushPendingNodeDbSave(false); // batched new-node save, at most every 30 s
     if (mp.which_payload_variant == meshtastic_MeshPacket_decoded_tag && mp.from) {
         if (mp.via_mqtt && !mqttContactDiscoveryEnabled()) {
             LOG_DEBUG("Skip MQTT contact update from 0x%x", mp.from);
@@ -2017,7 +2056,7 @@ void NodeDB::updateFrom(const meshtastic_MeshPacket &mp)
 
         LOG_DEBUG("Update DB node 0x%x, rx_time=%u", mp.from, mp.rx_time);
 
-        meshtastic_NodeInfoLite *info = getOrCreateMeshNode(getFrom(&mp));
+        meshtastic_NodeInfoLite *info = getOrCreateMeshNode(getFrom(&mp), mp.via_mqtt);
         if (!info) {
             return;
         }
@@ -2028,14 +2067,19 @@ void NodeDB::updateFrom(const meshtastic_MeshPacket &mp)
         if (mp.rx_snr)
             info->snr = mp.rx_snr; // keep the most recent SNR we received for this node.
 
+#if defined(CROWPANEL_DHE04005D)
+        const bool wasMqttOnly = info->via_mqtt;
+        info->via_mqtt = NodeRetentionPolicy::mqttOnlyAfterPacket(info->via_mqtt, mp.via_mqtt);
+        if (wasMqttOnly != info->via_mqtt)
+            nodeMembershipRevision.fetch_add(1, std::memory_order_release);
+#else
         if (mp.via_mqtt) {
-            // Keep LoRa-learned contacts independent from MQTT. A later MQTT text packet
-            // must not turn an existing LoRa contact into an MQTT-only contact.
             if (info->via_mqtt || !info->has_user)
                 info->via_mqtt = true;
         } else {
             info->via_mqtt = false;
         }
+#endif
 
         // If hopStart was set and there wasn't someone messing with the limit in the middle, add hopsAway
         const int8_t hopsAway = getHopsAway(mp);
@@ -2043,6 +2087,7 @@ void NodeDB::updateFrom(const meshtastic_MeshPacket &mp)
             info->has_hops_away = true;
             info->hops_away = hopsAway;
         }
+        markNodeDbSavePending();
         sortMeshDB();
     }
 }
@@ -2185,11 +2230,33 @@ bool NodeDB::isFull()
 }
 
 /// Find a node in our DB, create an empty NodeInfo if missing
-meshtastic_NodeInfoLite *NodeDB::getOrCreateMeshNode(NodeNum n)
+meshtastic_NodeInfoLite *NodeDB::getOrCreateMeshNode(NodeNum n, bool viaMqtt)
 {
     meshtastic_NodeInfoLite *lite = getMeshNode(n);
 
     if (!lite) {
+#if defined(CROWPANEL_DHE04005D)
+        const bool lowMemory = n != getNodeNum() && memGet.getFreeHeap() < MINIMUM_SAFE_FREE_HEAP;
+        const int replacement = numMeshNodes >= MAX_NUM_NODES
+                                    ? NodeRetentionPolicy::oldestMqttContact(meshNodes->data(), numMeshNodes, getNodeNum(),
+                                                                             NODEINFO_BITFIELD_IS_KEY_MANUALLY_VERIFIED_MASK)
+                                    : -1;
+        if (lowMemory || (numMeshNodes >= MAX_NUM_NODES && replacement < 0)) {
+            if (!Throttle::isWithinTimespanMs(nodeDbFullWarningMs, 30000)) {
+                nodeDbFullWarningMs = millis();
+                LOG_WARN("Node database (%u/%u): %s; protected contacts retained, ignoring new node 0x%x",
+                         (unsigned)numMeshNodes, (unsigned)MAX_NUM_NODES,
+                         lowMemory ? "low memory" : "no replaceable MQTT contact", n);
+            }
+            return nullptr;
+        }
+        if (replacement >= 0) {
+            lite = &meshNodes->at(replacement);
+            LOG_DEBUG("Replacing oldest MQTT contact 0x%x (last heard %u) with 0x%x", lite->num, lite->last_heard, n);
+        } else {
+            lite = &meshNodes->at(numMeshNodes++);
+        }
+#else
         if (isFull()) {
             LOG_INFO("Node database full with %i nodes and %u bytes free. Erasing oldest entry", numMeshNodes,
                      memGet.getFreeHeap());
@@ -2228,10 +2295,13 @@ meshtastic_NodeInfoLite *NodeDB::getOrCreateMeshNode(NodeNum n)
         }
         // add the node at the end
         lite = &meshNodes->at((numMeshNodes)++);
+#endif
 
         // everything is missing except the nodenum
         memset(lite, 0, sizeof(*lite));
         lite->num = n;
+        lite->via_mqtt = viaMqtt;
+        nodeMembershipRevision.fetch_add(1, std::memory_order_release);
         LOG_INFO("Adding node to database with %i nodes and %u bytes free!", numMeshNodes, memGet.getFreeHeap());
 
         // Persist newly discovered nodes promptly, even if they first arrive via
@@ -2239,12 +2309,7 @@ meshtastic_NodeInfoLite *NodeDB::getOrCreateMeshNode(NodeNum n)
         // survive quick reboot/power loss without waiting for periodic saves.
         if (n != getNodeNum()) {
 #if defined(CROWPANEL_DHE04005D)
-            // Join the batched new-node save instead of writing per node
-            // (discovery bursts otherwise rewrite the whole DB file constantly).
-            if (nodeDbBatchPendingSince == 0)
-                nodeDbBatchPendingSince = millis();
-            nodeDbBatchPendingCount++;
-            flushPendingNodeDbSave(nodeDbBatchPendingCount >= 10);
+            markNodeDbSavePending(true);
 #else
             if (!Throttle::isWithinTimespanMs(lastNodeDbNewNodeSave, newNodeSaveIntervalMs())) {
                 saveToDisk(SEGMENT_NODEDATABASE);

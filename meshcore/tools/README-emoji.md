@@ -10,7 +10,7 @@ Both contain a curated set of ~250 common emojis from Noto Color Emoji.
 
 ## One-time setup
 
-1. **Install Pillow** (you already have 12.1.1 — skip if so):
+1. **Install Pillow**:
    ```
    python -m pip install Pillow
    ```
@@ -22,6 +22,10 @@ Both contain a curated set of ~250 common emojis from Noto Color Emoji.
    Save it somewhere convenient, e.g. `C:\fonts\NotoColorEmoji.ttf`.
 
 ## Generate atlases
+
+Prebuilt release atlases are already available in the repository's root
+`docs/` directory. Regenerate them only when changing the emoji set or font.
+Generated copies in `tools/` are local output and are ignored by Git.
 
 From the `meshcore/tools/` directory:
 

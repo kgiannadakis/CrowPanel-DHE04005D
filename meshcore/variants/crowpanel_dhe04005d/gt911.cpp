@@ -2,6 +2,7 @@
 #include "i2c_bus.h"
 #include "stc8.h"
 #include "board_config.h"
+#include "gt911_wake_policy.h"
 
 #include <Arduino.h>
 #include <esp_log.h>
@@ -19,6 +20,7 @@ static constexpr uint8_t GT911_ADDR_B = 0x14;
 static constexpr uint16_t REG_STATUS        = 0x814E;  // touch status + point count
 static constexpr uint16_t REG_POINT1        = 0x814F;  // first point data
 static constexpr uint16_t REG_PRODUCT_ID    = 0x8140;  // "911\0"
+static constexpr uint16_t REG_MODULE_SWITCH = 0x804D;
 
 static constexpr uint32_t I2C_FREQ_HZ = 400000;
 static constexpr int      I2C_TIMEOUT_MS = 50;
@@ -26,6 +28,15 @@ static constexpr int      I2C_TIMEOUT_MS = 50;
 static i2c_master_dev_handle_t s_dev = nullptr;
 static uint16_t s_panel_w = 800;
 static uint16_t s_panel_h = 480;
+static int s_active_level = -1;
+static int s_verified_wake_level = -1;
+static bool s_wake_disabled = false;
+static TouchWake::Verification s_wake_verification;
+
+static void invalidate_wake_verification() {
+  s_wake_verification.reset();
+  __atomic_store_n(&s_verified_wake_level, -1, __ATOMIC_RELEASE);
+}
 
 // ---- helpers ----------------------------------------------------------------
 
@@ -58,6 +69,9 @@ static bool write_reg(uint16_t reg, uint8_t value) {
 bool gt911_init(uint16_t panel_w, uint16_t panel_h) {
   s_panel_w = panel_w;
   s_panel_h = panel_h;
+  s_active_level = -1;
+  __atomic_store_n(&s_wake_disabled, false, __ATOMIC_RELEASE);
+  invalidate_wake_verification();
 
   // RST (IO36) is wired directly to the GT911 reset line on this board
   // (0R resistor per schematic). STC8 P1.2 is only a weak 27K secondary path,
@@ -92,6 +106,12 @@ bool gt911_init(uint16_t panel_w, uint16_t panel_h) {
         && pid[0] == '9' && pid[1] == '1' && pid[2] == '1') {
       ESP_LOGI(TAG, "GT911 found at 0x%02X, product_id=\"%c%c%c%c\"",
                addr, pid[0], pid[1], pid[2], pid[3]);
+      // Read existing polarity without changing configuration, address pins
+      // or the controller's power mode.
+      uint8_t config = 0, check = 0;
+      if (read_reg(REG_MODULE_SWITCH, &config, 1) && config != 0xFF &&
+          read_reg(REG_MODULE_SWITCH, &check, 1) && check == config)
+        s_active_level = TouchWake::activeLevel(config);
       return true;
     }
   }
@@ -104,12 +124,20 @@ bool gt911_read(uint16_t* x, uint16_t* y) {
   if (!s_dev) return false;
 
   uint8_t status = 0;
-  if (!read_reg(REG_STATUS, &status, 1)) return false;
+  const int int_before_read = gpio_get_level((gpio_num_t)Touch_GPIO_INT);
+  if (!read_reg(REG_STATUS, &status, 1)) {
+    invalidate_wake_verification();
+    return false;
+  }
 
   // A properly responding GT911 returns 0 here when idle. A silent bus
   // returns 0xFF for everything and (0xFF & 0x80) passes, producing
   // ghost touches. Reject the all-ones pattern explicitly.
-  if (status == 0xFF) { write_reg(REG_STATUS, 0); return false; }
+  if (status == 0xFF) {
+    invalidate_wake_verification();
+    write_reg(REG_STATUS, 0);
+    return false;
+  }
 
   bool touched = (status & 0x80) && ((status & 0x0F) > 0);
   uint16_t tx = 0, ty = 0;
@@ -121,13 +149,23 @@ bool gt911_read(uint16_t* x, uint16_t* y) {
       tx = (uint16_t)p[1] | ((uint16_t)p[2] << 8);
       ty = (uint16_t)p[3] | ((uint16_t)p[4] << 8);
     } else {
+      invalidate_wake_verification();
       touched = false;
+      write_reg(REG_STATUS, 0);
+      return false;
     }
   }
 
   // ALWAYS clear the status register so the chip refills the touch buffer —
   // even when the buffer-ready bit was not set this cycle.
-  write_reg(REG_STATUS, 0);
+  if (!write_reg(REG_STATUS, 0)) {
+    invalidate_wake_verification();
+  } else {
+    // A stuck active INT with an empty buffer must not cause a wake/spin loop.
+    const bool verified = s_wake_verification.observe(
+        touched, int_before_read, s_active_level, status == 0);
+    __atomic_store_n(&s_verified_wake_level, verified ? s_active_level : -1, __ATOMIC_RELEASE);
+  }
 
   if (touched) {
     if (tx >= s_panel_w) tx = s_panel_w - 1;
@@ -136,4 +174,13 @@ bool gt911_read(uint16_t* x, uint16_t* y) {
     if (y) *y = ty;
   }
   return touched;
+}
+
+int gt911_interrupt_wake_level() {
+  if (__atomic_load_n(&s_wake_disabled, __ATOMIC_ACQUIRE)) return -1;
+  return __atomic_load_n(&s_verified_wake_level, __ATOMIC_ACQUIRE);
+}
+
+void gt911_disable_interrupt_wake() {
+  __atomic_store_n(&s_wake_disabled, true, __ATOMIC_RELEASE);
 }

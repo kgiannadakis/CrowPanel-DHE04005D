@@ -3,11 +3,17 @@
 // ============================================================
 
 #include "persistence.h"
+#include "crash_diagnostics.h"
 #include "app_globals.h"
 #include "utils.h"
 #include <new>
+#include <memory>
+#include <utility>
+#include "display.h"
 #if defined(ESP32)
+#include <esp_heap_caps.h>
 #include <esp_task_wdt.h>
+#include <freertos/semphr.h>
 #endif
 #include "chat_ui.h"
 #include "settings_cb.h"
@@ -68,10 +74,8 @@ String chat_path_for(const String& key) { return String("/chat_") + key; }
 //   2. Buffer full (new append forces a flush before enqueueing).
 //   3. Chat switch / exit (chat_append_flush_sync).
 //   4. load_chat_from_file() for the same key (see below).
-// Power-loss window: any messages appended in the last 200 ms may be
-// lost on a hard reset. Acceptable tradeoff for the responsiveness
-// win; the device has no battery anyway so a hard reset mostly only
-// happens on USB unplug.
+// Messages still buffered in RAM can be lost on a reset. File-write retries
+// retain their remaining bytes, but are not a power-loss transaction.
 #if defined(ESP32)
 static void compact_chat_file(const String& path, int keep_last_n);
 
@@ -79,21 +83,70 @@ struct PendingChatLine {
   bool   active;
   char   key[20];     // "ct_XXXXXXXXXXXX" = 15 chars; "ch_NN" much less
   String line;        // fully formatted "TX|...\n" or "RX|...\n"
+  size_t written = 0;
 };
 static const int kPendingMax = 32;
 static PendingChatLine s_pending[kPendingMax];
 static int s_pending_count = 0;
+static StaticSemaphore_t s_chat_mutex_storage;
+static SemaphoreHandle_t s_chat_mutex = nullptr;
+static uint32_t s_chat_retry_after_ms = 0;
+
+class PendingChatGuard {
+  bool locked_;
+public:
+  PendingChatGuard() : locked_(s_chat_mutex &&
+      xSemaphoreTakeRecursive(s_chat_mutex, portMAX_DELAY) == pdTRUE) {}
+  ~PendingChatGuard() { if (locked_) xSemaphoreGiveRecursive(s_chat_mutex); }
+  explicit operator bool() const { return locked_; }
+};
 #endif
 
 // millis() timestamp at which the main loop should flush pending
 // lines. 0 = nothing pending. Declared extern in persistence.h so
 // main.cpp's housekeeping block can poll it without another global.
-uint32_t g_chat_flush_deadline_ms = 0;
+std::atomic<uint32_t> g_chat_flush_deadline_ms{0};
 static const uint32_t kChatFlushDelayMs = 200;
 
+void chat_persistence_init() {
 #if defined(ESP32)
-static void chat_flush_all_now() {
-  if (s_pending_count == 0) return;
+  // Setup calls this before radio callbacks or the LVGL task can enqueue.
+  if (!s_chat_mutex) s_chat_mutex = xSemaphoreCreateRecursiveMutexStatic(&s_chat_mutex_storage);
+#endif
+}
+
+#if defined(ESP32)
+static void chat_retry_pending() {
+  // Keep pending slots in FIFO order when earlier writes freed holes.
+  int count = 0;
+  for (int i = 0; i < kPendingMax; ++i) {
+    if (!s_pending[i].active) continue;
+    if (count != i) {
+      s_pending[count] = std::move(s_pending[i]);
+      s_pending[i].active = false;
+    }
+    ++count;
+  }
+  s_pending_count = count;
+  s_chat_retry_after_ms = millis() + 1000;
+  g_chat_flush_deadline_ms = s_chat_retry_after_ms;
+  crash_diagnostics_mark_current(CrashStage::Storage, 505);
+}
+
+static bool chat_flush_all_now() {
+  // Every caller, including PM status updates and queue overflow, uses the
+  // same LVGL -> pending-queue lock order. Never wait for rendering with the
+  // queue mutex held: a UI callback may need that mutex to finish rendering.
+  crash_diagnostics_mark_current(CrashStage::Storage, 506);
+  if (!lvgl_lock(5)) return false;
+  struct RenderUnlock { ~RenderUnlock() { lvgl_unlock(); } } render_unlock;
+  crash_diagnostics_mark_current(CrashStage::Storage, 500);
+  PendingChatGuard guard;
+  if (!guard) return false;
+  crash_diagnostics_mark_current(CrashStage::Storage, 507);
+  if (s_pending_count == 0) return true;
+  if (s_chat_retry_after_ms && (int32_t)(millis() - s_chat_retry_after_ms) < 0) return false;
+  uint8_t staging[128]; // Flash writes never read a PSRAM-backed String directly.
   // Walk pending; for each still-active slot, open its chat file once
   // and coalesce every pending line that targets the same key into
   // one open/write/close cycle. Ordering is preserved because we
@@ -102,22 +155,35 @@ static void chat_flush_all_now() {
     if (!s_pending[i].active) continue;
     const char* this_key = s_pending[i].key;
     String path = chat_path_for(String(this_key));
+    crash_diagnostics_mark_current(CrashStage::Storage, 501);
     File f = LittleFS.open(path, FILE_APPEND);
-    if (!f) f = LittleFS.open(path, FILE_WRITE);
     if (!f) {
-      // Mark as inactive so we don't loop forever if writes keep
-      // failing; drop the line.
-      s_pending[i].active = false;
-      continue;
+      chat_retry_pending();
+      return false;
     }
+    bool write_failed = false;
     for (int j = i; j < kPendingMax; j++) {
       if (!s_pending[j].active) continue;
       if (strcmp(s_pending[j].key, this_key) != 0) continue;
-      f.print(s_pending[j].line);
+      PendingChatLine& pending = s_pending[j];
+      while (pending.written < pending.line.length()) {
+        const size_t remaining = pending.line.length() - pending.written;
+        const size_t bytes = remaining < sizeof(staging) ? remaining : sizeof(staging);
+        memcpy(staging, pending.line.c_str() + pending.written, bytes);
+        crash_diagnostics_mark_current(CrashStage::Storage, 502);
+        const size_t written = f.write(staging, bytes);
+        pending.written += written;
+        if (written != bytes) { write_failed = true; break; }
+      }
+      if (write_failed) break;
       s_pending[j].active = false;
       s_pending[j].line   = String();   // release the String heap
+      s_pending[j].written = 0;
+      --s_pending_count;
     }
+    crash_diagnostics_mark_current(CrashStage::Storage, 503);
     f.close();
+    if (write_failed) { chat_retry_pending(); return false; }
     // IMPORTANT (UI smoothness): do NOT compact on every flush.
     // compact_chat_file() does a full-file pass; running it per append batch
     // creates sustained flash I/O stalls that hitch scrolling/navigation.
@@ -126,25 +192,32 @@ static void chat_flush_all_now() {
     // naturally amortized during chat-open, not during high-frequency RX/TX.
   }
   s_pending_count = 0;
+  s_chat_retry_after_ms = 0;
   g_chat_flush_deadline_ms = 0;
+  crash_diagnostics_mark_current(CrashStage::Storage, 504);
+  return true;
 }
 
 static bool chat_enqueue_line(const String& key, const String& line) {
-  if (s_pending_count >= kPendingMax) {
-    // Force-flush to free slots. Safe: we're about to write these
-    // lines anyway; the caller is just pushing another one behind.
-    chat_flush_all_now();
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    {
+      PendingChatGuard guard;
+      if (!guard) return false;
+      for (int i = 0; i < kPendingMax; i++) {
+        if (s_pending[i].active) continue;
+        s_pending[i].active = true;
+        StrHelper::strncpy(s_pending[i].key, key.c_str(), sizeof(s_pending[i].key));
+        s_pending[i].line = line;
+        s_pending[i].written = 0;
+        s_pending_count++;
+        g_chat_flush_deadline_ms = millis() + kChatFlushDelayMs;
+        return true;
+      }
+    }
+    // Release queue ownership before acquiring the render lock for overflow I/O.
+    if (attempt == 0 && !chat_flush_all_now()) return false;
   }
-  for (int i = 0; i < kPendingMax; i++) {
-    if (s_pending[i].active) continue;
-    s_pending[i].active = true;
-    StrHelper::strncpy(s_pending[i].key, key.c_str(), sizeof(s_pending[i].key));
-    s_pending[i].line = line;   // String copy (heap)
-    s_pending_count++;
-    g_chat_flush_deadline_ms = millis() + kChatFlushDelayMs;
-    return true;
-  }
-  return false;   // shouldn't happen after the force-flush above
+  return false;
 }
 #endif
 
@@ -152,15 +225,18 @@ static bool chat_enqueue_line(const String& key, const String& line) {
 // passed. main.cpp polls g_chat_flush_deadline_ms like g_ui_prefs_*.
 void chat_append_flush_if_due() {
 #if defined(ESP32)
-  chat_flush_all_now();
+  const uint32_t deadline = g_chat_flush_deadline_ms.load();
+  if (deadline && (int32_t)(millis() - deadline) >= 0) chat_flush_all_now();
 #endif
 }
 
-// Synchronous flush: called by chat switch / exit / load so readers
-// never see stale disk state. Cheap if nothing's pending.
-void chat_append_flush_sync() {
+// Synchronous flush: called by chat switch / exit / load. False means text
+// remains queued after a storage failure; do not claim it is durable yet.
+bool chat_append_flush_sync() {
 #if defined(ESP32)
-  if (s_pending_count > 0) chat_flush_all_now();
+  return chat_flush_all_now();
+#else
+  return true;
 #endif
 }
 
@@ -190,7 +266,7 @@ void append_chat_to_file(const String& key, bool out, const char* msg, uint32_t 
   }
   line += msg;
   line += '\n';
-  chat_enqueue_line(key, line);
+  if (!chat_enqueue_line(key, line)) serialmon_append("Chat queue full/busy - message not saved");
 #else
   (void)key; (void)out; (void)msg; (void)msg_ts; (void)signal_info;
 #endif
@@ -614,6 +690,7 @@ static int prune_chat_file_to_recent_seconds(const String& path, uint32_t keep_s
 #endif
 
 void load_chat_from_file(const String& key) {
+  crash_diagnostics_mark_current(CrashStage::HistoryRead);
   // Publish the active chat key BEFORE chat_clear() so translate's
   // live-update path can no longer accidentally target a bubble that
   // belongs to the chat we're about to replace. (translate_loop()
@@ -701,6 +778,7 @@ void load_chat_from_file(const String& key) {
   // Iterate the tail in chronological order.
   const int start = 0;
   for (int i = 0; i < ring_count; i++) {
+    crash_diagnostics_mark_current(CrashStage::HistoryBubbles, i);
     String& line = ring[start + i];
     bool out = line.startsWith("TX|");
 
@@ -807,6 +885,7 @@ void load_chat_from_file(const String& key) {
     }
   }
   g_loading_history = false;
+  crash_diagnostics_mark_current(CrashStage::HistoryLayout, ring_count);
 
   // Drain the bounded auto-translate backfill window in chronological
   // order (oldest in window first).
@@ -825,6 +904,7 @@ void load_chat_from_file(const String& key) {
   // Time-based retention pruning: keep only the last 7 days on disk.
   // This enforces persistent history by time window rather than count.
   if (file_size <= kPruneOnOpenMaxBytes) {
+    crash_diagnostics_mark_current(CrashStage::Storage, file_size);
     int kept_after_prune = prune_chat_file_to_recent_seconds(path, kChatHistoryKeepSeconds);
     if (!history_truncated && kept_after_prune > 0 && kept_after_prune != ring_count) {
       read_pos_set(key.c_str(), kept_after_prune);
@@ -872,6 +952,24 @@ void delete_chat_file_for_key(const String& key) {
 // ---- NVS persistence ----
 #if defined(ESP32)
 static Preferences g_prefs;
+
+uint8_t load_brightness_nvs() {
+  Preferences prefs;
+  if (!prefs.begin("ui", true)) return ScreenPower::kMaxBacklight;
+  const uint8_t level = prefs.getUChar("brightness", ScreenPower::kMaxBacklight);
+  prefs.end();
+  return ScreenPower::savedBrightness(level);
+}
+
+bool save_brightness_nvs(uint8_t level) {
+  Preferences prefs;
+  if (!prefs.begin("ui", false)) return false;
+  const uint8_t valid_level = ScreenPower::savedBrightness(level);
+  const bool ok = prefs.getUChar("brightness", 0) == valid_level
+      || prefs.putUChar("brightness", valid_level) == sizeof(uint8_t);
+  prefs.end();
+  return ok;
+}
 
 uint32_t clamp_timeout_s(uint32_t s) {
   if (s < 5) s = 5;
@@ -1024,7 +1122,17 @@ struct ReadPosRecord { char key[20]; int32_t msg_count; };
 #pragma pack(pop)
 
 void save_notifications_nvs() {
-  ContactUnreadRecord crecs[MAX_UNREAD_SLOTS];
+  struct Snapshot {
+    ContactUnreadRecord contacts[MAX_UNREAD_SLOTS];
+    ChannelUnreadRecord channels[MAX_UNREAD_SLOTS];
+    ReadPosRecord readpos[MAX_READ_POS];
+  };
+  std::unique_ptr<Snapshot, decltype(&heap_caps_free)> snapshot(
+      static_cast<Snapshot*>(heap_caps_calloc(
+          1, sizeof(Snapshot), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+      &heap_caps_free);
+  if (!snapshot || !lvgl_lock(5)) { g_notifications_dirty = true; return; }
+  auto& crecs = snapshot->contacts;
   int nc = 0;
   for (int i = 0; i < MAX_UNREAD_SLOTS; i++)
     if (g_contact_unread[i].valid && g_contact_unread[i].count > 0) {
@@ -1032,7 +1140,7 @@ void save_notifications_nvs() {
       crecs[nc].count = g_contact_unread[i].count;
       nc++;
     }
-  ChannelUnreadRecord hrecs[MAX_UNREAD_SLOTS];
+  auto& hrecs = snapshot->channels;
   int nh = 0;
   for (int i = 0; i < MAX_UNREAD_SLOTS; i++)
     if (g_channel_unread[i].valid && g_channel_unread[i].count > 0) {
@@ -1043,7 +1151,7 @@ void save_notifications_nvs() {
   // Serialise g_read_pos so the NEW-MESSAGES divider position survives
   // a reboot. Without persistence, last_read=-1 on the next boot means
   // load_chat_from_file falls through to chat_scroll_to_newest.
-  ReadPosRecord rprecs[MAX_READ_POS];
+  auto& rprecs = snapshot->readpos;
   int np = 0;
   for (int i = 0; i < MAX_READ_POS; i++) {
     if (!g_read_pos[i].valid) continue;
@@ -1053,26 +1161,38 @@ void save_notifications_nvs() {
     np++;
   }
 
-  g_prefs.begin("notif", false);
+  lvgl_unlock();
+  Preferences prefs;
+  crash_diagnostics_mark_current(CrashStage::Storage, 101);
+  if (!prefs.begin("notif", false)) { g_notifications_dirty = true; return; }
+  bool ok = true;
+  crash_diagnostics_mark_current(CrashStage::Storage, 102);
   if (nc > 0) {
-    g_prefs.putBytes("contacts", crecs, (size_t)nc * sizeof(ContactUnreadRecord));
-  } else if (g_prefs.isKey("contacts")) {
+    const size_t bytes = (size_t)nc * sizeof(ContactUnreadRecord);
+    if (prefs.putBytes("contacts", crecs, bytes) != bytes) ok = false;
+  } else if (prefs.isKey("contacts")) {
     // Only call remove() if the key actually exists — otherwise Arduino's
     // Preferences layer logs nvs_erase_key NOT_FOUND as an [E] error for
     // a no-op. isKey() is a cheap check and keeps the serial clean.
-    g_prefs.remove("contacts");
+    if (!prefs.remove("contacts")) ok = false;
   }
+  crash_diagnostics_mark_current(CrashStage::Storage, 103);
   if (nh > 0) {
-    g_prefs.putBytes("channels", hrecs, (size_t)nh * sizeof(ChannelUnreadRecord));
-  } else if (g_prefs.isKey("channels")) {
-    g_prefs.remove("channels");
+    const size_t bytes = (size_t)nh * sizeof(ChannelUnreadRecord);
+    if (prefs.putBytes("channels", hrecs, bytes) != bytes) ok = false;
+  } else if (prefs.isKey("channels")) {
+    if (!prefs.remove("channels")) ok = false;
   }
+  crash_diagnostics_mark_current(CrashStage::Storage, 104);
   if (np > 0) {
-    g_prefs.putBytes("readpos", rprecs, (size_t)np * sizeof(ReadPosRecord));
-  } else if (g_prefs.isKey("readpos")) {
-    g_prefs.remove("readpos");
+    const size_t bytes = (size_t)np * sizeof(ReadPosRecord);
+    if (prefs.putBytes("readpos", rprecs, bytes) != bytes) ok = false;
+  } else if (prefs.isKey("readpos")) {
+    if (!prefs.remove("readpos")) ok = false;
   }
-  g_prefs.end();
+  crash_diagnostics_mark_current(CrashStage::Storage, 105);
+  prefs.end();
+  if (!ok) g_notifications_dirty = true;
 }
 
 void load_notifications_nvs() {
@@ -1144,6 +1264,8 @@ uint32_t clamp_timeout_s(uint32_t s) { return s; }
 void save_ui_prefs_nvs()  {}
 void save_ui_prefs_nvs_now() {}
 void load_ui_prefs_nvs()  {}
+uint8_t load_brightness_nvs() { return ScreenPower::kMaxBacklight; }
+bool save_brightness_nvs(uint8_t) { return false; }
 void save_timeout_s(uint32_t s) { g_screen_timeout_s = clamp_timeout_s(s); }
 void save_device_name_nvs(const char*) {}
 bool load_device_name_nvs(char*, size_t) { return false; }

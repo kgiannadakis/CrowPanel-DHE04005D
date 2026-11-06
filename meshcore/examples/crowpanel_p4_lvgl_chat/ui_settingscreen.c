@@ -3,6 +3,7 @@
 
 #include "ui.h"
 #include "ui_tabbar.h"
+#include "ui_battery.h"
 
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
@@ -196,6 +197,7 @@ void ui_settingscreen_screen_init(void) {
     lv_obj_set_style_text_color(title, lv_color_hex(TH_TEXT), 0);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
     lv_obj_center(title);
+    ui_battery_create(hdr);
 
     // ── SCROLLABLE FORM ─────────────────────────────────────
 

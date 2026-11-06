@@ -18,6 +18,17 @@ Thanks for helping improve the CrowPanel DHE04005D dual-boot firmware.
 - `meshtastic/` contains the customized Meshtastic firmware.
 - `flash_all.py` flashes the complete dual-boot image set.
 
+For MeshCore ownership boundaries, locking rules, feature limitations and the
+pre-publish checklist, see [the CrowPanel development guide](meshcore/docs/crowpanel.md).
+Run `python tools/check_repository.py` from the repository root before building
+the active `dhe04005d-5inch-P4-meshcore` environment. This checks installation
+tooling, publishing hygiene, MeshCore source/policy assertions and portable
+Meshtastic policy tests without
+accessing a device. CI runs the same command. See the
+[publishing checklist](docs/publishing.md) for release preparation.
+
 When reporting a bug, include the affected firmware, build environment, hardware revision, radio module/frequency, serial output, and reproducible steps. Remove mesh identities, location data, Wi-Fi credentials, and tokens from logs before sharing them.
 
-By contributing, you agree that your contribution is licensed under this repository's GPL-3.0 license.
+Preserve the license of the component you modify. The repository includes
+GPL-3.0 firmware, MIT-licensed MeshCore code and separately licensed dependencies;
+do not remove their attribution or license notices.

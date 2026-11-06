@@ -36,7 +36,8 @@ using namespace STM32_LittleFS_Namespace;
 #include "LittleFS.h"
 #define FSCom LittleFS
 #if defined(CROWPANEL_DHE04005D)
-#define FSBegin() FSCom.begin(true, "/littlefs", 10, "mtdata") // format on failure, explicit partition label
+#include "CrowPanelStorage.h"
+#define FSBegin() crowpanel_preferences_begin()
 #else
 #define FSBegin() FSCom.begin(true) // format on failure
 #endif

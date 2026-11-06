@@ -24,6 +24,9 @@ class TraceRouteModule : public ProtobufModule<meshtastic_RouteDiscovery>,
     TraceRouteModule();
 
     bool startTraceRoute(NodeNum node);
+    bool acceptsMqttPacket(const meshtastic_MeshPacket &packet) const;
+    void handleRoutingReport(const meshtastic_MeshPacket &packet, const meshtastic_Routing &report);
+    void noteMqttReplyRejected(const meshtastic_MeshPacket &packet, const char *reason);
     void launch(NodeNum node);
     void handleTraceRouteResult(const String &result);
     bool shouldDraw();
@@ -55,6 +58,7 @@ class TraceRouteModule : public ProtobufModule<meshtastic_RouteDiscovery>,
     virtual int32_t runOnce() override;
 
   private:
+    bool prepareRequest(meshtastic_MeshPacket *packet, NodeNum node);
     void setResultText(const String &text);
     void clearResultLines();
 #if HAS_SCREEN
@@ -88,6 +92,13 @@ class TraceRouteModule : public ProtobufModule<meshtastic_RouteDiscovery>,
     std::vector<String> resultLines;
     bool resultLinesDirty = false;
     NodeNum tracingNode = 0;
+    PacketId tracingPacketId = 0;
+    bool mqttTracePossible = false;
+    bool publicBrokerTrace = false;
+    bool targetAckSeen = false;
+    bool brokerEchoSeen = false;
+    bool radioFailureSeen = false;
+    const char *mqttRejectionReason = nullptr;
     bool initialized = false;
 };
 

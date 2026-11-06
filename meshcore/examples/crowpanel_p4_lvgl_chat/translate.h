@@ -1,10 +1,10 @@
 #pragma once
 // translate.h — Google Translate integration (free unofficial API)
 //
-// Inline drain model (matches DIS02050A). translate_loop() runs on the
-// Arduino loop() task and processes at most one queue entry per call,
-// so there's no task/mutex/semaphore stack and no coupling to the web
-// dashboard's AsyncTCP lifecycle. Translations are identified by
+// translate_loop() processes one queue entry on the Arduino task. Only
+// the HTTP request runs on a helper task; while waiting, the Arduino
+// task calls service_radio without running other network consumers.
+// Translations are identified by
 // (chat_key, source_text) — no bubble pointers are stored, so the
 // queue survives chat navigation and UI teardown without any
 // stale-pointer hazard.
@@ -27,7 +27,7 @@
 #define TRANSLATE_LABEL_TAG 0xBEEF
 
 void translate_init();
-void translate_loop();
+void translate_loop(void (*service_radio)() = nullptr);
 
 // Queue a translation. text is the body to translate; chat_key is the
 // destination chat file key (ct_<hex> or ch_<idx>). Dedup is by

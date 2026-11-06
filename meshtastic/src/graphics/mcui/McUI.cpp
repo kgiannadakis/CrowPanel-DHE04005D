@@ -6,6 +6,7 @@
 #include "McStatusBar.h"
 #include "McTabBar.h"
 #include "McKeyboard.h"
+#include "McTextEdit.h"
 #include "screens/McScreens.h"
 #include "screens/McChatView.h"
 #include "data/McClock.h"
@@ -85,7 +86,7 @@ int page_height()
 
 int keyboard_height()
 {
-    return s_landscape ? 190 : 280;
+    return s_landscape ? 210 : 330;
 }
 
 bool landscape_active()
@@ -136,6 +137,9 @@ void switchTab(int idx)
     if (chatview_is_open())
         chatview_hide();
     if (s_active_tab == idx) return;
+    text_edit_close();
+    if (s_active_tab == TAB_NODES)
+        nodes_screen_on_hide();
     if (s_active_tab == TAB_MAPS)
         maps_screen_on_hide();
     for (int i = 0; i < 4; i++) {
@@ -147,6 +151,8 @@ void switchTab(int idx)
         }
     }
     s_active_tab = idx;
+    if (s_active_tab == TAB_NODES)
+        nodes_screen_on_show();
     if (s_active_tab == TAB_MAPS)
         maps_screen_on_show();
     tabbar_set_active(idx);
@@ -237,6 +243,7 @@ static void ui_task(void *)
         // blocking read never stalls the render/touch task.
         statusbar_poll_battery();
         if (crowpanel_p4::lvgl_lock(2)) {
+            text_edit_tick();
             const bool chats_active = (s_active_tab == TAB_CHATS) || chatview_is_open();
             if (s_active_tab == TAB_CHATS) {
                 chats_screen_tick();
@@ -262,6 +269,7 @@ static void ui_task(void *)
         }
 #else
         const bool chats_active = (s_active_tab == TAB_CHATS) || chatview_is_open();
+        text_edit_tick();
         if (s_active_tab == TAB_CHATS) {
             chats_screen_tick();
         } else {

@@ -82,6 +82,9 @@ class Router : protected concurrency::OSThread, protected PacketHistory
      */
     virtual void enqueueReceivedMessage(meshtastic_MeshPacket *p);
 
+    // Leave a slot for LoRa while MQTT yields to the router's next dispatch.
+    bool canAcceptMqttMessage() { return fromRadioQueue.numFree() > 1; }
+
     /**
      * Send a packet on a suitable interface.  This routine will
      * later free() the packet to pool.  This routine is not allowed to stall.

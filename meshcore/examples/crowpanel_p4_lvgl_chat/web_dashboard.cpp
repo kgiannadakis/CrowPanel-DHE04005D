@@ -4,6 +4,7 @@
 #include "web_dashboard.h"
 #include "persistence.h"
 #include "mesh_api.h"
+#include "crash_diagnostics.h"
 #include "repeater_ui.h"            // repeater_get_selected_name
 #include "utils.h"
 
@@ -14,13 +15,8 @@
 #include <LittleFS.h>
 #include <math.h>
 
-// P4 port: the HTTPS half of the dashboard (port 443, /position endpoints)
-// has moved to web_dashboard_https.cpp because ESPAsyncWebServer and
-// esp_http_server both define HTTP_GET at global scope and cannot coexist
-// in the same translation unit.
-// HTTPS support has been retired — see the comment block in
-// web_dashboard_https.cpp for the reasoning. Position coordinates are
-// entered manually on the plain-HTTP dashboard.
+// HTTP-only dashboard. A concurrent TLS server exceeded the P4's internal
+// memory budget. Position coordinates are entered manually over HTTP.
 #endif
 
 extern bool g_wifi_connected;
@@ -34,8 +30,6 @@ static char s_status[128] = "Disabled";
 #if defined(ESP32)
 static AsyncWebServer s_server(80);
 static AsyncWebSocket s_ws("/ws");
-// HTTPS state lives in web_dashboard_https.cpp. We just keep the
-// update_webdash_status() output coherent via webdash_https_is_running().
 #endif
 
 // ── Embedded HTML ───────────────────────────────────────────
@@ -735,8 +729,6 @@ static void handle_position_clear(AsyncWebServerRequest* req) {
     req->send(200, "application/json", position_state_json());
 }
 
-// HTTPS handlers live in web_dashboard_https.cpp.
-
 static void handle_stats(AsyncWebServerRequest* req) {
     char buf[256];
     snprintf(buf, sizeof(buf),
@@ -1083,21 +1075,14 @@ static void handle_rpt_delete_nobody(AsyncWebServerRequest* req) {
     req->send(ok ? 200 : 500, "text/plain", ok ? "OK" : "Failed");
 }
 
-// HTTPS server + cert task moved to web_dashboard_https.cpp.
-
-
 #endif // ESP32
 
 // ── Public API ──────────────────────────────────────────────
 
 void webdash_init() {
 #if defined(ESP32)
-    // Load the persisted Dashboard master switch from NVS. Defaults to
-    // false on a fresh device — when the dashboard is OFF the HTTP
-    // server, HTTPS server, Telegram bridge, and OTA updater all stay
-    // dormant; only NTP (one-shot at boot) and the translate bridge
-    // still use WiFi. Turning the toggle on in Settings → Web Apps
-    // brings everything up.
+    // Load the persisted Dashboard master switch from NVS (default off).
+    // NTP and translation can use Wi-Fi independently of the HTTP server.
     Preferences prefs;
     prefs.begin("webdash", true);      // read-only
     g_webdash_enabled = prefs.getBool("enabled", false);
@@ -1145,6 +1130,16 @@ void webdash_start() {
         s_server.on("/api/save_position", HTTP_GET, handle_position_set);
         s_server.on("/api/clear_position", HTTP_GET, handle_position_clear);
         s_server.on("/api/stats", HTTP_GET, handle_stats);
+        s_server.on("/api/rx", HTTP_GET, [](AsyncWebServerRequest* req) {
+            AsyncWebServerResponse* response = req->beginResponse(200, "text/plain; charset=utf-8", mesh_rx_report());
+            response->addHeader("Cache-Control", "no-store");
+            req->send(response);
+        });
+        s_server.on("/api/crash", HTTP_GET, [](AsyncWebServerRequest* req) {
+            AsyncWebServerResponse* response = req->beginResponse(200, "text/plain; charset=utf-8", crash_diagnostics_history());
+            response->addHeader("Cache-Control", "no-store");
+            req->send(response);
+        });
         s_server.on("/api/contacts", HTTP_GET, handle_contacts);
         s_server.on("/api/channels", HTTP_GET, handle_channels);
         s_server.on("/api/messages", HTTP_GET, handle_messages);

@@ -18,6 +18,11 @@ bool gt911_init(uint16_t panel_w, uint16_t panel_h);
 // When true, *x, *y are filled in panel coordinates.
 bool gt911_read(uint16_t* x, uint16_t* y);
 
+// -1 until idle and a genuine touch have verified INT against its configured
+// polarity; otherwise 0/1 is the active GPIO wake level. No I2C in these calls.
+int gt911_interrupt_wake_level(void);
+void gt911_disable_interrupt_wake(void);
+
 #ifdef __cplusplus
 }
 #endif

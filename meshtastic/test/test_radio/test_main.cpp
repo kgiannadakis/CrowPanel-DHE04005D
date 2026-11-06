@@ -63,6 +63,26 @@ static void test_bootstrapLoRaConfigFromPreset_setsDerivedFields_wideRegion()
     TEST_ASSERT_EQUAL_UINT32(9, cfg.spread_factor);
 }
 
+static void test_bootstrapLoRaConfigFromPreset_narrowSlow()
+{
+    meshtastic_Config_LoRaConfig cfg = meshtastic_Config_LoRaConfig_init_zero;
+    cfg.use_preset = true;
+    cfg.region = meshtastic_Config_LoRaConfig_RegionCode_EU_868;
+    cfg.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_NARROW_SLOW;
+
+    RadioInterface::bootstrapLoRaConfigFromPreset(cfg);
+
+    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_ModemPreset_NARROW_SLOW, cfg.modem_preset);
+    TEST_ASSERT_EQUAL_UINT16(62, cfg.bandwidth);
+    TEST_ASSERT_EQUAL_UINT32(8, cfg.spread_factor);
+    float bandwidth = 0;
+    uint8_t sf = 0, cr = 0;
+    modemPresetToParams(cfg.modem_preset, false, bandwidth, sf, cr);
+    TEST_ASSERT_FLOAT_WITHIN(0.0001f, 62.5f, bandwidth);
+    TEST_ASSERT_EQUAL_UINT8(8, sf);
+    TEST_ASSERT_EQUAL_UINT8(6, cr);
+}
+
 static void test_bootstrapLoRaConfigFromPreset_fallsBackIfBandwidthExceedsRegionSpan()
 {
     meshtastic_Config_LoRaConfig cfg = meshtastic_Config_LoRaConfig_init_zero;
@@ -93,6 +113,7 @@ void setup()
     RUN_TEST(test_bootstrapLoRaConfigFromPreset_noopWhenUsePresetFalse);
     RUN_TEST(test_bootstrapLoRaConfigFromPreset_setsDerivedFields_nonWideRegion);
     RUN_TEST(test_bootstrapLoRaConfigFromPreset_setsDerivedFields_wideRegion);
+    RUN_TEST(test_bootstrapLoRaConfigFromPreset_narrowSlow);
     RUN_TEST(test_bootstrapLoRaConfigFromPreset_fallsBackIfBandwidthExceedsRegionSpan);
     exit(UNITY_END());
 }

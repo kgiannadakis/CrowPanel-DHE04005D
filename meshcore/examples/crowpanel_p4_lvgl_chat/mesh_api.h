@@ -6,6 +6,7 @@
 // ============================================================
 
 #include <Arduino.h>
+#include "discovery_results.h"
 
 struct Preset;  // defined in app_globals.h
 
@@ -15,6 +16,13 @@ void mesh_set_path_hash_bytes(uint8_t bytes);
 uint8_t mesh_get_path_hash_bytes();
 void mesh_send_zero_hop_advert(int delay_ms);
 uint32_t mesh_send_discover_repeaters();
+uint32_t mesh_begin_repeater_discovery();
+bool mesh_finish_repeater_discovery();
+void mesh_clear_discovery_results();
+int mesh_get_discovery_results(DiscoveryResult* out, int capacity);
+bool mesh_get_discovery_result(const uint8_t* key, DiscoveryResult& out);
+bool mesh_try_get_current_rssi(float& rssi);
+String mesh_rx_report();
 void mesh_rename_if_non_empty(const char* name);
 int  mesh_join_hashtag_channel(const String& raw);
 int  mesh_join_private_channel(const String& name, const String& hex_key);
@@ -54,5 +62,7 @@ void mesh_populate_repeater_list();
 int  mesh_repeater_login(const uint8_t* pub_key, const char* password);
 int  mesh_repeater_request_status(const uint8_t* pub_key);
 int  mesh_repeater_request_neighbours(const uint8_t* pub_key);
+// UI-only: request neighbours and open the map without adding contacts.
+int  mesh_repeater_show_neighbours(const uint8_t* pub_key);
 int  mesh_repeater_send_advert(const uint8_t* pub_key);
 int  mesh_repeater_send_reboot(const uint8_t* pub_key);

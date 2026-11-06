@@ -125,10 +125,11 @@ static const uint8_t REQ_TYPE_GET_PKT_RECEIPT = 0x08;
 // g_landscape_mode is the only layout global here (C++ only)
 extern bool    g_landscape_mode;
 
-// Backlight constants
-static const uint8_t BL_OFF         = 0x05;
-static const uint8_t BL_MIN_VISIBLE = 0x06;
-static const uint8_t BL_MAX         = 0x10;
+// Backlight levels are STC8 duty percentages, not legacy v11 command bytes.
+#include "screen_power_policy.h"
+static const uint8_t BL_OFF         = ScreenPower::kBacklightOff;
+static const uint8_t BL_MIN_VISIBLE = ScreenPower::kMinBacklight;
+static const uint8_t BL_MAX         = ScreenPower::kMaxBacklight;
 
 // Speaker
 #define SPK_PIN  0
@@ -240,10 +241,6 @@ extern bool g_manual_discover_active;
 extern uint32_t g_discover_tag;
 extern bool g_deferred_discover_done;
 
-// Discover response tracking (for listing results at scan-done)
-#define MAX_DISCOVER_RESULTS 16
-extern char g_discover_names[MAX_DISCOVER_RESULTS][32];
-extern int  g_discover_result_count;
 extern bool g_purged_this_session;
 extern bool    g_speaker_enabled;
 // 0..100 volume percent. Scales the I2S sine amplitude in utils.cpp

@@ -35,20 +35,27 @@ void btn_lbl(lv_obj_t* btn, const char* txt) {
 }
 
 // ---- Settings callbacks ----
-void cb_brightness(lv_event_t*) {
+void cb_brightness(lv_event_t* e) {
   if (!ui_brightnessslider) return;
 
   int v    = lv_slider_get_value(ui_brightnessslider);
   int vmax = lv_slider_get_max_value(ui_brightnessslider);
-  if (vmax <= 0) vmax = 100;
-  if (v > vmax)  vmax = v;
-
-  uint8_t bl = (uint8_t)(BL_MIN_VISIBLE + (long)(BL_MAX - BL_MIN_VISIBLE) * (long)v / (long)vmax);
-  if (bl < BL_MIN_VISIBLE) bl = BL_MIN_VISIBLE;
-  if (bl > BL_MAX) bl = BL_MAX;
+  const uint8_t bl = ScreenPower::brightnessFromSlider(v, vmax);
 
   g_backlight_level = bl;
-  if (g_screen_awake) i2c_cmd(bl);
+  if (ScreenPower::kDisplayTaskBacklight) {
+    g_ramp_current = 0;
+    display_request_backlight(g_screen_awake ? bl : 0);
+  } else if (g_screen_awake && display_backlight_ready()) {
+    g_ramp_current = 0;
+    i2c_cmd(bl);
+  } else if (g_screen_awake) {
+    g_ramp_target = bl;
+    g_ramp_current = BL_MIN_VISIBLE;
+  }
+  // Keep dragging responsive; commit once when the user lifts their finger.
+  if (lv_event_get_code(e) == LV_EVENT_RELEASED && !save_brightness_nvs(bl))
+    serialmon_append("Brightness could not be saved");
 }
 
 void cb_volume(lv_event_t* e) {
@@ -110,8 +117,13 @@ void cb_txpower_ready(lv_event_t*) {
   if (val < 1) val = 1;
   if (val > 22) val = 22;
   int8_t dbm = (int8_t)val;
+  if (g_mesh_mutex && xSemaphoreTake(g_mesh_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+    serialmon_append("Radio busy; try setting transmit power again");
+    return;
+  }
   radio_set_tx_power(dbm);
   mesh_set_tx_power_pref(dbm);
+  if (g_mesh_mutex) xSemaphoreGive(g_mesh_mutex);
   // Persist to NVS
   {
     Preferences p;
@@ -172,8 +184,6 @@ void cb_auto_contact_toggle(lv_event_t*) {
   g_auto_contact_enabled = !g_auto_contact_enabled;
   ui_apply_auto_contact_state();
   serialmon_append(g_auto_contact_enabled ? "Auto-contact discovery: ON" : "Auto-contact discovery: OFF");
-  // Prime discovery when enabling so nearby nodes see us quickly.
-  if (g_auto_contact_enabled) mesh_send_flood_advert(150);
   save_ui_prefs_nvs();
 }
 
@@ -279,21 +289,13 @@ static lv_timer_t* s_discover_timer = nullptr;
 
 void cb_discover_repeaters(lv_event_t*) {
   if (!g_mesh) return;
+  if (g_manual_discover_active) return;
 
-  // Reset discover response tracking
-  g_discover_result_count = 0;
-
-  // Mark manual-discover active BEFORE transmit to avoid a race where a
-  // fast reply arrives before the gate is raised and gets filtered out.
-  g_manual_discover_active = true;
-  // Flood one advert + one discover request so multi-hop repeaters can answer.
-  mesh_send_flood_advert(100);
-  uint32_t tag = mesh_send_discover_repeaters();
-  if (tag == 0) {
-    g_manual_discover_active = false;
+  // Queue the probe and arm its reply tag under the radio-task mutex.
+  if (!mesh_begin_repeater_discovery()) {
+    serialmon_append("Discovery could not start: mesh busy or packet queue unavailable. Try again.");
     return;
   }
-  g_discover_tag = tag;
 
   serialmon_append("Searching for nearby repeaters");
 
@@ -302,11 +304,13 @@ void cb_discover_repeaters(lv_event_t*) {
     btn_lbl(g_discover_repeaters_btn, LV_SYMBOL_REFRESH " Scanning...");
   }
 
-  // End scan after 15s
+  // Keep the original 15-second scan window; closing must not block LVGL.
   if (s_discover_timer) lv_timer_del(s_discover_timer);
   s_discover_timer = lv_timer_create([](lv_timer_t* t) {
-    g_manual_discover_active = false;
-    g_discover_tag = 0;
+    if (!mesh_finish_repeater_discovery()) {
+      lv_timer_set_period(t, 100);
+      return;
+    }
     repeater_populate_dropdown();
 
     if (g_discover_repeaters_btn) {
@@ -314,13 +318,31 @@ void cb_discover_repeaters(lv_event_t*) {
       btn_lbl(g_discover_repeaters_btn, LV_SYMBOL_GPS " Repeater Discovery");
     }
 
-    int n = g_discover_result_count;
-    char msg[48];
-    snprintf(msg, sizeof(msg), "Scan done: %d repeater%s found", n, n == 1 ? "" : "s");
-    serialmon_append(msg);
+    static DiscoveryResult results[MAX_DISCOVER_RESULTS];
+    const int n = mesh_get_discovery_results(results, MAX_DISCOVER_RESULTS);
+    // Strongest local replies first; do not sort by the remote request SNR.
+    for (int i = 1; i < n; ++i) {
+      const DiscoveryResult entry = results[i];
+      int j = i;
+      while (j > 0 && results[j - 1].rssi < entry.rssi) {
+        results[j] = results[j - 1];
+        --j;
+      }
+      results[j] = entry;
+    }
+    if (!n) {
+      serialmon_append("No direct discovery replies received in this scan.");
+    } else {
+      char msg[48];
+      snprintf(msg, sizeof(msg), "Scan done: %d repeater%s replied", n, n == 1 ? "" : "s");
+      serialmon_append(msg);
+    }
     for (int i = 0; i < n; i++) {
-      char line[64];
-      snprintf(line, sizeof(line), "  %d. %s", i + 1, g_discover_names[i]);
+      char line[160];
+      snprintf(line, sizeof(line), "  %d. %s | RX: %.1f dBm | SNR: %+.2f dB | Request SNR: %+.2f dB | Replies: %u",
+               i + 1, results[i].name, results[i].rssi,
+               results[i].rx_snr_x4 / 4.0f, results[i].request_snr_x4 / 4.0f,
+               (unsigned)results[i].replies);
       serialmon_append_color(0x00FFC8, line);
     }
 
@@ -341,7 +363,8 @@ struct FloorNoiseJob {
 };
 static void floor_noise_tick(lv_timer_t* t) {
   FloorNoiseJob* j = (FloorNoiseJob*)t->user_data;
-  float r = radio_driver.getCurrentRSSI();
+  float r;
+  if (!mesh_try_get_current_rssi(r)) return;
   j->sum += r;
   if (j->idx == 0 || r < j->mn) j->mn = r;
   if (r > j->mx) j->mx = r;
@@ -353,15 +376,14 @@ static void floor_noise_tick(lv_timer_t* t) {
              avg, j->mn, j->mx);
     serialmon_append(buf);
     delete j;
-    // Don't lv_timer_del(t) here — LVGL auto-deletes when the repeat
-    // count hits zero (set to 20 at creation), and calling both would
-    // double-free the timer struct.
+    // Count successful samples, not timer firings skipped while RX owns mesh.
+    lv_timer_del(t);
   }
 }
 void cb_floor_noise(lv_event_t*) {
   FloorNoiseJob* j = new FloorNoiseJob{0, 0.0f, 0.0f, -200.0f};
   lv_timer_t* t = lv_timer_create(floor_noise_tick, 5, j);
-  lv_timer_set_repeat_count(t, 20);
+  if (!t) delete j;
 }
 
 // ---- Orientation toggle ----

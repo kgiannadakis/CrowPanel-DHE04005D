@@ -2,6 +2,7 @@
 
 #include "McChatView.h"
 #include "../McKeyboard.h"
+#include "../McTextEdit.h"
 #include "../McStatusBar.h"
 #include "../McTheme.h"
 #include "../McUI.h"
@@ -278,6 +279,7 @@ static void add_bubble(const McMessage &m)
     lv_obj_set_width(body, lv_pct(100));
     lv_obj_set_style_text_color(body, lv_color_hex(TH_TEXT), 0);
     lv_obj_set_style_text_font(body, MCUI_FONT_16, 0);
+    text_edit_register_message(body);
 
     char foot[48] = {0};
     uint32_t foot_color = TH_TEXT3;
@@ -516,6 +518,7 @@ void chatview_tick()
 {
     if (!chatview_is_open()) return;
     refresh_header_time();
+    if (text_edit_message_selected()) return;
 
     const bool typing = keyboard_is_visible();
     const uint32_t now = millis();

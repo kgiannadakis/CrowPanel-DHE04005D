@@ -21,7 +21,7 @@ void update_timelabel();
 String time_string_now();
 
 // Battery (onboard STC8). battery_poll() reads I2C off-lock; update_batterylabel()
-// applies the cached reading to the status bar under the LVGL lock.
+// applies the filtered reading to every tab's header under the LVGL lock.
 void battery_poll();
 void update_batterylabel();
 
@@ -63,7 +63,7 @@ void deferred_msg_push(bool out, const char* txt, const char* sig = "", bool liv
 
 // I2C helpers
 bool i2c_ok(uint8_t a);
-void i2c_cmd(uint8_t c);
+bool i2c_cmd(uint8_t c);
 
 // Screen helpers
 void note_touch_activity();

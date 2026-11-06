@@ -31,6 +31,7 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -179,6 +180,12 @@ static volatile bool s_regen_keys_req   = false;
 static PendingOwner  s_pending_owner    = {};
 static SemaphoreHandle_t s_aux_lock     = nullptr;
 
+enum class SetupSaveStatus { Idle, Pending, Failed, Saved };
+static std::atomic<SetupSaveStatus> s_setup_save_status{SetupSaveStatus::Idle};
+static PendingOwner s_setup_owner = {};
+static meshtastic_Config_LoRaConfig_RegionCode s_setup_region;
+static bool s_setup_req = false;
+
 struct PendingPosition {
     bool   set;
     double lat_deg;
@@ -263,6 +270,40 @@ class McAuxThread : public concurrency::OSThread
   protected:
     int32_t runOnce() override
     {
+
+        PendingOwner setup_owner = {};
+        meshtastic_Config_LoRaConfig_RegionCode setup_region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
+        aux_lock_init();
+        xSemaphoreTake(s_aux_lock, portMAX_DELAY);
+        bool setup_req = s_setup_req;
+        if (setup_req) {
+            setup_owner = s_setup_owner;
+            setup_region = s_setup_region;
+            s_setup_req = false;
+        }
+        xSemaphoreGive(s_aux_lock);
+        if (setup_req) {
+            bool saved = false;
+            if (nodeDB) {
+                memcpy(owner.long_name, setup_owner.long_name, sizeof(owner.long_name));
+                memcpy(owner.short_name, setup_owner.short_name, sizeof(owner.short_name));
+                devicestate.has_owner = true;
+                config.lora.region = setup_region;
+                nodeDB->resetRadioConfig();
+                if (service) service->reloadOwner(false);
+                // Setup spans several preference files; never reboot on a partial save.
+                saved = nodeDB->saveToDisk(SEGMENT_CONFIG | SEGMENT_DEVICESTATE |
+                                          SEGMENT_NODEDATABASE | SEGMENT_CHANNELS);
+            }
+            s_setup_save_status = saved ? SetupSaveStatus::Saved : SetupSaveStatus::Failed;
+            if (saved) {
+                LOG_INFO("mcui: first setup saved (region=%d); restarting", (int)setup_region);
+                rebootAtMsec = millis() + 1500;
+            } else {
+                LOG_ERROR("mcui: first setup save failed; not restarting");
+            }
+            return 500;
+        }
 
         if (s_owner_req) {
             aux_lock_init();
@@ -482,6 +523,7 @@ static const EnumEntry PRESETS[] = {
     {meshtastic_Config_LoRaConfig_ModemPreset_SHORT_FAST,       "Short Fast"},
     {meshtastic_Config_LoRaConfig_ModemPreset_SHORT_TURBO,      "Short Turbo"},
     {meshtastic_Config_LoRaConfig_ModemPreset_LONG_TURBO,       "Long Turbo"},
+    {meshtastic_Config_LoRaConfig_ModemPreset_NARROW_SLOW,      "Narrow Slow"},
 };
 static constexpr int PRESET_COUNT = sizeof(PRESETS) / sizeof(PRESETS[0]);
 
@@ -1319,6 +1361,8 @@ static lv_obj_t *s_onboarding_short   = nullptr;
 static lv_obj_t *s_onboarding_region  = nullptr;
 static lv_obj_t *s_onboarding_status  = nullptr;
 static bool      s_onboarding_shown   = false;
+static lv_timer_t *s_onboarding_save_timer = nullptr;
+static lv_obj_t *s_onboarding_save_button = nullptr;
 
 static bool onboarding_needed()
 {
@@ -1330,6 +1374,11 @@ static bool onboarding_needed()
 static void onboarding_close()
 {
     keyboard_hide();
+    if (s_onboarding_save_timer) {
+        lv_timer_delete(s_onboarding_save_timer);
+        s_onboarding_save_timer = nullptr;
+    }
+    s_onboarding_save_button = nullptr;
     if (s_onboarding_overlay) {
         lv_obj_delete(s_onboarding_overlay);
         s_onboarding_overlay = nullptr;
@@ -1407,15 +1456,35 @@ static void onboarding_save_cb(lv_event_t *e)
         return;
     }
 
+    if (s_setup_save_status.load() == SetupSaveStatus::Pending ||
+        s_setup_save_status.load() == SetupSaveStatus::Saved) return;
     ensure_aux_thread();
-    queue_owner_edit(longn, shortn);
-    config.lora.region = (meshtastic_Config_LoRaConfig_RegionCode)REGIONS[idx].code;
-    cfg_mark_dirty();
+    aux_lock_init();
+    xSemaphoreTake(s_aux_lock, portMAX_DELAY);
+    s_setup_owner = {};
+    strncpy(s_setup_owner.long_name, longn, sizeof(s_setup_owner.long_name) - 1);
+    strncpy(s_setup_owner.short_name, shortn, sizeof(s_setup_owner.short_name) - 1);
+    s_setup_region = (meshtastic_Config_LoRaConfig_RegionCode)REGIONS[idx].code;
+    s_setup_save_status = SetupSaveStatus::Pending;
+    s_setup_req = true;
+    xSemaphoreGive(s_aux_lock);
 
     lv_obj_t *btn = (lv_obj_t *)lv_event_get_current_target(e);
+    s_onboarding_save_button = btn;
     if (btn) lv_obj_add_state(btn, LV_STATE_DISABLED);
     if (s_onboarding_status)
-        lv_label_set_text(s_onboarding_status, "Saving setup... rebooting soon.");
+        lv_label_set_text(s_onboarding_status, "Saving setup...");
+    s_onboarding_save_timer = lv_timer_create([](lv_timer_t *timer) {
+        auto status = s_setup_save_status.load();
+        if (status != SetupSaveStatus::Failed && status != SetupSaveStatus::Saved) return;
+        if (s_onboarding_status)
+            lv_label_set_text(s_onboarding_status, status == SetupSaveStatus::Saved
+                ? "Setup saved. Restarting..." : "Could not save setup. Please try again.");
+        if (status == SetupSaveStatus::Failed && s_onboarding_save_button)
+            lv_obj_remove_state(s_onboarding_save_button, LV_STATE_DISABLED);
+        s_onboarding_save_timer = nullptr;
+        lv_timer_delete(timer);
+    }, 100, nullptr);
     s_onboarding_shown = true;
 }
 
@@ -2232,9 +2301,11 @@ static void preset_changed_cb(lv_event_t *e)
     uint16_t idx = lv_dropdown_get_selected((lv_obj_t *)lv_event_get_target(e));
     if (idx >= PRESET_COUNT) return;
     auto sel = (meshtastic_Config_LoRaConfig_ModemPreset)PRESETS[idx].code;
-    if (sel == config.lora.modem_preset && config.lora.use_preset) return;
+    if (sel == config.lora.modem_preset && config.lora.use_preset && config.lora.coding_rate == 0) return;
     config.lora.use_preset   = true;
     config.lora.modem_preset = sel;
+    // Zero lets the selected preset supply its own coding rate.
+    config.lora.coding_rate  = 0;
     cfg_mark_dirty();
 #if defined(CROWPANEL_DHE04005D)
     crowpanel_log_heap("preset changed");

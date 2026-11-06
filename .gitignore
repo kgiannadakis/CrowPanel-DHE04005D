@@ -27,15 +27,35 @@ venv/
 # Build leftovers
 out/
 .cache/
+site/
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
 compile_commands.json
+*.elf
+*.o
+*.obj
+*.tmp
+*.swp
+*.swo
+node_modules/
+.platformio/
+
+# CrowPanel scratch data and generated assets (keep docs/ release assets)
+/meshcore/tmp/
+/meshcore/sdcard/
+/meshcore/tools/emoji_atlas_*.bin
 
 # Device logs, crash dumps, and local tooling
 **/logs/
 *.log
 *.dmp
 core.*
-.claude/
-**/.claude/
+.local-tools/
+**/settings.local.json
+scheduled_tasks.lock
 .mcp.json
 **/.mcp.json
 
@@ -51,6 +71,8 @@ core.*
 !**/.env.example
 secrets.ini
 credentials.json
+dash_cert.pem
+dash_key.pem
 
 # OS files
 .DS_Store

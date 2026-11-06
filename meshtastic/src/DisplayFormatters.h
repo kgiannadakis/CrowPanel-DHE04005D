@@ -1,5 +1,5 @@
 #pragma once
-#include "NodeDB.h"
+#include "mesh/generated/meshtastic/config.pb.h"
 
 class DisplayFormatters
 {

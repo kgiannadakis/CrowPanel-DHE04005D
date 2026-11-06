@@ -365,6 +365,9 @@ void fsInit()
     preFSBegin();
     if (!FSBegin()) {
         LOG_ERROR("Filesystem mount failed");
+#if defined(CROWPANEL_DHE04005D)
+        LOG_ERROR("CrowPanel preferences preserved: nonblank storage is never automatically formatted");
+#endif
         // assert(0); This auto-formats the partition, so no need to fail here.
     }
 #if defined(ARCH_ESP32)

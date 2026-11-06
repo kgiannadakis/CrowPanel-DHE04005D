@@ -40,6 +40,15 @@ void lvgl_unlock(void);
 // nothing's pending.
 void display_handle_ppa_recovery_if_pending(void);
 
+// Thread-safe: the backlight ramp waits for restored clocks and a fresh frame.
+bool display_backlight_ready(void);
+// Experimental build: publish a PWM target; only the display task writes it.
+void display_request_backlight(uint8_t level);
+// Caller holds lvgl_lock(): no RGB/PPA DMA may be active during CPU sleep.
+bool display_cpu_sleep_ready(void);
+// Wake the UI task after manual sleep; do not rely on RTOS tick catch-up.
+void display_notify_service(void);
+
 #ifdef __cplusplus
 }
 #endif
@@ -55,8 +64,11 @@ void kb_apply_language(lv_obj_t* kb);
 void setup_keyboard(lv_obj_t* kb);
 void kb_hide(lv_obj_t* kb, lv_obj_t* ta);
 void kb_show(lv_obj_t* kb, lv_obj_t* ta);
+bool kb_edit_touch_contains(int x, int y);
 
 void speaker_init();
+bool speaker_try_idle_lock();
+void speaker_idle_unlock();
 void beep_msg_in();
 void beep_msg_out();
 void beep_error();

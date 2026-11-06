@@ -3,13 +3,18 @@
 #include "NodeDB.h"
 #include "PowerFSM.h"
 #include "ServiceEnvelope.h"
+#include "MqttTextPolicy.h"
 #include "configuration.h"
 #include "main.h"
 #include "mesh/Channels.h"
+#include "mesh/PositionCoordinates.h"
 #include "mesh/Router.h"
 #include "mesh/generated/meshtastic/mqtt.pb.h"
 #include "mesh/generated/meshtastic/telemetry.pb.h"
 #include "modules/RoutingModule.h"
+#if defined(CROWPANEL_DHE04005D) && !MESHTASTIC_EXCLUDE_TRACEROUTE
+#include "modules/TraceRouteModule.h"
+#endif
 #if defined(ARCH_ESP32)
 #include "../mesh/generated/meshtastic/paxcount.pb.h"
 #endif
@@ -38,6 +43,7 @@
 #endif
 #include <Throttle.h>
 #include <assert.h>
+#include <new>
 #include <utility>
 
 #include "IPAddress.h"
@@ -68,17 +74,15 @@ size_t CrowPanelMqttClient::write(const uint8_t *buf, size_t size)
         return 0;
 
     size_t total = 0;
-    uint8_t retries = 8;
-    while (total < size && retries > 0) {
+    const uint32_t started = millis();
+    while (total < size && Throttle::isWithinTimespanMs(started, 100)) {
         const int sent = ::send(sock, buf + total, size - total, MSG_DONTWAIT);
         if (sent > 0) {
             total += sent;
-            retries = 8;
             continue;
         }
 
         if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
-            --retries;
             delay(1);
             continue;
         }
@@ -88,7 +92,80 @@ size_t CrowPanelMqttClient::write(const uint8_t *buf, size_t size)
         break;
     }
 
+    if (total != size)
+        stop(); // A partial MQTT frame cannot be followed by another frame.
+
     return total;
+}
+
+int CrowPanelMqttClient::available()
+{
+    if (rxFrame.available())
+        return rxFrame.available();
+    if (!_connected || fd() < 0)
+        return 0;
+    if (rxFrame.partial() && !Throttle::isWithinTimespanMs(rxFrameStartedMs, 5000)) {
+        LOG_WARN("MQTT TCP RX: incomplete frame timed out; disconnecting");
+        stop();
+        return 0;
+    }
+
+    for (int i = 0; i < 8 && rxFrame.writeSize(); ++i) {
+        const int received = ::recv(fd(), rxFrame.writeData(), rxFrame.writeSize(), MSG_DONTWAIT);
+        if (received > 0) {
+            if (!rxFrame.partial())
+                rxFrameStartedMs = millis();
+            rxFrame.commit(received);
+            if (rxFrame.failed()) {
+                LOG_WARN("MQTT TCP RX: malformed or oversized frame; disconnecting");
+                stop();
+                return 0;
+            }
+        } else if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            break;
+        } else {
+            stop();
+            return 0;
+        }
+    }
+    return rxFrame.available();
+}
+
+int CrowPanelMqttClient::read()
+{
+    uint8_t data;
+    return read(&data, 1) == 1 ? data : -1;
+}
+
+int CrowPanelMqttClient::read(uint8_t *buf, size_t size)
+{
+    return rxFrame.read(buf, size);
+}
+
+int CrowPanelMqttClient::peek()
+{
+    available();
+    return rxFrame.peek();
+}
+
+uint8_t CrowPanelMqttClient::connected()
+{
+    if (rxFrame.available())
+        return true;
+    if (!_connected || fd() < 0)
+        return false;
+    uint8_t byte;
+    const int result = ::recv(fd(), &byte, 1, MSG_DONTWAIT | MSG_PEEK);
+    if (result == 0 || (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+        stop();
+    return _connected;
+}
+
+void CrowPanelMqttClient::stop()
+{
+    rxFrame.reset();
+    rxFrameStartedMs = 0;
+    WiFiClient::stop();
 }
 #endif
 
@@ -112,49 +189,39 @@ static uint32_t lastIgnoredContactLog = 0;
 static uint32_t ignoredContactCount = 0;
 static uint32_t lastIgnoredDirectOtherLog = 0;
 static uint32_t ignoredDirectOtherCount = 0;
-static uint32_t lastPublicBudgetLog = 0;
-static uint32_t publicBudgetDropCount = 0;
-static uint32_t publicBroadcastDecodeWindowMs = 0;
-static uint8_t publicBroadcastDecodeCount = 0;
-static uint32_t publicDownlinkPauseUntilMs = 0;
 static bool crowpanelDeferSubscriptionsDuringPrewarm = false;
 static bool crowpanelSubscriptionsPending = false;
 
+enum class MqttRxResult { Invalid, Channel, Plaintext, Decode, OtherNode, Filtered, NoMemory, Text, Contact, Ack, Trace, Position, Count };
 #if defined(CROWPANEL_DHE04005D)
-static constexpr uint8_t MQTT_SUBSCRIBE_QOS = 0;
-static constexpr uint16_t MQTT_KEEPALIVE_SECONDS = 0;
-// 8 (was 1): the per-second decode budget for encrypted broadcasts (channel
-// text is an encrypted broadcast, so 1/s could DROP your own channel traffic on
-// a busy public feed). Raised now that the DMA-pressure guard + lifeboat below
-// protect against the old SDIO RX-buffer assert. Known foreign-key spammers are
-// muted by sender BEFORE consuming this budget (see isBadSender), so the budget
-// is mostly spent on decodable traffic.
-static constexpr uint8_t MQTT_PUBLIC_BROADCAST_DECRYPTS_PER_SEC = 8;
-// 100 ms (was 2000): how often the broker socket is drained. This is the primary
-// message-delivery latency. Polling faster ALSO reduces DMA pressure — unread
-// broker data accumulates as lwIP pbufs in the same internal DMA pool ESP-Hosted
-// needs, so a slow poll let it erode (14K->1K in 2 min); draining promptly frees
-// those pbufs. The DMA-pressure guard at the top of runOnce() remains the safety
-// net if a burst still collapses the pool. Stock meshtastic uses 20 ms.
-static constexpr uint32_t MQTT_PUBLIC_LOOP_INTERVAL_MS = 100;
-// Short blanket pause, and only after several consecutive failures: a single
-// foreign-keyed packet must not make us deaf to the whole public broker.
-// Persistent offenders are handled per-gateway (see badGateways below).
-static constexpr uint32_t MQTT_PUBLIC_DECODE_FAILURE_PAUSE_MS = 3000;
-static constexpr uint8_t MQTT_PUBLIC_DECODE_FAILURE_THRESHOLD = 3;
-// Mute by SENDER node id, not by gateway: gateways relay a mix of good
-// (default-key) and foreign-keyed traffic, so muting a gateway also drops
-// good packets. The `from` header is cleartext even on encrypted payloads.
-static constexpr uint32_t MQTT_BAD_SENDER_SKIP_MS = 600000; // 10 min
-static constexpr size_t MQTT_BAD_SENDER_SLOTS = 8;
-struct BadSenderEntry {
-    uint32_t node;    // sending node id whose packets we can't decode
-    uint32_t untilMs; // skip this sender until this time; 0 = free slot
-};
-static BadSenderEntry badSenders[MQTT_BAD_SENDER_SLOTS] = {};
-static uint8_t consecutiveDecodeFailures = 0;
-static uint32_t lastBadSenderSkipLog = 0;
-static uint32_t badSenderSkipCount = 0;
+static uint32_t mqttRxPackets = 0;
+static uint32_t lastMqttTraceRequestMs = 0;
+static uint32_t mqttRxCounts[static_cast<size_t>(MqttRxResult::Count)] = {};
+static uint32_t lastMqttRxSummary = 0;
+#endif
+
+inline void recordMqttRx(MqttRxResult result)
+{
+#if defined(CROWPANEL_DHE04005D)
+    ++mqttRxCounts[static_cast<size_t>(result)];
+#else
+    (void)result;
+#endif
+}
+
+inline uint32_t mqttRxCount(MqttRxResult result)
+{
+#if defined(CROWPANEL_DHE04005D)
+    return mqttRxCounts[static_cast<size_t>(result)];
+#else
+    return 0;
+#endif
+}
+
+#if defined(CROWPANEL_DHE04005D)
+static constexpr uint8_t MQTT_SUBSCRIBE_QOS = 1;
+static constexpr uint16_t MQTT_KEEPALIVE_SECONDS = 30;
+static constexpr uint32_t MQTT_PUBLIC_LOOP_INTERVAL_MS = 20;
 #else
 static constexpr uint8_t MQTT_SUBSCRIBE_QOS = 1;
 static constexpr uint16_t MQTT_KEEPALIVE_SECONDS = 15;
@@ -175,68 +242,6 @@ inline bool isCrowPanelPublicDefaultMqtt()
     return false;
 #endif
 }
-
-inline bool isPublicDownlinkPaused()
-{
-#if defined(CROWPANEL_DHE04005D)
-    return publicDownlinkPauseUntilMs != 0 && (int32_t)(publicDownlinkPauseUntilMs - millis()) > 0;
-#else
-    return false;
-#endif
-}
-
-#if defined(CROWPANEL_DHE04005D)
-inline bool isBadSender(uint32_t node)
-{
-    if (node == 0)
-        return false;
-    const uint32_t now = millis();
-    for (auto &e : badSenders) {
-        if (e.untilMs != 0 && (int32_t)(e.untilMs - now) <= 0)
-            e.untilMs = 0; // expired
-        if (e.untilMs != 0 && e.node == node)
-            return true;
-    }
-    return false;
-}
-
-inline void markBadSender(uint32_t node)
-{
-    if (node == 0)
-        return;
-    const uint32_t now = millis();
-    BadSenderEntry *slot = nullptr;
-    BadSenderEntry *oldest = &badSenders[0];
-    for (auto &e : badSenders) {
-        if (e.untilMs != 0 && e.node == node) {
-            slot = &e; // already listed: refresh expiry
-            break;
-        }
-        if (!slot && (e.untilMs == 0 || (int32_t)(e.untilMs - now) <= 0))
-            slot = &e;
-        if ((int32_t)(e.untilMs - oldest->untilMs) < 0)
-            oldest = &e;
-    }
-    if (!slot)
-        slot = oldest; // all slots busy: recycle the one expiring soonest
-    slot->node = node;
-    slot->untilMs = now + MQTT_BAD_SENDER_SKIP_MS;
-    if (slot->untilMs == 0)
-        slot->untilMs = 1; // 0 means "free slot"
-    LOG_WARN("CrowPanel MQTT skip sender 0x%08x for %us: undecodable traffic", (unsigned)node,
-             (unsigned)(MQTT_BAD_SENDER_SKIP_MS / 1000));
-}
-
-inline void logBadSenderSkip(uint32_t node)
-{
-    badSenderSkipCount++;
-    if (lastBadSenderSkipLog == 0 || !Throttle::isWithinTimespanMs(lastBadSenderSkipLog, MQTT_REJECT_LOG_INTERVAL_MS)) {
-        LOG_DEBUG("Skipped packets from foreign-keyed MQTT senders: count=%u latest 0x%08x", badSenderSkipCount, (unsigned)node);
-        badSenderSkipCount = 0;
-        lastBadSenderSkipLog = millis();
-    }
-}
-#endif
 
 inline bool mqttContactDiscoveryEnabled()
 {
@@ -305,41 +310,14 @@ inline void logIgnoredDirectToOtherMqtt(NodeNum to)
     }
 }
 
-inline bool allowPublicMqttBroadcastDecode(const meshtastic_MeshPacket &p)
-{
-#if defined(CROWPANEL_DHE04005D)
-    if (!isCrowPanelPublicDefaultMqtt() || p.which_payload_variant != meshtastic_MeshPacket_encrypted_tag || !isBroadcast(p.to))
-        return true;
-    if (isPublicDownlinkPaused())
-        return false;
-
-    const uint32_t now = millis();
-    if (publicBroadcastDecodeWindowMs == 0 || !Throttle::isWithinTimespanMs(publicBroadcastDecodeWindowMs, 1000)) {
-        publicBroadcastDecodeWindowMs = now;
-        publicBroadcastDecodeCount = 0;
-    }
-
-    if (publicBroadcastDecodeCount < MQTT_PUBLIC_BROADCAST_DECRYPTS_PER_SEC) {
-        publicBroadcastDecodeCount++;
-        return true;
-    }
-
-    publicBudgetDropCount++;
-    if (lastPublicBudgetLog == 0 || !Throttle::isWithinTimespanMs(lastPublicBudgetLog, MQTT_REJECT_LOG_INTERVAL_MS)) {
-        LOG_WARN("CrowPanel public MQTT broadcast budget: skipped=%u", publicBudgetDropCount);
-        publicBudgetDropCount = 0;
-        lastPublicBudgetLog = now;
-    }
-    return false;
-#else
-    return true;
-#endif
-}
-
 inline void onReceiveProto(char *topic, byte *payload, size_t length)
 {
+#if defined(CROWPANEL_DHE04005D)
+    ++mqttRxPackets;
+#endif
     const DecodedServiceEnvelope e(payload, length);
     if (!e.validDecode || e.channel_id == NULL || e.gateway_id == NULL || e.packet == NULL) {
+        recordMqttRx(MqttRxResult::Invalid);
         logInvalidServiceEnvelope(topic, length);
         return;
     }
@@ -348,6 +326,7 @@ inline void onReceiveProto(char *topic, byte *payload, size_t length)
     // Find channel by channel_id and check downlink_enabled
     if (!(strcmp(e.channel_id, "PKI") == 0 ||
           (strcmp(e.channel_id, channels.getGlobalId(ch.index)) == 0 && ch.settings.downlink_enabled))) {
+        recordMqttRx(MqttRxResult::Channel);
         return;
     }
 
@@ -362,6 +341,7 @@ inline void onReceiveProto(char *topic, byte *payload, size_t length)
     }
 
     if (strcmp(e.channel_id, "PKI") == 0 && !anyChannelHasDownlink) {
+        recordMqttRx(MqttRxResult::Channel);
         return;
     }
     // Generate node ID from nodenum for comparison
@@ -385,6 +365,7 @@ inline void onReceiveProto(char *topic, byte *payload, size_t length)
     }
 
     if (e.packet->hop_limit > HOP_MAX || e.packet->hop_start > HOP_MAX) {
+        recordMqttRx(MqttRxResult::Invalid);
         LOG_DEBUG("Invalid hop_limit(%u) or hop_start(%u)", e.packet->hop_limit, e.packet->hop_start);
         return;
     }
@@ -392,26 +373,106 @@ inline void onReceiveProto(char *topic, byte *payload, size_t length)
     const bool isPkiTopic = strcmp(e.channel_id, "PKI") == 0;
     if (e.packet->which_payload_variant == meshtastic_MeshPacket_decoded_tag) {
         if (moduleConfig.mqtt.encryption_enabled) {
+            recordMqttRx(MqttRxResult::Plaintext);
+#if defined(CROWPANEL_DHE04005D) && !MESHTASTIC_EXCLUDE_TRACEROUTE
+            if (traceRouteModule)
+                traceRouteModule->noteMqttReplyRejected(*e.packet, "unencrypted MQTT reply with encryption enabled");
+#endif
             LOG_DEBUG("Ignore decoded message on MQTT, encryption is enabled");
             return;
         }
         if (e.packet->decoded.portnum == meshtastic_PortNum_ADMIN_APP) {
+            recordMqttRx(MqttRxResult::Filtered);
             LOG_DEBUG("Ignore decoded admin packet");
             return;
         }
+#if !defined(CROWPANEL_DHE04005D)
         if (isMqttContactDiscoveryPort(e.packet->decoded.portnum)) {
             logIgnoredMqttContactDiscovery(e.packet->decoded.portnum);
             return;
         }
+#endif
     } else if (!isPkiTopic && e.packet->which_payload_variant == meshtastic_MeshPacket_encrypted_tag &&
                isDirectToAnotherNode(*e.packet)) {
+        recordMqttRx(MqttRxResult::OtherNode);
         logIgnoredDirectToOtherMqtt(e.packet->to);
         return;
     } else if (e.packet->which_payload_variant != meshtastic_MeshPacket_encrypted_tag) {
+        recordMqttRx(MqttRxResult::Invalid);
         logInvalidServiceEnvelope(topic, length);
         return;
     }
 
+#if defined(CROWPANEL_DHE04005D)
+    if (!router)
+        return;
+    if (isDirectToAnotherNode(*e.packet) ||
+        (isPkiTopic && e.packet->which_payload_variant == meshtastic_MeshPacket_encrypted_tag && !isToUs(e.packet))) {
+        recordMqttRx(MqttRxResult::OtherNode);
+        return;
+    }
+
+    meshtastic_MeshPacket candidate = *e.packet;
+    candidate.via_mqtt = true;
+    candidate.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT;
+    if (candidate.which_payload_variant == meshtastic_MeshPacket_decoded_tag)
+        candidate.channel = ch.index;
+    if (perhapsDecode(&candidate) != DecodeState::DECODE_SUCCESS) {
+        recordMqttRx(MqttRxResult::Decode);
+        return;
+    }
+    bool allowTraceroute = false;
+#if !MESHTASTIC_EXCLUDE_TRACEROUTE
+    if (traceRouteModule && candidate.decoded.portnum == meshtastic_PortNum_TRACEROUTE_APP)
+        allowTraceroute = traceRouteModule->acceptsMqttPacket(candidate);
+#endif
+    if (!MqttTextPolicy::accepts(candidate.decoded.portnum, candidate.decoded.payload.size, isToUs(&candidate),
+                               candidate.decoded.request_id != 0, mqttContactDiscoveryEnabled(), allowTraceroute)) {
+        recordMqttRx(MqttRxResult::Filtered);
+        return;
+    }
+    if (candidate.decoded.portnum == meshtastic_PortNum_POSITION_APP) {
+        meshtastic_Position position = meshtastic_Position_init_zero;
+        if (!pb_decode_from_bytes(candidate.decoded.payload.bytes, candidate.decoded.payload.size,
+                                  &meshtastic_Position_msg, &position) ||
+            !PositionCoordinates::isComplete(position.has_latitude_i, position.has_longitude_i,
+                                             position.latitude_i, position.longitude_i)) {
+            recordMqttRx(MqttRxResult::Filtered);
+            return;
+        }
+    }
+    // Bound unsolicited trace requests, without rate-limiting replies or user texts.
+    if (allowTraceroute && candidate.decoded.request_id == 0) {
+        if (lastMqttTraceRequestMs && Throttle::isWithinTimespanMs(lastMqttTraceRequestMs, 10000)) {
+            recordMqttRx(MqttRxResult::Filtered);
+            return;
+        }
+        lastMqttTraceRequestMs = millis();
+    }
+
+    // Telemetry never takes packet-pool or router-queue space on this board.
+    auto chat = packetPool.allocUniqueZeroed();
+    if (!chat) {
+        recordMqttRx(MqttRxResult::NoMemory);
+#if !MESHTASTIC_EXCLUDE_TRACEROUTE
+        if (traceRouteModule)
+            traceRouteModule->noteMqttReplyRejected(candidate, "no MeshPacket memory");
+#endif
+        LOG_WARN("Drop MQTT packet: no MeshPacket memory");
+        return;
+    }
+    *chat = candidate;
+    router->enqueueReceivedMessage(chat.release());
+    if (allowTraceroute)
+        LOG_INFO("MQTT traceroute RX: from=0x%08x request=0x%08x response=%d", candidate.from,
+                 candidate.decoded.request_id, candidate.decoded.request_id != 0);
+    recordMqttRx(candidate.decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP ? MqttRxResult::Text
+                 : candidate.decoded.portnum == meshtastic_PortNum_NODEINFO_APP ? MqttRxResult::Contact
+                 : candidate.decoded.portnum == meshtastic_PortNum_POSITION_APP ? MqttRxResult::Position
+                 : candidate.decoded.portnum == meshtastic_PortNum_TRACEROUTE_APP ? MqttRxResult::Trace
+                                                                              : MqttRxResult::Ack);
+    return;
+#else
     UniquePacketPoolPacket p = packetPool.allocUniqueZeroed();
     if (!p) {
         LOG_WARN("Drop MQTT packet: no MeshPacket memory");
@@ -444,31 +505,9 @@ inline void onReceiveProto(char *topic, byte *payload, size_t length)
             router->enqueueReceivedMessage(p.release());
         }
     } else if (router) {
-#if defined(CROWPANEL_DHE04005D)
-        if (isCrowPanelPublicDefaultMqtt() && isBadSender(p->from)) {
-            // This node's packets recently failed decode (foreign key on our
-            // channel hash); drop just its packets instead of pausing everything.
-            logBadSenderSkip(p->from);
+        if (perhapsDecode(p.get()) != DecodeState::DECODE_SUCCESS) {
             return;
         }
-#endif
-        if (!allowPublicMqttBroadcastDecode(*p))
-            return;
-        if (perhapsDecode(p.get()) != DecodeState::DECODE_SUCCESS) { // ignore messages if we don't have the channel key
-#if defined(CROWPANEL_DHE04005D)
-            if (mqtt && isCrowPanelPublicDefaultMqtt()) {
-                markBadSender(p->from);
-                if (++consecutiveDecodeFailures >= MQTT_PUBLIC_DECODE_FAILURE_THRESHOLD) {
-                    consecutiveDecodeFailures = 0;
-                    mqtt->pausePublicDownlink(MQTT_PUBLIC_DECODE_FAILURE_PAUSE_MS, "MQTT decode failure");
-                }
-            }
-#endif
-            return;
-        }
-#if defined(CROWPANEL_DHE04005D)
-        consecutiveDecodeFailures = 0;
-#endif
         if (isMqttContactDiscoveryPacket(*p)) {
             logIgnoredMqttContactDiscovery(p->decoded.portnum);
             return;
@@ -476,6 +515,7 @@ inline void onReceiveProto(char *topic, byte *payload, size_t length)
         LOG_DEBUG("Received MQTT topic %s, len=%u", topic, length);
         router->enqueueReceivedMessage(p.release());
     }
+#endif
 }
 
 #if !defined(ARCH_NRF52) || NRF52_USE_JSON
@@ -511,6 +551,10 @@ inline void onReceiveJson(byte *payload, size_t length)
         LOG_ERROR("JSON received payload on MQTT but not a valid envelope");
         return;
     }
+#if defined(CROWPANEL_DHE04005D)
+    if (json["type"]->AsString() != "sendtext")
+        return;
+#endif
 
     // this is a valid envelope
     if (json["type"]->AsString().compare("sendtext") == 0 && json["payload"]->IsString()) {
@@ -655,11 +699,14 @@ bool connectPubSub(const PubSubConfig &config, PubSubClient &pubSub, Client &cli
         }
     }
     pubSub.setKeepAlive(MQTT_KEEPALIVE_SECONDS);
+#if defined(CROWPANEL_DHE04005D)
+    pubSub.setSocketTimeout(5);
+#endif
     pubSub.setClient(client);
     pubSub.setServer(config.serverAddr.c_str(), config.serverPort);
 
-    LOG_INFO("Connecting directly to MQTT server %s, port: %d, username: %s, password: %s", config.serverAddr.c_str(),
-             config.serverPort, config.mqttUsername, config.mqttPassword);
+    LOG_INFO("Connecting directly to MQTT server %s, port: %d, username: %s", config.serverAddr.c_str(),
+             config.serverPort, config.mqttUsername);
 
     // Generate node ID from nodenum for client identification
     std::string nodeId = nodeDB->getNodeId();
@@ -945,8 +992,10 @@ void MQTT::reconnect()
             reconnectCount++;
             LOG_ERROR("Failed to contact MQTT server directly (%d/%d)", reconnectCount, reconnectMax);
             if (reconnectCount >= reconnectMax) {
+#if !defined(CROWPANEL_DHE04005D)
                 needReconnect = true;
                 wifiReconnect->setIntervalFromNow(0);
+#endif
                 reconnectCount = 0;
             }
 #endif
@@ -972,50 +1021,35 @@ void MQTT::prewarmConnect()
 #endif
 }
 
-void MQTT::pausePublicDownlink(uint32_t durationMs, const char *reason)
-{
-#if HAS_NETWORKING && defined(CROWPANEL_DHE04005D)
-    if (!isCrowPanelPublicDefaultMqtt() || durationMs == 0)
-        return;
-
-    publicDownlinkPauseUntilMs = millis() + durationMs;
-    if (pubSub.connected()) {
-        LOG_WARN("CrowPanel MQTT public downlink soft pause for %u ms: %s",
-                 (unsigned)durationMs, reason ? reason : "runtime guard");
-    }
-#else
-    (void)durationMs;
-    (void)reason;
-#endif
-}
-
 void MQTT::sendSubscriptions()
 {
 #if HAS_NETWORKING
     bool hasDownlink = false;
-    bool subscribedCrowPanelPublicChannel = false;
+    bool subscriptionsSent = true;
     size_t numChan = channels.getNumChannels();
     for (size_t i = 0; i < numChan; i++) {
         const auto &ch = channels.getByIndex(i);
         if (ch.settings.downlink_enabled) {
             hasDownlink = true;
-#if defined(CROWPANEL_DHE04005D)
-            if (isCrowPanelPublicDefaultMqtt() && subscribedCrowPanelPublicChannel) {
-                LOG_WARN("CrowPanel MQTT: skip secondary public downlink %s to reduce ESP-Hosted RX pressure",
-                         channels.getGlobalId(i));
-                continue;
-            }
-            subscribedCrowPanelPublicChannel = true;
-#endif
             std::string topic = cryptTopic + channels.getGlobalId(i) + "/+";
             LOG_INFO("Subscribe to %s", topic.c_str());
-            pubSub.subscribe(topic.c_str(), MQTT_SUBSCRIBE_QOS);
+            if (!pubSub.subscribe(topic.c_str(), MQTT_SUBSCRIBE_QOS)) {
+                subscriptionsSent = false;
+                LOG_WARN("MQTT subscription request failed: %s", topic.c_str());
+            }
 #if !defined(ARCH_NRF52) ||                                                                                                      \
     defined(NRF52_USE_JSON) // JSON is not supported on nRF52, see issue #2804 ### Fixed by using ArduinoJSON ###
-            if (moduleConfig.mqtt.json_enabled == true) {
+            if (moduleConfig.mqtt.json_enabled == true
+#if defined(CROWPANEL_DHE04005D)
+                && strcasecmp(channels.getGlobalId(i), Channels::mqttChannel) == 0
+#endif
+            ) {
                 std::string topicDecoded = jsonTopic + channels.getGlobalId(i) + "/+";
                 LOG_INFO("Subscribe to %s", topicDecoded.c_str());
-                pubSub.subscribe(topicDecoded.c_str(), MQTT_SUBSCRIBE_QOS);
+                if (!pubSub.subscribe(topicDecoded.c_str(), MQTT_SUBSCRIBE_QOS)) {
+                    subscriptionsSent = false;
+                    LOG_WARN("MQTT subscription request failed: %s", topicDecoded.c_str());
+                }
             }
 #endif // ARCH_NRF52 NRF52_USE_JSON
         }
@@ -1024,8 +1058,18 @@ void MQTT::sendSubscriptions()
     if (hasDownlink) {
         std::string topic = cryptTopic + "PKI/+";
         LOG_INFO("Subscribe to %s", topic.c_str());
-        pubSub.subscribe(topic.c_str(), MQTT_SUBSCRIBE_QOS);
+        if (!pubSub.subscribe(topic.c_str(), MQTT_SUBSCRIBE_QOS)) {
+            subscriptionsSent = false;
+            LOG_WARN("MQTT subscription request failed: %s", topic.c_str());
+        }
     }
+#endif
+#if defined(CROWPANEL_DHE04005D)
+    crowpanelSubscriptionsPending = hasDownlink && !subscriptionsSent;
+    LOG_INFO("MQTT downlink: enabled=%d contacts=%d ignore_mqtt=%d root=%s", hasDownlink, mqttContactDiscoveryEnabled(),
+             config.lora.ignore_mqtt, moduleConfig.mqtt.root);
+#else
+    (void)subscriptionsSent;
 #endif
 #endif
 }
@@ -1036,12 +1080,21 @@ int32_t MQTT::runOnce()
         return disable();
     bool wantConnection = wantsLink();
 
+#if HAS_NETWORKING && defined(CROWPANEL_DHE04005D)
+    if (lastMqttRxSummary == 0 || !Throttle::isWithinTimespanMs(lastMqttRxSummary, 30000)) {
+        lastMqttRxSummary = millis();
+        LOG_INFO("MQTT RX: state=%d packets=%u text=%u contacts=%u ack=%u filtered=%u invalid=%u channel=%u decrypt=%u "
+                 "plaintext=%u other-node=%u oom=%u trace=%u pos=%u", pubSub.state(), mqttRxPackets, mqttRxCount(MqttRxResult::Text),
+                 mqttRxCount(MqttRxResult::Contact), mqttRxCount(MqttRxResult::Ack), mqttRxCount(MqttRxResult::Filtered),
+                 mqttRxCount(MqttRxResult::Invalid), mqttRxCount(MqttRxResult::Channel), mqttRxCount(MqttRxResult::Decode),
+                 mqttRxCount(MqttRxResult::Plaintext), mqttRxCount(MqttRxResult::OtherNode), mqttRxCount(MqttRxResult::NoMemory),
+                 mqttRxCount(MqttRxResult::Trace), mqttRxCount(MqttRxResult::Position));
+    }
+#endif
+
 #if HAS_NETWORKING && defined(ARCH_ESP32P4) && defined(CROWPANEL_DHE04005D) && !defined(ARCH_PORTDUINO)
     {
-        // The precompiled ESP-Hosted SDIO driver in the framework asserts (and
-        // reboots) if it can't allocate an internal RX buffer. Back-pressure the
-        // broker link before that point: stop servicing the socket so the TCP
-        // window closes and the C6 stops pushing frames until heap recovers.
+        // Disconnect before ESP-Hosted exhausts its internal DMA RX buffers.
         // Watch DMA-CAPABLE internal memory specifically: on the P4 a chunk of
         // internal RAM (TCM) is 8-bit-capable but NOT DMA-capable, so the
         // plain INTERNAL|8BIT numbers can look healthy (90+ KB) while the DMA
@@ -1098,25 +1151,11 @@ int32_t MQTT::runOnce()
             if (!moduleConfig.mqtt.proxy_to_client_enabled && isConnectedDirectly()) {
                 LOG_WARN("CrowPanel MQTT disconnecting broker until DMA pool recovers");
                 pubSub.disconnect();
+                isConnected = false;
             }
             dmaPressureDisconnected = true;
             return 2000;
         }
-    }
-#endif
-
-#if HAS_NETWORKING && defined(CROWPANEL_DHE04005D)
-    if (isCrowPanelPublicDefaultMqtt() && publicDownlinkPauseUntilMs != 0) {
-        const uint32_t now = millis();
-        if ((int32_t)(publicDownlinkPauseUntilMs - now) > 0) {
-            // Downlink stays paused, but our own uploads must not starve: when a
-            // decode-failure storm keeps re-arming the pause every <10s, queued
-            // publishes would otherwise never reach the broker (the drain below
-            // this early return would never run).
-            publishQueuedMessages();
-            return 1000;
-        }
-        publicDownlinkPauseUntilMs = 0;
     }
 #endif
 
@@ -1128,7 +1167,13 @@ int32_t MQTT::runOnce()
         return 200;
     }
 #if HAS_NETWORKING
-    else if (!pubSub.loop()) {
+#if defined(CROWPANEL_DHE04005D)
+    if (router && !router->canAcceptMqttMessage() && isConnectedDirectly() && !crowpanelSubscriptionsPending) {
+        publishQueuedMessages();
+        return 5;
+    }
+#endif
+    if (!pubSub.loop()) {
         if (!wantConnection)
             return 5000; // If we don't want connection now, check again in 5 secs
         else {
@@ -1146,6 +1191,8 @@ int32_t MQTT::runOnce()
         if (!wantConnection) {
             LOG_INFO("MQTT link not needed, drop");
             pubSub.disconnect();
+            isConnected = false;
+            return 5000;
         }
 
 #if defined(CROWPANEL_DHE04005D)
@@ -1157,16 +1204,11 @@ int32_t MQTT::runOnce()
         }
         publishQueuedMessages();
 
-        // PubSubClient::loop() (called once in the condition above) processes at
-        // most ONE packet per call, so a single poll caps delivery at 1 pkt per
-        // interval and lets the rest sit in the socket as DMA-pool pbufs. Drain a
-        // bounded burst here to cut delivery latency AND actively relieve DMA
-        // pressure (each processed packet frees its pbuf). Bounded so we never
-        // starve the radio/UI threads on a firehose feed; the DMA-pressure guard
-        // at the top of runOnce() re-checks on the next pass. onReceive() still
-        // applies the per-second decode budget, so this doesn't uncork unlimited
-        // AES work — it just stops the socket backlog.
-        for (int i = 0; i < 15; i++) {
+        // Yield by elapsed time and queue capacity, without dropping undecoded texts.
+        const uint32_t started = millis();
+        for (int i = 0; i < 15 && Throttle::isWithinTimespanMs(started, 4); i++) {
+            if (router && !router->canAcceptMqttMessage())
+                break;
             if (!pubSub.loop())
                 break;
         }
@@ -1258,46 +1300,30 @@ void MQTT::publishNodeInfo()
 }
 void MQTT::publishQueuedMessages()
 {
-    if (mqttQueue.isEmpty())
+    if (!pendingPublish && mqttQueue.isEmpty())
         return;
 
-    if (!moduleConfig.mqtt.proxy_to_client_enabled && !isConnected) {
-        LOG_WARN("CrowPanel MQTT upload queue held: MQTT state not connected");
+    if (!moduleConfig.mqtt.proxy_to_client_enabled && !isConnectedDirectly()) {
         return;
     }
 
-    LOG_DEBUG("Publish enqueued MQTT message");
-    const std::unique_ptr<QueueEntry> entry(mqttQueue.dequeuePtr(0));
-    const bool ok = publish(entry->topic.c_str(), entry->envBytes.data(), entry->envBytes.size(), false);
-    LOG_WARN("CrowPanel MQTT upload drain: topic=%s bytes=%u ok=%d connected=%d",
-             entry->topic.c_str(), (unsigned)entry->envBytes.size(), ok ? 1 : 0, isConnectedDirectly() ? 1 : 0);
-
-#if !defined(ARCH_NRF52) ||                                                                                                      \
-    defined(NRF52_USE_JSON) // JSON is not supported on nRF52, see issue #2804 ### Fixed by using ArduinoJson ###
-    if (!moduleConfig.mqtt.json_enabled)
+    if (!pendingPublish)
+        pendingPublish.reset(mqttQueue.dequeuePtr(0));
+    if (!pendingPublish)
         return;
-
-    // handle json topic
-    const DecodedServiceEnvelope env(entry->envBytes.data(), entry->envBytes.size());
-    if (!env.validDecode || env.packet == NULL || env.channel_id == NULL)
+    if (!pendingPublish->binaryPublished &&
+        !publish(pendingPublish->topic.c_str(), pendingPublish->envBytes.data(), pendingPublish->envBytes.size(), false)) {
+        LOG_WARN("MQTT upload retained for retry: %s", pendingPublish->topic.c_str());
         return;
-
-    auto jsonString = MeshPacketSerializer::JsonSerialize(env.packet);
-    if (jsonString.length() == 0)
-        return;
-
-    // Generate node ID from nodenum for topic
-    std::string nodeId = nodeDB->getNodeId();
-
-    std::string topicJson;
-    if (env.packet->pki_encrypted) {
-        topicJson = jsonTopic + "PKI/" + nodeId;
-    } else {
-        topicJson = jsonTopic + env.channel_id + "/" + nodeId;
     }
-    LOG_DEBUG("JSON publish message to %s, %u bytes: %s", topicJson.c_str(), jsonString.length(), jsonString.c_str());
-    publish(topicJson.c_str(), jsonString.c_str(), false);
-#endif // ARCH_NRF52 NRF52_USE_JSON
+    pendingPublish->binaryPublished = true;
+#if !defined(ARCH_NRF52) || NRF52_USE_JSON
+    if (moduleConfig.mqtt.json_enabled && !pendingPublish->jsonPayload.empty() &&
+        !publish(pendingPublish->jsonPublishTopic.c_str(), pendingPublish->jsonPayload.c_str(), false))
+        return;
+#endif
+    LOG_INFO("MQTT upload sent: %s", pendingPublish->topic.c_str());
+    pendingPublish.reset();
 }
 
 void MQTT::onSend(const meshtastic_MeshPacket &mp_encrypted, const meshtastic_MeshPacket &mp_decoded, ChannelIndex chIndex)
@@ -1369,12 +1395,10 @@ void MQTT::onSend(const meshtastic_MeshPacket &mp_encrypted, const meshtastic_Me
         return;
     }
 
-    const bool deferPublicBrokerPublish = isCrowPanelPublicDefaultMqtt() && isPublicDownlinkPaused();
-    if (moduleConfig.mqtt.proxy_to_client_enabled || (this->isConnectedDirectly() && !deferPublicBrokerPublish)) {
+#if !defined(CROWPANEL_DHE04005D)
+    if (moduleConfig.mqtt.proxy_to_client_enabled || this->isConnectedDirectly()) {
         const bool ok = publish(topic.c_str(), bytes, numBytes, false);
-        LOG_WARN("CrowPanel MQTT upload publish: topic=%s bytes=%u ok=%d connected=%d paused=%d",
-                 topic.c_str(), (unsigned)numBytes, ok ? 1 : 0, isConnectedDirectly() ? 1 : 0,
-                 deferPublicBrokerPublish ? 1 : 0);
+        LOG_DEBUG("MQTT upload publish: topic=%s bytes=%u ok=%d", topic.c_str(), (unsigned)numBytes, ok ? 1 : 0);
 
 #if !defined(ARCH_NRF52) ||                                                                                                      \
     defined(NRF52_USE_JSON) // JSON is not supported on nRF52, see issue #2804 ### Fixed by using ArduinoJson ###
@@ -1391,21 +1415,34 @@ void MQTT::onSend(const meshtastic_MeshPacket &mp_encrypted, const meshtastic_Me
         publish(topicJson.c_str(), jsonString.c_str(), false);
 #endif // ARCH_NRF52 NRF52_USE_JSON
     } else {
-        LOG_WARN(deferPublicBrokerPublish ? "CrowPanel MQTT upload queued: public broker paused topic=%s bytes=%u"
-                                          : "CrowPanel MQTT upload queued: MQTT not connected topic=%s bytes=%u",
-                 topic.c_str(), (unsigned)numBytes);
+#else
+    {
+#endif
         QueueEntry *entry;
         if (mqttQueue.numFree() == 0) {
             LOG_WARN("MQTT queue is full, discard oldest");
             entry = mqttQueue.dequeuePtr(0);
         } else {
-            entry = new QueueEntry;
+            entry = new (std::nothrow) QueueEntry;
+        }
+        if (!entry) {
+            LOG_WARN("Cannot queue MQTT upload: no memory");
+            return;
         }
         entry->topic = std::move(topic);
         entry->envBytes.assign(bytes, numBytes);
+        entry->binaryPublished = false;
+#if !defined(ARCH_NRF52) || NRF52_USE_JSON
+        entry->jsonPayload.clear();
+        entry->jsonPublishTopic.clear();
+        if (moduleConfig.mqtt.json_enabled) {
+            entry->jsonPayload = MeshPacketSerializer::JsonSerialize(&mp_decoded);
+            entry->jsonPublishTopic = jsonTopic + channelId + "/" + nodeId;
+        }
+#endif
         if (mqttQueue.enqueue(entry, 0) == false) {
-            LOG_CRIT("Failed to add a message to mqttQueue!");
-            abort();
+            LOG_WARN("MQTT upload queue full");
+            delete entry;
         }
     }
 }

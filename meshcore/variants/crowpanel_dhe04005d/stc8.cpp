@@ -1,6 +1,9 @@
 #include "stc8.h"
 #include "i2c_bus.h"
+#include "stc8_backlight_policy.h"
 #include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 static const char* TAG = "stc8";
 
@@ -14,6 +17,7 @@ static constexpr uint32_t I2C_FREQ_HZ = 400000;
 static constexpr int      I2C_TIMEOUT_MS = 100;
 
 static i2c_master_dev_handle_t s_dev = NULL;
+static int s_backlight_duty = -1;
 
 static bool stc8_ensure_device() {
   if (s_dev != NULL) return true;
@@ -86,7 +90,18 @@ esp_err_t stc8_set_pwm_duty(int pwm_num, uint8_t duty) {
     return ESP_ERR_INVALID_ARG;
   }
   if (duty > 100) duty = 100;
+  // Prime at full duty before dimming to test low-duty supply startup after
+  // PWM zero or a host-only reset. I2C ACK alone does not prove illumination.
+  if (Stc8Backlight::needsStart(s_backlight_duty, duty)) {
+    const esp_err_t start_err = stc8_write_reg(REG_SET_PWM_BASE + pwm_num,
+                                             Stc8Backlight::kStartDuty);
+    s_backlight_duty = -1;
+    if (start_err != ESP_OK) return start_err;
+    vTaskDelay(pdMS_TO_TICKS(Stc8Backlight::kStartMs));
+    ESP_LOGW(TAG, "backlight startup pulse: 100%% for 30 ms, then %u%%", duty);
+  }
   esp_err_t err = stc8_write_reg(REG_SET_PWM_BASE + pwm_num, duty);
+  s_backlight_duty = err == ESP_OK ? duty : -1;
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "set_pwm_duty(%d,%u) failed: %d", pwm_num, duty, (int)err);
   }

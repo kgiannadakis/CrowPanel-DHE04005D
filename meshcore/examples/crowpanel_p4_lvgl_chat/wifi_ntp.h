@@ -20,6 +20,8 @@ const char* wifi_last_error_text();
 
 // Initialization
 void wifi_init();
+// Hosted SDIO transport cannot safely be paused after it has been started.
+bool wifi_cpu_sleep_safe();
 
 // Connection control
 void wifi_connect_saved();

@@ -22,12 +22,20 @@
 #include <WiFi.h>
 #include <Preferences.h>
 #include <time.h>
+#include <atomic>
 #include <target.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 
 // ---- State ----
+static std::atomic<bool> s_transport_used{false};
+
+bool wifi_cpu_sleep_safe() {
+  return !s_transport_used.load(std::memory_order_acquire)
+      && !g_wifi_enabled && !WiFi.STA.started() && !WiFi.AP.started();
+}
+
 bool g_wifi_enabled = false;
 bool g_wifi_connected = false;
 bool g_wifi_has_saved_network = false;
@@ -149,7 +157,7 @@ static void wifi_p4_event_cb(arduino_event_id_t ev, arduino_event_info_t info) {
       // run AFTER toggle-on has scheduled s_settle_connect_ms),
       // teardown path clears s_settle_connect_ms, so the pending
       // reconnect never fires and UI stays at "Saved: … (not
-      // connected)" until reboot. Credit: Codex diagnosed this.
+      // connected)" until reboot.
       // Only TRUE auth failures go through the hard-teardown path,
       // because those are the ones where the C6 keeps leaking SDIO
       // RX buffers on each retry. Transient signal-loss conditions
@@ -410,9 +418,8 @@ static void wifi_save_enabled(bool en) {
 }
 
 // ---- RTC hardware time persistence ----
-// DHE04005D has no coin-cell RTC, so there is nothing to persist to. Left as
-// a stub so the single call site in wifi_ntp_sync() stays source-compatible
-// with v11 — if a future variant adds a battery-backed RTC, fill this in.
+// mesh_set_time_epoch() updates the optional external RTC through rtc_clock.
+// This legacy compatibility hook must not write the hardware a second time.
 static void wifi_write_time_to_rtc(uint32_t /*utc_epoch*/) { /* no-op on P4 */ }
 
 // ---- NTP sync ----
@@ -483,6 +490,7 @@ void wifi_init() {
                 g_wifi_ssid, (int)g_wifi_has_saved_network, (int)g_wifi_enabled);
 
   if (g_wifi_enabled && wifi_has_credentials()) {
+    s_transport_used.store(true, std::memory_order_release);
     // Match the proven old-path sequence: set mode, give the hosted link
     // ~500 ms to settle, then begin(). Skipping the settle window caused
     // WiFi.begin() to race with the ESP-Hosted SDIO init and never
@@ -513,6 +521,7 @@ void wifi_connect_saved() {
     Serial.println("[wifi] connect_saved: no creds");
     return;
   }
+  s_transport_used.store(true, std::memory_order_release);
 
   // Pressing Connect (or the reconnect timer firing) is an explicit
   // "enable WiFi" — flip the flag and persist so wifi_loop() also tracks
@@ -601,6 +610,7 @@ void wifi_toggle(bool enable) {
   g_wifi_last_disc_reason   = 0;
 
   if (enable) {
+    s_transport_used.store(true, std::memory_order_release);
     wifi_configure_pins_once();
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(false);
@@ -643,6 +653,7 @@ String wifi_scan_ssid(int idx) { return WiFi.SSID(idx); }
 int    wifi_scan_rssi(int idx) { return WiFi.RSSI(idx); }
 
 static void wifi_do_sync_scan() {
+  s_transport_used.store(true, std::memory_order_release);
   wifi_configure_pins_once();
   wifi_mode_t mode = WiFi.getMode();
   const bool needs_mode_change = (mode != WIFI_STA && mode != WIFI_AP_STA);

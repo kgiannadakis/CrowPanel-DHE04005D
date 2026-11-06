@@ -1,186 +1,188 @@
 #!/usr/bin/env python3
-"""
-Build all three firmwares and flash the dual-boot system to the CrowPanel.
+"""Build and install the complete CrowPanel dual-boot image set.
 
-Uses the repo-root partitions.bin and the Meshtastic bootloader.
-
-Requires: Python 3 + PlatformIO CLI (pio) + esptool
-          (all included with a standard PlatformIO installation)
-
-Usage:
-    python flash_all.py <PORT>               (build + flash)
-    python flash_all.py <PORT> --skip-build  (flash only, no rebuild)
-
-Examples:
-    python flash_all.py COM20               (Windows)
-    python flash_all.py /dev/ttyUSB0        (Linux)
-    python flash_all.py /dev/cu.usbserial   (macOS)
+For routine firmware updates, use the affected project's normal upload target.
+--dry-run checks already-built inputs without building or accessing a device.
 """
 
-import subprocess, sys, os, glob, shutil, csv
+import argparse
+import csv
+from pathlib import Path
+import shutil
+import struct
+import subprocess
+import sys
 
-# Prefer the standalone PlatformIO install (Python 3.11) over a pio that may
-# be installed under a newer Python. The pioarduino platform-espressif32
-# bundles a `fatfs` C extension built for cp311 only, so running pio under
-# Python 3.12+ fails with: ModuleNotFoundError: No module named 'fatfs.wrapper'.
-def _resolve_pio():
-    for cand in (r"C:\pio\penv\Scripts\pio.exe",
-                 os.path.expanduser(r"~\.platformio\penv\Scripts\pio.exe")):
-        if os.path.isfile(cand):
-            return cand
-    return shutil.which("pio") or "pio"
-
-PIO = _resolve_pio()
-
-if len(sys.argv) < 2 or sys.argv[1].startswith("--"):
-    print("Usage: python flash_all.py <PORT> [--skip-build]")
-    print("  e.g. python flash_all.py COM20")
-    print("  e.g. python flash_all.py /dev/ttyUSB0")
-    sys.exit(1)
-
-PORT = sys.argv[1]
-SKIP_BUILD = "--skip-build" in sys.argv
-BAUD = "921600"
-
-REPO_DIR = os.path.dirname(os.path.abspath(__file__))
-
-BUILDS = [
-    ("selector",   "dhe04005d-5inch-P4-selector"),
-    ("meshcore",   "dhe04005d-5inch-P4-meshcore"),
+ROOT = Path(__file__).resolve().parent
+BUILDS = (
+    ("selector", "dhe04005d-5inch-P4-selector"),
+    ("meshcore", "dhe04005d-5inch-P4-meshcore"),
     ("meshtastic", "dhe04005d-5inch-P4-meshtastic"),
-]
-ENVS = {name: env for name, env in BUILDS}
+)
+PARTITION_TABLES = (
+    "selector/partitions_dualboot.csv",
+    "meshcore/partitions_p4.csv",
+    "meshtastic/variants/esp32p4/crowpanel_dhe04005d/partitions.csv",
+)
+FLASH_SIZE = 16 * 1024 * 1024
 
 
-def parse_num(s):
-    return int(s.strip(), 0)
+def resolve_pio():
+    """Prefer the normal user installation, then a CLI on PATH."""
+    penv = Path.home() / ".platformio" / "penv"
+    for relative in ("Scripts/platformio.exe", "Scripts/pio.exe", "bin/platformio", "bin/pio"):
+        candidate = penv / relative
+        if candidate.is_file():
+            return str(candidate)
+    for command in ("platformio", "pio"):
+        candidate = shutil.which(command)
+        if candidate:
+            return candidate
+    raise FileNotFoundError("PlatformIO not found. Install its CLI or VS Code extension.")
 
 
 def parse_partitions_csv(path):
     parts = {}
-    with open(path, newline="") as fp:
-        for row in csv.reader(line for line in fp if not line.lstrip().startswith("#")):
-            if len(row) < 5:
+    with Path(path).open(encoding="utf-8", newline="") as source:
+        rows = csv.reader(line for line in source if not line.lstrip().startswith("#"))
+        for row in rows:
+            if not row or not any(field.strip() for field in row):
                 continue
+            if len(row) < 5 or not row[0].strip():
+                raise ValueError(f"Incomplete partition row in {path}")
             name = row[0].strip()
-            if not name:
-                continue
+            if name in parts:
+                raise ValueError(f"Duplicate partition {name} in {path}")
             parts[name] = {
                 "type": row[1].strip(),
                 "subtype": row[2].strip(),
-                "offset": parse_num(row[3]),
-                "size": parse_num(row[4]),
+                "offset": int(row[3].strip(), 0),
+                "size": int(row[4].strip(), 0),
             }
+    previous_end = 0x9000
+    for name, part in sorted(parts.items(), key=lambda item: item[1]["offset"]):
+        if part["size"] <= 0 or part["offset"] < previous_end:
+            raise ValueError(f"Invalid or overlapping partition: {name}")
+        previous_end = part["offset"] + part["size"]
+        if previous_end > FLASH_SIZE:
+            raise ValueError(f"Partition outside 16 MB flash: {name}")
     return parts
 
 
-def require_fits(label, filename, part):
-    size = os.path.getsize(filename)
-    if size > part["size"]:
-        print(
-            f"ERROR: {label} image is too large for partition "
-            f"({size:#x} bytes > {part['size']:#x})."
-        )
-        print(f"       file: {filename}")
-        sys.exit(1)
+def binary_layout(path):
+    data = Path(path).read_bytes()
+    if not data or len(data) % 32:
+        raise ValueError(f"Invalid partition table size: {path}")
+    parts = {}
+    for offset in range(0, len(data), 32):
+        magic, kind, subtype, address, size, label, flags = struct.unpack_from("<HBBII16sI", data, offset)
+        if magic == 0xFFFF:
+            break
+        if magic == 0xEBEB:  # Optional SDK partition-table MD5 record.
+            break
+        if magic != 0x50AA:
+            raise ValueError(f"Invalid partition entry in {path}")
+        name = label.split(b"\0", 1)[0].decode("ascii")
+        if name in parts:
+            raise ValueError(f"Duplicate binary partition {name} in {path}")
+        parts[name] = (address, size)
+    if not parts:
+        raise ValueError(f"No partitions in {path}")
+    return parts
 
 
-def find_firmware(proj, env):
-    build_dir = os.path.join(REPO_DIR, proj, ".pio", "build", env)
-    if not os.path.isdir(build_dir):
-        return None
-    for f in sorted(os.listdir(build_dir)):
-        if f.startswith("firmware") and f.endswith(".bin") and "merged" not in f:
-            return os.path.join(build_dir, f)
-    return None
+def build_directory(repo, project, environment):
+    return repo / project / ".pio" / "build" / environment
 
 
-def build_all():
-    for proj, env in BUILDS:
-        proj_dir = os.path.join(REPO_DIR, proj)
-        print(f"\n{'='*60}")
-        print(f"  Building {proj} (env: {env})")
-        print(f"{'='*60}")
-        subprocess.run([PIO, "run", "-e", env], cwd=proj_dir, check=True)
+def find_firmware(directory):
+    exact = directory / "firmware.bin"
+    if exact.is_file():
+        return exact
+    candidates = sorted(path for path in directory.glob("firmware*.bin")
+                        if "merged" not in path.name.lower() and "factory" not in path.name.lower())
+    if len(candidates) != 1:
+        raise ValueError(f"Expected one application image in {directory}; rebuild or remove stale outputs.")
+    return candidates[0]
 
 
-def flash():
-    partitions_csv = os.path.join(REPO_DIR, "selector", "partitions_dualboot.csv")
-    parts = parse_partitions_csv(partitions_csv)
-    for required in ("factory", "ota_0", "ota_1"):
-        if required not in parts:
-            print(f"ERROR: {required} partition missing from {partitions_csv}")
-            sys.exit(1)
+def prepare_flash_plan(repo=ROOT):
+    repo = Path(repo)
+    tables = [parse_partitions_csv(repo / relative) for relative in PARTITION_TABLES]
+    if not all(table == tables[0] for table in tables[1:]):
+        raise ValueError("The selector, MeshCore and Meshtastic partition CSVs disagree.")
+    parts = tables[0]
+    for name in ("factory", "ota_0", "ota_1"):
+        if name not in parts:
+            raise ValueError(f"Required application partition is missing: {name}")
+    expected = {name: (part["offset"], part["size"]) for name, part in parts.items()}
+    directories = {project: build_directory(repo, project, env) for project, env in BUILDS}
+    generated_table = directories["selector"] / "partitions.bin"
+    for path in (repo / "partitions.bin", generated_table):
+        if binary_layout(path) != expected:
+            raise ValueError(f"Partition table disagrees with the CSV layout: {path}")
 
-    # partitions.bin: source of truth is selector/partitions_dualboot.csv,
-    # which PlatformIO compiles into selector/.pio/build/<env>/partitions.bin
-    # on every selector build. Copy it to the repo root so this script and
-    # the selector build can never disagree about slot offsets — drift here
-    # silently corrupts the other firmwares (they write to data partitions
-    # at addresses that overlap factory/ota slots).
-    selector_partitions = os.path.join(
-        REPO_DIR, "selector", ".pio", "build", ENVS["selector"], "partitions.bin")
-    partitions = os.path.join(REPO_DIR, "partitions.bin")
-    if not os.path.isfile(selector_partitions):
-        print(f"ERROR: {selector_partitions} not found. Build selector first.")
-        sys.exit(1)
-    if os.path.getmtime(selector_partitions) < os.path.getmtime(partitions_csv):
-        print(f"ERROR: {os.path.relpath(selector_partitions, REPO_DIR)} is older than")
-        print(f"       {os.path.relpath(partitions_csv, REPO_DIR)}.")
-        print("       Re-run without --skip-build so PlatformIO regenerates partitions.bin.")
-        sys.exit(1)
-    shutil.copyfile(selector_partitions, partitions)
-    print(f"  partitions.bin <- {os.path.relpath(selector_partitions, REPO_DIR)}")
+    # Never rewrite the distributed table as a side effect of inspection/flashing.
+    images = [
+        (0x2000, directories["meshtastic"] / "bootloader.bin", 0x6000),
+        (0x8000, generated_table, 0x1000),
+    ]
+    for project, partition in (("selector", "factory"), ("meshcore", "ota_0"), ("meshtastic", "ota_1")):
+        images.append((parts[partition]["offset"], find_firmware(directories[project]), parts[partition]["size"]))
+    previous_end = 0
+    for address, path, capacity in sorted(images):
+        size = path.stat().st_size
+        if not size or size > capacity or address < previous_end or address + size > FLASH_SIZE:
+            raise ValueError(f"Empty, oversized or overlapping image: {path}")
+        if address != 0x8000:
+            with path.open("rb") as source:
+                if source.read(1) != b"\xe9":
+                    raise ValueError(f"Not an ESP application/bootloader image: {path}")
+        previous_end = address + size
+    return [(address, path) for address, path, capacity in images]
 
-    # Bootloader from Meshtastic build
-    mt_build = os.path.join(REPO_DIR, "meshtastic", ".pio", "build", ENVS["meshtastic"])
-    bootloader = os.path.join(mt_build, "bootloader.bin")
-    if not os.path.isfile(bootloader):
-        print("ERROR: bootloader.bin not found in meshtastic build. Build meshtastic first.")
-        sys.exit(1)
 
-    # Firmware binaries
-    selector_fw   = find_firmware("selector",   ENVS["selector"])
-    meshcore_fw   = find_firmware("meshcore",   ENVS["meshcore"])
-    meshtastic_fw = find_firmware("meshtastic", ENVS["meshtastic"])
+def build_all(repo=ROOT):
+    pio = resolve_pio()
+    for project, environment in BUILDS:
+        print(f"Building {project}: {environment}", flush=True)
+        subprocess.run([pio, "run", "-e", environment], cwd=Path(repo) / project, check=True)
 
-    for name, fw in [("selector", selector_fw), ("meshcore", meshcore_fw), ("meshtastic", meshtastic_fw)]:
-        if not fw:
-            print(f"ERROR: No firmware found for {name}. Build first.")
-            sys.exit(1)
 
-    require_fits("selector", selector_fw, parts["factory"])
-    require_fits("meshcore", meshcore_fw, parts["ota_0"])
-    require_fits("meshtastic", meshtastic_fw, parts["ota_1"])
+def flash_command(port, images, baud=921600):
+    command = [sys.executable, "-m", "esptool", "--chip", "esp32p4",
+               "--port", port, "--baud", str(baud), "write-flash"]
+    for address, path in images:
+        command.extend((f"0x{address:x}", str(path)))
+    return command
 
-    factory_off = f"0x{parts['factory']['offset']:x}"
-    ota0_off = f"0x{parts['ota_0']['offset']:x}"
-    ota1_off = f"0x{parts['ota_1']['offset']:x}"
 
-    print(f"\n{'='*60}")
-    print(f"  Flashing to {PORT} at {BAUD} baud")
-    print(f"{'='*60}")
-    print(f"  0x2000   -> bootloader.bin (from meshtastic)")
-    print(f"  0x8000   -> partitions.bin (from repo root)")
-    print(f"  {factory_off:<8} -> {os.path.basename(selector_fw)}    (factory)")
-    print(f"  {ota0_off:<8} -> {os.path.basename(meshcore_fw)}     (ota_0)")
-    print(f"  {ota1_off:<8} -> {os.path.basename(meshtastic_fw)}   (ota_1)")
-
-    subprocess.run([
-        sys.executable, "-m", "esptool",
-        "--chip", "esp32p4", "--port", PORT, "--baud", BAUD,
-        "write-flash",
-        "0x2000",   bootloader,
-        "0x8000",   partitions,
-        factory_off, selector_fw,
-        ota0_off,    meshcore_fw,
-        ota1_off,    meshtastic_fw,
-    ], check=True)
-
-    print("\nDone! Power-cycle to enter the boot selector.")
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("port", nargs="?", help="Serial port; required unless --dry-run")
+    parser.add_argument("--skip-build", action="store_true", help="Use already-built images")
+    parser.add_argument("--dry-run", action="store_true", help="Inspect existing inputs only; no builds or device access")
+    args = parser.parse_args(argv)
+    if not args.port and not args.dry_run:
+        parser.error("A serial port is required unless --dry-run is selected.")
+    try:
+        if not args.skip_build and not args.dry_run:
+            build_all()
+        images = prepare_flash_plan()
+        print("Full-device installation plan (not a routine firmware update):")
+        for address, path in images:
+            print(f"  0x{address:06x}  {path.stat().st_size:>9} bytes  {path.relative_to(ROOT)}")
+        if args.dry_run:
+            print("Dry run complete. No build, device connection or file writes performed.")
+            return 0
+        print("Back up device data first. Continuing with the standard esptool RAM stub.", flush=True)
+        subprocess.run(flash_command(args.port, images), check=True)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+    print("Installation complete. Power-cycle to enter the selector.")
+    return 0
 
 
 if __name__ == "__main__":
-    if not SKIP_BUILD:
-        build_all()
-    flash()
+    raise SystemExit(main())

@@ -24,6 +24,10 @@
 #endif
 #define AGC_RESET_INTERVAL_MS SX126X_AGC_RESET_INTERVAL_MS
 
+#ifndef RADIO_IRQ_POLL_INTERVAL_MS
+#define RADIO_IRQ_POLL_INTERVAL_MS 1000
+#endif
+
 /**
  * We need to override the RadioLib ArduinoHal class to add mutex protection for SPI bus access
  */
@@ -271,6 +275,8 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
 
   protected:
     uint32_t activeReceiveStart = 0;
+
+    virtual void checkRxHealth() {}
 
     bool receiveDetected(uint16_t irq, unsigned long syncWordHeaderValidFlag, unsigned long preambleDetectedFlag);
 

@@ -224,6 +224,16 @@ bool radio_init() {
   loraRadio.setDio2AsRfSwitch(SX126X_DIO2_AS_RF_SWITCH);
 #endif
 
+#ifdef SX126X_RX_BOOSTED_GAIN
+  // This custom SPI startup bypasses the gain setup in std_init().
+  status = loraRadio.setRxBoostedGainMode(SX126X_RX_BOOSTED_GAIN, true);
+  if (status != RADIOLIB_ERR_NONE) {
+    Serial.printf("ERROR: SX1262 RX gain setup failed: %d\n", status);
+    return false;
+  }
+  Serial.printf("SX1262: boosted RX gain %s\n", SX126X_RX_BOOSTED_GAIN ? "enabled" : "disabled");
+#endif
+
   // MeshCore interop — route IRQs to DIO1.
   loraRadio.setDioIrqParams(
     RADIOLIB_SX126X_IRQ_ALL,
@@ -252,6 +262,32 @@ void radio_set_params(float freq_mhz, float bw_khz, uint8_t sf, uint8_t cr) {
 
 void radio_set_tx_power(int8_t dbm) {
   loraRadio.setOutputPower(dbm);
+}
+
+RxGainCheck radio_verify_rx_gain(int16_t& error) {
+  error = RADIOLIB_ERR_NONE;
+  if (!radio_driver.isReceiveIdleForCpuSleep() || loraRadio.isReceiving() ||
+      !radio_driver.isReceiveIdleForCpuSleep()) return RxGainCheck::Deferred;
+
+  uint8_t gain = 0;
+  error = loraRadio.readRxGain(gain);
+  if (error != RADIOLIB_ERR_NONE) return RxGainCheck::Failed;
+  const uint8_t expected = SX126X_RX_BOOSTED_GAIN
+      ? RADIOLIB_SX126X_RX_GAIN_BOOSTED : RADIOLIB_SX126X_RX_GAIN_POWER_SAVING;
+  if (gain == expected) return RxGainCheck::Verified;
+  // Unexpected register bytes can indicate an SPI fault, not a lost setting.
+  if (gain != RADIOLIB_SX126X_RX_GAIN_BOOSTED &&
+      gain != RADIOLIB_SX126X_RX_GAIN_POWER_SAVING) {
+    error = RADIOLIB_ERR_UNKNOWN;
+    return RxGainCheck::Failed;
+  }
+  if (loraRadio.isReceiving() || !radio_driver.isReceiveIdleForCpuSleep())
+    return RxGainCheck::Deferred;
+  error = loraRadio.setRxBoostedGainMode(SX126X_RX_BOOSTED_GAIN, true);
+  if (error == RADIOLIB_ERR_NONE) error = loraRadio.readRxGain(gain);
+  if (error == RADIOLIB_ERR_NONE && gain == expected) return RxGainCheck::Restored;
+  if (error == RADIOLIB_ERR_NONE) error = RADIOLIB_ERR_UNKNOWN;
+  return RxGainCheck::Failed;
 }
 
 uint32_t radio_get_rng_seed() {

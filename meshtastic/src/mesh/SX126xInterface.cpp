@@ -12,6 +12,9 @@
 #endif
 
 #include "Throttle.h"
+#if defined(CROWPANEL_DHE04005D)
+#include "SX126xRxHealth.h"
+#endif
 
 // Particular boards might define a different max power based on what their hardware can do, default to max power output if not
 // specified (may be dangerous if using external PA and SX126x power config forgotten)
@@ -164,10 +167,10 @@ template <typename T> bool SX126xInterface<T>::init()
     }
 #endif
     if (config.lora.sx126x_rx_boosted_gain) {
-        uint16_t result = lora.setRxBoostedGainMode(true);
+        int16_t result = lora.setRxBoostedGainMode(true);
         LOG_INFO("Set RX gain to boosted mode; result: %d", result);
     } else {
-        uint16_t result = lora.setRxBoostedGainMode(false);
+        int16_t result = lora.setRxBoostedGainMode(false);
         LOG_INFO("Set RX gain to power saving mode (boosted mode off); result: %d", result);
     }
 
@@ -181,6 +184,10 @@ template <typename T> bool SX126xInterface<T>::init()
     }
 #else
     LOG_INFO("Skipped SX1262 register 0x8B5 patch by build flag");
+#endif
+
+#if defined(CROWPANEL_DHE04005D)
+    logRxSettings("init");
 #endif
 
 #if 0
@@ -412,7 +419,59 @@ template <typename T> bool SX126xInterface<T>::isActivelyReceiving()
 {
     // The IRQ status will be cleared when we start our read operation. Check if we've started a header, but haven't yet
     // received and handled the interrupt for reading the packet/handling errors.
-    return receiveDetected(lora.getIrqFlags(), RADIOLIB_SX126X_IRQ_HEADER_VALID, RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED);
+    uint32_t irq = lora.getIrqFlags();
+#if defined(CROWPANEL_DHE04005D)
+    // A completed packet still belongs to the RX worker, even after preamble tracking expires.
+    if (irq & RADIOLIB_SX126X_IRQ_RX_DONE)
+        return true;
+    bool active = !(irq & RADIOLIB_SX126X_IRQ_HEADER_ERR) &&
+                  receiveDetected(irq, RADIOLIB_SX126X_IRQ_HEADER_VALID, RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED);
+    uint32_t stale = sx126x_rx_health::staleActivityFlags(irq, active);
+    if (stale) {
+        lora.clearIrqFlags(stale);
+        activeReceiveStart = 0;
+    }
+    return active;
+#else
+    return receiveDetected(irq, RADIOLIB_SX126X_IRQ_HEADER_VALID, RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED);
+#endif
+}
+
+#if defined(CROWPANEL_DHE04005D)
+template <typename T> bool SX126xInterface<T>::isIdleForRxMaintenance()
+{
+    return isReceiving && !isSending() && canSleep() && !isActivelyReceiving() && !isIRQPending();
+}
+#endif
+
+template <typename T> void SX126xInterface<T>::checkRxHealth()
+{
+#if defined(CROWPANEL_DHE04005D)
+    if (Throttle::isWithinTimespanMs(lastRxHealthAttempt, rxHealthIntervalMs))
+        return;
+    lastRxHealthAttempt = millis();
+
+    int16_t error = RADIOLIB_ERR_NONE;
+    auto result = sx126x_rx_health::verify(lora, [this]() { return isIdleForRxMaintenance(); },
+                                         config.lora.sx126x_rx_boosted_gain, SX126X_REGISTER_PATCH_0X8B5 != 0, error);
+    switch (result) {
+    case sx126x_rx_health::Result::Deferred:
+        rxHealthIntervalMs = 250;
+        break;
+    case sx126x_rx_health::Result::Failed:
+        rxHealthIntervalMs = 10000;
+        LOG_WARN("CrowPanel LoRa RX health: verification failed: %d; retry deferred", error);
+        break;
+    case sx126x_rx_health::Result::Restored:
+        LOG_WARN("CrowPanel LoRa RX health: gain/sensitivity restored and verified");
+        rxHealthIntervalMs = 30000;
+        break;
+    case sx126x_rx_health::Result::Verified:
+        rxHealthIntervalMs = 30000;
+        LOG_DEBUG("CrowPanel LoRa RX health: verified; rxGood=%u rxBad=%u", rxGood, rxBad);
+        break;
+    }
+#endif
 }
 
 template <typename T> bool SX126xInterface<T>::sleep()
@@ -483,7 +542,12 @@ template <typename T> void SX126xInterface<T>::resetAGC()
 
     // 5. Re-calibrate image rejection for actual operating frequency
     //    Calibrate(0x7F) defaults to 902-928 MHz which is wrong for other regions.
-    lora.calibrateImage(getFreq());
+    int16_t imageResult = lora.calibrateImage(getFreq());
+    // CalibrateImage can finish after BUSY clears; defer register writes (upstream #11774).
+    module.hal->delay(50);
+    if (imageResult != RADIOLIB_ERR_NONE) {
+        LOG_WARN("SX126x resetAGC: image calibration failed: %d", imageResult);
+    }
 
     // Re-apply settings that calibration may have reset
 
@@ -496,19 +560,51 @@ template <typename T> void SX126xInterface<T>::resetAGC()
 #endif
 
     // RX boosted gain mode
-    lora.setRxBoostedGainMode(config.lora.sx126x_rx_boosted_gain);
+    int16_t gainResult = lora.setRxBoostedGainMode(config.lora.sx126x_rx_boosted_gain);
+    if (gainResult != RADIOLIB_ERR_NONE) {
+        LOG_WARN("SX126x resetAGC: RX gain restore failed: %d", gainResult);
+    }
 
-    // Re-apply the undocumented 0x8B5 RX sensitivity patch that was set in init().
-    // The CALIBRATE_ALL (0x7F) command above clears bit 0 of register 0x8B5, which
-    // silently removes the RX sensitivity improvement introduced in #9571 / #9777.
-    // Without this re-apply, every SX1262 node loses its RX boost ~60s after boot
-    // and never recovers until reboot. See empirical evidence in the PR description.
+#if SX126X_REGISTER_PATCH_0X8B5
+    // CALIBRATE_ALL clears this sensitivity setting; restore the same policy used by init().
     if (module.SPIsetRegValue(0x8B5, 0x01, 0, 0) != RADIOLIB_ERR_NONE) {
         LOG_WARN("SX126x resetAGC: failed to re-apply 0x8B5 RX sensitivity patch");
     }
+#endif
+
+#if defined(CROWPANEL_DHE04005D)
+    logRxSettings("AGC");
+#endif
 
     // 6. Resume receiving
     startReceive();
+}
+
+template <typename T> void SX126xInterface<T>::logRxSettings(const char *context)
+{
+    uint8_t gain = 0;
+    uint8_t patch = 0;
+    int16_t result = lora.readRegister(RADIOLIB_SX126X_REG_RX_GAIN, &gain, 1);
+    if (result == RADIOLIB_ERR_NONE) {
+        result = lora.readRegister(0x8B5, &patch, 1);
+    }
+    if (result != RADIOLIB_ERR_NONE) {
+        LOG_WARN("CrowPanel LoRa RX check (%s): register read failed: %d", context, result);
+        return;
+    }
+
+    uint8_t expected = config.lora.sx126x_rx_boosted_gain ? RADIOLIB_SX126X_RX_GAIN_BOOSTED
+                                                       : RADIOLIB_SX126X_RX_GAIN_POWER_SAVING;
+    LOG_INFO("CrowPanel LoRa RX check (%s): gain=0x%02x expected=0x%02x patch=0x%02x freq=%.3f BW=%.1f SF=%u CR=4/%u", context,
+             gain, expected, patch, getFreq(), bw, sf, cr);
+    if (gain != expected) {
+        LOG_WARN("CrowPanel LoRa RX check (%s): gain mismatch", context);
+    }
+#if SX126X_REGISTER_PATCH_0X8B5
+    if (!(patch & 0x01)) {
+        LOG_WARN("CrowPanel LoRa RX check (%s): sensitivity patch missing", context);
+    }
+#endif
 }
 
 /** Control PA mode for GC1109 FEM - CPS pin selects full PA (txon=true) or bypass mode (txon=false) */

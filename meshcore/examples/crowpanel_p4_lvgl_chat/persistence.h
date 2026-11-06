@@ -4,6 +4,7 @@
 // ============================================================
 
 #include <Arduino.h>
+#include <atomic>
 #include "app_globals.h"
 
 // On-disk contact record
@@ -57,9 +58,10 @@ void delete_chat_file_for_key(const String& key);
 // main loop drains via chat_append_flush_if_due() once the deadline
 // elapses. Call chat_append_flush_sync() before any read that needs
 // to see the very latest messages (chat load, chat switch).
-extern uint32_t g_chat_flush_deadline_ms;
+extern std::atomic<uint32_t> g_chat_flush_deadline_ms;
+void chat_persistence_init();
 void chat_append_flush_if_due();
-void chat_append_flush_sync();
+bool chat_append_flush_sync(); // false: queued text remains unsaved; do not persist its badge yet
 
 // NVS preferences
 uint32_t clamp_timeout_s(uint32_t s);
@@ -73,6 +75,9 @@ void save_ui_prefs_nvs();
 // (e.g., before esp_restart() on orientation change).
 void save_ui_prefs_nvs_now();
 void load_ui_prefs_nvs();
+// Brightness is loaded before display bring-up and saved only on slider release.
+uint8_t load_brightness_nvs();
+bool save_brightness_nvs(uint8_t level);
 void save_timeout_s(uint32_t s);
 void save_device_name_nvs(const char* name);
 bool load_device_name_nvs(char* out, size_t outlen);

@@ -5,6 +5,9 @@
 #include "Router.h"
 #include "configuration.h"
 #include "main.h"
+#if !MESHTASTIC_EXCLUDE_TRACEROUTE
+#include "TraceRouteModule.h"
+#endif
 
 RoutingModule *routingModule;
 
@@ -30,6 +33,10 @@ bool RoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, mesh
 
     printPacket("Routing sniffing", &mp);
     router->sniffReceived(&mp, r);
+#if !MESHTASTIC_EXCLUDE_TRACEROUTE
+    if (r && traceRouteModule)
+        traceRouteModule->handleRoutingReport(mp, *r);
+#endif
 
     // FIXME - move this to a non promsicious PhoneAPI module?
     // Note: we are careful not to send back packets that started with the phone back to the phone

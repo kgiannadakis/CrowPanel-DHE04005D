@@ -1,6 +1,6 @@
 # Meshtastic MCP Server
 
-An [MCP](https://modelcontextprotocol.io) server for working with the Meshtastic firmware repo and connected devices. Lets Claude Code / Claude Desktop:
+An [MCP](https://modelcontextprotocol.io) server for working with the Meshtastic firmware repo and connected devices. Compatible clients can:
 
 - Discover USB-connected Meshtastic devices
 - Enumerate PlatformIO board variants (166+) with Meshtastic metadata
@@ -37,9 +37,10 @@ MESHTASTIC_FIRMWARE_ROOT=<firmware-repo> .venv/bin/python -m meshtastic_mcp
 
 The server blocks on stdin (that's correct — it speaks MCP over stdio). Ctrl-C to exit.
 
-## Register with Claude Code
+## Client Configuration
 
-Edit `~/.claude/settings.json` (global) or `<firmware-repo>/.claude/settings.local.json` (project-only):
+Register the server in your client's MCP configuration using its supported
+settings format. For clients using an `mcpServers` object:
 
 ```json
 {
@@ -55,11 +56,8 @@ Edit `~/.claude/settings.json` (global) or `<firmware-repo>/.claude/settings.loc
 }
 ```
 
-Replace `<firmware-repo>` with the absolute path, e.g. `/Users/you/GitHub/firmware`. Restart Claude Code after editing.
-
-## Register with Claude Desktop
-
-Same `mcpServers` block, but in `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows).
+Replace `<firmware-repo>` with your checkout's absolute path and restart the
+client after editing. Use the virtual environment's `Scripts/python.exe` on Windows.
 
 ## Tools (43)
 
@@ -160,7 +158,7 @@ rather than auto-`sudo`'ing mid-run.
 
 ## Safety
 
-- **All destructive flash/admin tools require `confirm=True`** as a tool-level gate, on top of any permission prompt from Claude.
+- **All destructive flash/admin tools require `confirm=True`** as a tool-level gate, in addition to the client's permission prompt.
 - **Serial port is exclusive.** If a `serial_*` session is active on a port, `device_info`/admin tools on the same port will fail fast with a pointer at the active `session_id`. Close the session first.
 - **Flash confirmation by architecture**: `erase_and_flash` / `update_flash` error if the env's architecture isn't ESP32 — use `pio_flash` for nRF52/RP2040/STM32.
 
@@ -359,14 +357,13 @@ Right side: live transcript tail ("step 3 — frame 4/8 name=nodelist_nodes
 as each UI test runs. Requires the `[ui]` extras for image rendering; the
 transcript alone works without them.
 
-### Slash commands
+### Test Workflows
 
-Three AI-assisted workflows are wired up for Claude Code operators
-(`.claude/commands/`) and Copilot operators (`.github/prompts/`):
-`/test` (run + interpret), `/diagnose` (read-only health report), `/repro`
-(flake triage, N-times re-run with log diff).
+Use `run-tests.sh` or the test TUI to run hardware checks, collect read-only
+health reports and repeat a failing test with log comparison. Client-specific
+shortcuts and local configuration are not required by the firmware.
 
-### House rules (for human + agent contributors)
+### Contributor Rules
 
 - Session-scoped fixtures in `tests/conftest.py` snapshot + restore
   `userPrefs.jsonc`; **never edit `userPrefs.jsonc` from inside a test**.

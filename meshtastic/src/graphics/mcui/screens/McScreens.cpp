@@ -1,6 +1,7 @@
 #if HAS_TFT && USE_MCUI
 
 #include "McScreens.h"
+#include "MapTileLayout.h"
 #include "McChatView.h"
 #include "../McKeyboard.h"
 #include "../McTheme.h"
@@ -11,6 +12,8 @@
 #include "mesh/Channels.h"
 #include "mesh/MeshService.h"
 #include "mesh/NodeDB.h"
+#include "mesh/PositionCoordinates.h"
+#include "mesh/Throttle.h"
 #include "mesh/generated/meshtastic/channel.pb.h"
 
 #include <Arduino.h>
@@ -848,11 +851,13 @@ struct MapTileSlot {
     lv_obj_t *img = nullptr;
     lv_obj_t *placeholder = nullptr;
     char src[96] = {0};
-    // Cache of the tile this slot last resolved, so an unchanged view (the
-    // every-4s marker refresh, the post-drag marker restore) skips all SD I/O.
-    // -1 = invalid.
+    // Keep resolved tile identity across layout changes, including missing files.
     int cz = -1, cx = -1, cy = -1;
     bool cloaded = false; // whether (cz,cx,cy) resolved to a real tile file
+    MapTileKey target;
+    bool active = false;
+    bool pending = false;
+    bool visible = false;
 };
 
 struct MapMarkerSlot {
@@ -861,6 +866,8 @@ struct MapMarkerSlot {
     lv_obj_t *tag_label = nullptr;
     bool active = false;
     bool has_tag = false; // whether this slot's tag/label should be visible
+    uint32_t node_num = 0;
+    int count = 1;
 };
 
 struct MapState {
@@ -877,11 +884,21 @@ struct MapState {
     uint32_t last_nodes_refresh_ms = 0;
     bool initialized = false;
     bool first_render_pending = true;
+    bool show_names = false;
+    bool save_pending = false;
+    uint32_t save_changed_ms = 0;
+    int base_x = 0, base_y = 0;
+    int pins = 0;
+    int positioned_nodes = 0;
+    int fallback_start_zoom = -1;
+    bool fallback_active = false;
+    bool tiles_ready = false;
+    int gesture_travel = 0;
 };
 
 static constexpr int kMapTilePx = 256;
-static constexpr int kMapMarkerDotPx = 6;
-static constexpr int kMapLocalDotPx = 9;
+static constexpr int kMapMarkerDotPx = 8;
+static constexpr int kMapLocalDotPx = 10;
 static constexpr int kMapMinZoom = 7;
 static constexpr int kMapMaxZoom = 12;
 static constexpr int kMapDesiredTilePad = 1;
@@ -891,13 +908,11 @@ static constexpr int kMapDesiredTilePad = 1;
 // (fixed by the multi_heap custom allocator, crowpanel_lvgl_alloc.cpp).
 static constexpr int kMapMaxTileSlots = 30;
 static constexpr int kMapMaxMarkerSlots = 40;
-// Node name tags are only drawn at these zooms; below this it's dots only.
-static constexpr int kMapNameMinZoom = 11;
 // Screen-space grid cell (px) for marker clustering: nodes whose dots fall in
 // the same cell collapse into one dot + a count, so a crowded area doesn't draw
 // dozens of overlapping markers. Zoom in to pull them apart.
 static constexpr int kMapClusterCellPx = 40;
-static constexpr uint32_t kMapNodeRefreshMs = 4000;
+static constexpr uint32_t kMapNodeRefreshMs = 2000;
 static constexpr uint32_t kMapMarkerRestoreDelayMs = 120;
 static constexpr int kMapRebuildEdgeMarginPx = 24;
 static MapState s_map;
@@ -907,6 +922,7 @@ static bool s_map_markers_hidden = false;
 static bool s_map_blocked_by_wifi = false;
 static uint32_t s_map_marker_restore_ms = 0;
 static uint32_t s_map_last_diag_ms = 0;
+static lv_obj_t *s_map_popup = nullptr;
 
 #if defined(ARCH_ESP32) && defined(CROWPANEL_DHE04005D) && !defined(CROWPANEL_DISABLE_MAPS)
 static sdmmc_card_t *s_map_sd_card = nullptr;
@@ -923,6 +939,8 @@ static double maps_world_size_px(int zoom)
 
 static void maps_latlon_to_world(double lat, double lon, int zoom, double *wx, double *wy)
 {
+    // Mercator is undefined at the poles, which fixed/stale positions can contain.
+    lat = fmax(-85.05112878, fmin(85.05112878, lat));
     const double n = maps_world_size_px(zoom);
     *wx = (lon + 180.0) / 360.0 * n;
     const double lat_rad = lat * M_PI / 180.0;
@@ -946,6 +964,9 @@ static void maps_status_set(const char *text)
 static bool maps_wifi_conflicts_with_sd()
 {
 #if defined(ARCH_ESP32P4) && defined(CROWPANEL_DHE04005D)
+#if !defined(CROWPANEL_DISABLE_MAPS)
+    if (s_map_sd_ready) return false;
+#endif
     struct stat st = {};
     if (stat("/sdcard", &st) == 0 && (st.st_mode & S_IFDIR))
         return false;
@@ -966,12 +987,22 @@ static void maps_zoom_set_label()
 static void maps_viewport_save_now()
 {
     Preferences prefs;
-    if (!prefs.begin("map", false))
+    if (!prefs.begin("map", false)) {
+        s_map.save_changed_ms = millis();
         return;
+    }
     prefs.putInt("lat_e6", (int32_t)lround(s_map.center_lat * 1.0e6));
     prefs.putInt("lon_e6", (int32_t)lround(s_map.center_lon * 1.0e6));
     prefs.putUChar("zoom", (uint8_t)s_map.zoom);
+    prefs.putBool("names", s_map.show_names);
     prefs.end();
+    s_map.save_pending = false;
+}
+
+static void maps_viewport_save_later()
+{
+    s_map.save_pending = true;
+    s_map.save_changed_ms = millis();
 }
 
 static bool maps_viewport_load()
@@ -982,9 +1013,12 @@ static bool maps_viewport_load()
     const int32_t lat_e6 = prefs.getInt("lat_e6", INT32_MIN);
     const int32_t lon_e6 = prefs.getInt("lon_e6", INT32_MIN);
     uint8_t zoom = prefs.getUChar("zoom", 0xFF);
+    s_map.show_names = prefs.getBool("names", false);
     prefs.end();
 
     if (lat_e6 == INT32_MIN || lon_e6 == INT32_MIN || zoom == 0xFF)
+        return false;
+    if (lat_e6 < -85051129 || lat_e6 > 85051129 || lon_e6 < -180000000 || lon_e6 > 180000000)
         return false;
     if (zoom < kMapMinZoom)
         zoom = kMapMinZoom;
@@ -1012,21 +1046,13 @@ static bool maps_extract_node_latlon(const meshtastic_NodeInfoLite *node, double
 {
     if (!node || !lat || !lon) return false;
 
-    if (nodeDB && nodeDB->hasValidPosition(node)) {
-        *lat = (double)node->position.latitude_i / 1.0e7;
-        *lon = (double)node->position.longitude_i / 1.0e7;
-        return true;
-    }
-
-    // Fallback: draw stale/fixed coordinates if present and in plausible range.
+    // Keep drawing saved/fixed coordinates, but never project an invalid report.
     const int32_t lat_i = node->position.latitude_i;
     const int32_t lon_i = node->position.longitude_i;
-    if (lat_i == 0 && lon_i == 0) return false;
+    if (!PositionCoordinates::isValid(lat_i, lon_i)) return false;
 
     const double lat_d = (double)lat_i / 1.0e7;
     const double lon_d = (double)lon_i / 1.0e7;
-    if (lat_d < -90.0 || lat_d > 90.0 || lon_d < -180.0 || lon_d > 180.0) return false;
-
     *lat = lat_d;
     *lon = lon_d;
     return true;
@@ -1111,10 +1137,7 @@ static bool maps_ensure_sd_mounted()
 // is handed the equivalent "S:/..." path. Returns true if the tile is loaded.
 static bool maps_load_tile(MapTileSlot &ts, int z, int x, int y)
 {
-    // Fast path: this slot already resolved this exact tile — skip ALL SD I/O.
-    // The every-4s marker refresh and the post-drag marker restore rebuild the
-    // same view, so without this each redraw did 30-60 FAT stat() calls (~200 ms
-    // of pure SD latency, felt as periodic stutter and slow pan/zoom).
+    // Already-resolved tiles need no SD lookup, even after shifting the viewport.
     if (ts.cz == z && ts.cx == x && ts.cy == y)
         return ts.cloaded;
 
@@ -1171,6 +1194,7 @@ static void maps_clear_all_tiles()
         ts.src[0] = '\0';
         ts.cz = ts.cx = ts.cy = -1; // invalidate the SD-skip cache
         ts.cloaded = false;
+        ts.active = ts.pending = false;
         if (ts.img) {
             lv_image_set_src(ts.img, nullptr);
             lv_obj_add_flag(ts.img, LV_OBJ_FLAG_HIDDEN);
@@ -1210,12 +1234,7 @@ static void maps_set_marker_visibility(bool visible)
     for (int i = 0; i < kMapMaxMarkerSlots; i++) {
         MapMarkerSlot &m = s_map_markers[i];
         if (!m.active) continue;
-        if (m.dot) {
-            if (visible)
-                lv_obj_clear_flag(m.dot, LV_OBJ_FLAG_HIDDEN);
-            else
-                lv_obj_add_flag(m.dot, LV_OBJ_FLAG_HIDDEN);
-        }
+        // Pins travel with the tile layer; only labels disappear during drag.
         if (m.tag) {
             if (visible && m.has_tag)
                 lv_obj_clear_flag(m.tag, LV_OBJ_FLAG_HIDDEN);
@@ -1265,29 +1284,37 @@ static void maps_show_marker_slot(MapMarkerSlot &slot, const meshtastic_NodeInfo
                                   bool show_name)
 {
     if (!slot.dot) return;
+    slot.node_num = node ? node->num : 0;
+    slot.count = 1;
 
     if (is_local) {
         lv_obj_set_size(slot.dot, kMapLocalDotPx, kMapLocalDotPx);
         lv_obj_set_pos(slot.dot, mx - (kMapLocalDotPx / 2), my - (kMapLocalDotPx / 2));
-        lv_obj_set_style_bg_color(slot.dot, lv_color_hex(0x1E3A8A), 0);
+        lv_obj_set_style_bg_color(slot.dot, lv_color_hex(0x6DC264), 0);
         lv_obj_set_style_radius(slot.dot, LV_RADIUS_CIRCLE, 0);
     } else {
         lv_obj_set_size(slot.dot, kMapMarkerDotPx, kMapMarkerDotPx);
         lv_obj_set_pos(slot.dot, mx - (kMapMarkerDotPx / 2), my - (kMapMarkerDotPx / 2));
-        lv_obj_set_style_bg_color(slot.dot, lv_color_hex(0x4DA3FF), 0);
-        lv_obj_set_style_radius(slot.dot, 0, 0);
+        const bool router = node && node->has_user &&
+            (node->user.role == meshtastic_Config_DeviceConfig_Role_ROUTER ||
+             node->user.role == meshtastic_Config_DeviceConfig_Role_REPEATER ||
+             node->user.role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE ||
+             node->user.role == meshtastic_Config_DeviceConfig_Role_CLIENT_BASE);
+        lv_obj_set_style_bg_color(slot.dot, lv_color_hex(router ? 0xFF3B30 : 0x35A4FF), 0);
+        lv_obj_set_style_radius(slot.dot, LV_RADIUS_CIRCLE, 0);
     }
 
     lv_obj_move_foreground(slot.dot);
     lv_obj_clear_flag(slot.dot, LV_OBJ_FLAG_HIDDEN);
 
-    // Name tag only at the closer zooms (kMapNameMinZoom+); otherwise dot only.
+    // Optional MeshCore-style name tag, bounded to the visible viewport.
     if (show_name && slot.tag && slot.tag_label && node) {
-        char short_name[32];
+        char short_name[64];
         maps_node_short_name(node, short_name, sizeof(short_name));
-        lv_label_set_text(slot.tag_label, short_name);
+        if (strcmp(lv_label_get_text(slot.tag_label), short_name) != 0)
+            lv_label_set_text(slot.tag_label, short_name);
         lv_obj_set_size(slot.tag, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-        lv_obj_set_pos(slot.tag, mx + 6, my - 10);
+        lv_obj_set_pos(slot.tag, mx + 7, my - 10);
         lv_obj_move_foreground(slot.tag);
         lv_obj_clear_flag(slot.tag, LV_OBJ_FLAG_HIDDEN);
         slot.has_tag = true;
@@ -1305,18 +1332,21 @@ static void maps_show_marker_slot(MapMarkerSlot &slot, const meshtastic_NodeInfo
 static void maps_show_cluster_slot(MapMarkerSlot &slot, int count, int mx, int my)
 {
     if (!slot.dot) return;
+    slot.node_num = 0;
+    slot.count = count;
 
     lv_obj_set_size(slot.dot, kMapMarkerDotPx, kMapMarkerDotPx);
     lv_obj_set_pos(slot.dot, mx - (kMapMarkerDotPx / 2), my - (kMapMarkerDotPx / 2));
-    lv_obj_set_style_bg_color(slot.dot, lv_color_hex(0x4DA3FF), 0);
-    lv_obj_set_style_radius(slot.dot, 0, 0);
+    lv_obj_set_style_bg_color(slot.dot, lv_color_hex(0x35A4FF), 0);
+    lv_obj_set_style_radius(slot.dot, LV_RADIUS_CIRCLE, 0);
     lv_obj_move_foreground(slot.dot);
     lv_obj_clear_flag(slot.dot, LV_OBJ_FLAG_HIDDEN);
 
     if (slot.tag && slot.tag_label) {
         char buf[8];
         snprintf(buf, sizeof(buf), "%d", count);
-        lv_label_set_text(slot.tag_label, buf);
+        if (strcmp(lv_label_get_text(slot.tag_label), buf) != 0)
+            lv_label_set_text(slot.tag_label, buf);
         lv_obj_set_size(slot.tag, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
         lv_obj_set_pos(slot.tag, mx + 6, my - 10);
         lv_obj_move_foreground(slot.tag);
@@ -1330,10 +1360,11 @@ static void maps_show_cluster_slot(MapMarkerSlot &slot, int count, int mx, int m
 static int maps_draw_markers(int base_x, int base_y, int pan_w, int pan_h)
 {
     maps_hide_all_markers();
+    s_map.positioned_nodes = 0;
     if (!nodeDB || !s_map.pan) return 0;
 
     const uint32_t local_num = nodeDB->getNodeNum();
-    const bool show_names = (s_map.zoom >= kMapNameMinZoom);
+    const bool show_names = s_map.show_names;
 
     // Bin visible non-local nodes into screen-space grid cells. Nodes sharing a
     // cell collapse to one marker: a single node keeps its dot (+ name at close
@@ -1353,6 +1384,8 @@ static int maps_draw_markers(int base_x, int base_y, int pan_w, int pan_h)
     for (size_t i = 0; i < n; i++) {
         meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(i);
         if (!node || node->num == local_num) continue; // local drawn separately
+        if (PositionCoordinates::isValid(node->position.latitude_i, node->position.longitude_i))
+            ++s_map.positioned_nodes;
         int mx = 0, my = 0;
         if (!maps_slot_position_from_node(node, base_x, base_y, pan_w, pan_h, &mx, &my)) continue;
 
@@ -1363,7 +1396,7 @@ static int maps_draw_markers(int base_x, int base_y, int pan_w, int pan_h)
             if (clusters[c].cx == cx && clusters[c].cy == cy) { found = c; break; }
         }
         if (found < 0) {
-            if (nclusters >= kMapMaxMarkerSlots) continue; // out of marker slots
+            if (nclusters >= kMapMaxMarkerSlots - 1) continue; // reserve the local pin
             found = nclusters++;
             clusters[found] = {cx, cy, 0, 0, 0, node};
         }
@@ -1387,6 +1420,8 @@ static int maps_draw_markers(int base_x, int base_y, int pan_w, int pan_h)
     // Local node: always its own marker (distinct style), never clustered.
     if (marker_idx < kMapMaxMarkerSlots) {
         meshtastic_NodeInfoLite *local = nodeDB->getMeshNode(local_num);
+        if (local && PositionCoordinates::isValid(local->position.latitude_i, local->position.longitude_i))
+            ++s_map.positioned_nodes;
         int mx = 0, my = 0;
         if (maps_slot_position_from_node(local, base_x, base_y, pan_w, pan_h, &mx, &my)) {
             maps_show_marker_slot(s_map_markers[marker_idx], local, true, mx, my, show_names);
@@ -1414,19 +1449,83 @@ static bool maps_should_rebuild_after_drag()
 
 static void maps_schedule_marker_restore()
 {
-    s_map_marker_restore_ms = millis() + kMapMarkerRestoreDelayMs;
+    s_map_marker_restore_ms = millis();
+}
+
+static void maps_refresh_markers()
+{
+    s_map.pins = maps_draw_markers(s_map.base_x, s_map.base_y,
+                                 lv_obj_get_width(s_map.pan), lv_obj_get_height(s_map.pan));
+    // Limit labels and reject overlaps; pins remain visible in crowded areas.
+    int shown = 0;
+    const int left = -lv_obj_get_x(s_map.pan) + 4;
+    const int top = -lv_obj_get_y(s_map.pan) + 40;
+    const int right = left + lv_obj_get_width(s_map.content) - 8;
+    const int bottom = top + lv_obj_get_height(s_map.content) - 44;
+    lv_obj_update_layout(s_map.pan);
+    for (int i = 0; i < kMapMaxMarkerSlots; ++i) {
+        MapMarkerSlot &m = s_map_markers[i];
+        if (!m.active || !m.has_tag) continue;
+        const int w = lv_obj_get_width(m.tag), h = lv_obj_get_height(m.tag);
+        const int x = static_cast<int>(fmax(left, fmin(right - w, lv_obj_get_x(m.tag))));
+        const int y = static_cast<int>(fmax(top, fmin(bottom - h, lv_obj_get_y(m.tag))));
+        lv_obj_set_pos(m.tag, x, y);
+        const int px = lv_obj_get_x(m.dot), py = lv_obj_get_y(m.dot);
+        bool hide = shown >= 22 || px < left || px > right || py < top || py > bottom;
+        for (int j = 0; !hide && j < i; ++j) {
+            const MapMarkerSlot &other = s_map_markers[j];
+            if (!other.active || !other.has_tag) continue;
+            const int ox = lv_obj_get_x(other.tag), oy = lv_obj_get_y(other.tag);
+            hide = x < ox + lv_obj_get_width(other.tag) + 3 && x + w + 3 > ox &&
+                   y < oy + lv_obj_get_height(other.tag) + 3 && y + h + 3 > oy;
+        }
+        if (hide) {
+            m.has_tag = false;
+            lv_obj_add_flag(m.tag, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            ++shown;
+        }
+    }
+    for (MapMarkerSlot &m : s_map_markers)
+        if (m.active) lv_obj_move_foreground(m.dot);
+    s_map_markers_hidden = false;
+}
+
+static int maps_tile_status()
+{
+    int loaded = 0, total = 0, pending = 0;
+    for (const MapTileSlot &ts : s_map_tiles) {
+        if (!ts.active) continue;
+        const int limit = 1 << s_map.zoom;
+        if (ts.target.x < 0 || ts.target.y < 0 || ts.target.x >= limit || ts.target.y >= limit) continue;
+        ++total;
+        if (ts.pending) ++pending;
+        else if (ts.cloaded) ++loaded;
+    }
+    char status[88];
+    snprintf(status, sizeof(status), "%d/%d tiles  %d located  %d pins%s", loaded, total, s_map.positioned_nodes, s_map.pins,
+             pending ? "  " LV_SYMBOL_REFRESH : "");
+    maps_status_set(status);
+    return loaded;
 }
 
 static int maps_rebuild(bool allow_zoom_fallback, bool include_markers = true)
 {
     if (!s_map.pan || !s_map.content) return 0;
-    const uint32_t start_ms = millis();
+    s_map.tiles_ready = false;
+    if (allow_zoom_fallback) {
+        s_map.fallback_start_zoom = s_map.zoom;
+        s_map.fallback_active = true;
+    } else {
+        s_map.fallback_active = false;
+    }
 
     if (maps_wifi_conflicts_with_sd()) {
         s_map_blocked_by_wifi = true;
         maps_status_set("Maps require WiFi off");
         maps_clear_all_tiles();
         maps_hide_all_markers();
+        s_map.fallback_active = false;
         return 0;
     }
     s_map_blocked_by_wifi = false;
@@ -1447,6 +1546,7 @@ static int maps_rebuild(bool allow_zoom_fallback, bool include_markers = true)
             if (s_map_tiles[i].placeholder) lv_obj_add_flag(s_map_tiles[i].placeholder, LV_OBJ_FLAG_HIDDEN);
         }
         maps_hide_all_markers();
+        s_map.fallback_active = false;
         return 0;
     }
 
@@ -1488,90 +1588,110 @@ static int maps_rebuild(bool allow_zoom_fallback, bool include_markers = true)
     lv_obj_set_size(s_map.pan, pan_w, pan_h);
     lv_obj_set_pos(s_map.pan, pan_x, pan_y);
 
+    MapTileKey existing[kMapMaxTileSlots];
+    int slots[kMapMaxTileSlots];
+    for (int i = 0; i < kMapMaxTileSlots; ++i) {
+        existing[i] = {s_map_tiles[i].cz, s_map_tiles[i].cx, s_map_tiles[i].cy};
+        s_map_tiles[i].active = s_map_tiles[i].pending = false;
+    }
+    if (!map_tile_layout(existing, s_map.zoom, x0, y0, cols, rows, slots)) return 0;
+    s_map.tiles_ready = true;
+    int reused = 0, queued = 0;
     const int tile_max = 1 << s_map.zoom;
-    int slot = 0;
-    int loaded = 0;
-    int total = 0;
-    for (int ty = y0; ty <= y1; ty++) {
-        for (int tx = x0; tx <= x1; tx++) {
-            if (slot >= kMapMaxTileSlots) continue;
-            MapTileSlot &ts = s_map_tiles[slot++];
-
-            const int sx = (tx - x0) * kMapTilePx;
-            const int sy = (ty - y0) * kMapTilePx;
-            lv_obj_set_pos(ts.placeholder, sx, sy);
-            lv_obj_set_pos(ts.img, sx, sy);
-
-            if (tx < 0 || ty < 0 || tx >= tile_max || ty >= tile_max) {
-                lv_obj_clear_flag(ts.placeholder, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_add_flag(ts.img, LV_OBJ_FLAG_HIDDEN);
-                continue;
-            }
-            total++;
-
-            if (maps_load_tile(ts, s_map.zoom, tx, ty)) {
-                lv_obj_move_foreground(ts.img);
-                lv_obj_clear_flag(ts.img, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_add_flag(ts.placeholder, LV_OBJ_FLAG_HIDDEN);
-                loaded++;
-            } else {
-                lv_obj_clear_flag(ts.placeholder, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_add_flag(ts.img, LV_OBJ_FLAG_HIDDEN);
-            }
+    for (int i = 0; i < cols * rows; ++i) {
+        MapTileSlot &ts = s_map_tiles[slots[i]];
+        const int tx = x0 + i % cols, ty = y0 + i / cols;
+        ts.target = {s_map.zoom, tx, ty};
+        ts.active = true;
+        ts.visible = tx >= vis_x0 && tx <= vis_x1 && ty >= vis_y0 && ty <= vis_y1;
+        lv_obj_set_pos(ts.placeholder, (i % cols) * kMapTilePx, (i / cols) * kMapTilePx);
+        lv_obj_set_pos(ts.img, (i % cols) * kMapTilePx, (i / cols) * kMapTilePx);
+        const bool valid = tx >= 0 && ty >= 0 && tx < tile_max && ty < tile_max;
+        const bool resolved = existing[slots[i]] == ts.target;
+        ts.pending = valid && !resolved;
+        if (ts.pending) ++queued;
+        if (resolved && ts.cloaded) ++reused;
+        if (valid && resolved && ts.cloaded) {
+            lv_obj_clear_flag(ts.img, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(ts.placeholder, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(ts.img, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(ts.placeholder, LV_OBJ_FLAG_HIDDEN);
         }
     }
-
-    for (int i = slot; i < kMapMaxTileSlots; i++) {
-        if (s_map_tiles[i].img) lv_obj_add_flag(s_map_tiles[i].img, LV_OBJ_FLAG_HIDDEN);
-        if (s_map_tiles[i].placeholder) lv_obj_add_flag(s_map_tiles[i].placeholder, LV_OBJ_FLAG_HIDDEN);
+    for (MapTileSlot &ts : s_map_tiles) {
+        if (ts.active) continue;
+        lv_obj_add_flag(ts.img, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(ts.placeholder, LV_OBJ_FLAG_HIDDEN);
     }
+    s_map.base_x = x0 * kMapTilePx;
+    s_map.base_y = y0 * kMapTilePx;
 
-    int markers = 0;
     if (include_markers) {
-        markers = maps_draw_markers(x0 * kMapTilePx, y0 * kMapTilePx, pan_w, pan_h);
-        s_map_markers_hidden = false;
+        maps_refresh_markers();
         s_map_marker_restore_ms = 0;
     } else {
         maps_hide_all_markers();
         s_map_markers_hidden = true;
     }
 
-    char status[88];
-    snprintf(status, sizeof(status), "Z%d  %d/%d tiles  %d pins",
-             s_map.zoom, loaded, total, markers);
-    maps_status_set(status);
+    maps_tile_status();
+    LOG_DEBUG("mcui: map layout reused=%d queued=%d zoom=%d", reused, queued, s_map.zoom);
+    return reused + queued;
+}
 
-    const uint32_t elapsed_ms = millis() - start_ms;
-    if (elapsed_ms > 150 && (s_map_last_diag_ms == 0 || (uint32_t)(millis() - s_map_last_diag_ms) > 5000)) {
-#if !defined(DEBUG_MUTE)
-        const size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        LOG_WARN("mcui: map rebuild slow %u ms, tiles=%d/%d, largest_internal=%u",
-                 (unsigned)elapsed_ms, loaded, total, (unsigned)largest_internal);
-#endif
-        s_map_last_diag_ms = millis();
+static void maps_load_next_tile()
+{
+    if (!s_map.tiles_ready) return;
+    // One tile per UI tick, visible area before the off-screen pan border.
+    // All LVGL/decoder work stays under the existing UI lock and clean arena.
+    MapTileSlot *next = nullptr;
+    for (MapTileSlot &ts : s_map_tiles) {
+        if (!ts.active || !ts.pending) continue;
+        if (!next || (ts.visible && !next->visible)) next = &ts;
     }
-
-    if (loaded == 0 && allow_zoom_fallback && s_map.zoom > kMapMinZoom) {
-        int start_zoom = s_map.zoom;
-        for (int z = start_zoom - 1; z >= kMapMinZoom; z--) {
-            s_map.zoom = z;
-            maps_zoom_set_label();
-            if (maps_rebuild(false, include_markers) > 0) return 1;
+    if (next) {
+        const uint32_t start = millis();
+        const bool loaded = maps_load_tile(*next, next->target.zoom, next->target.x, next->target.y);
+        next->pending = false;
+        if (loaded) {
+            lv_obj_clear_flag(next->img, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(next->placeholder, LV_OBJ_FLAG_HIDDEN);
         }
-        s_map.zoom = start_zoom;
-        maps_zoom_set_label();
-        maps_status_set("No tiles for this area");
+        maps_tile_status();
+        if (millis() - start > 150 && !Throttle::isWithinTimespanMs(s_map_last_diag_ms, 5000)) {
+            s_map_last_diag_ms = millis();
+            LOG_WARN("mcui: map tile load slow %u ms z=%d x=%d y=%d", (unsigned)(millis() - start),
+                     next->target.zoom, next->target.x, next->target.y);
+        }
+        return;
     }
-
-    return loaded;
+    if (!s_map.fallback_active) return;
+    if (maps_tile_status() > 0) {
+        s_map.fallback_active = false;
+        if (s_map.zoom != s_map.fallback_start_zoom) maps_viewport_save_later();
+        return;
+    }
+    const int original = s_map.fallback_start_zoom;
+    if (s_map.zoom > kMapMinZoom) {
+        --s_map.zoom;
+        maps_zoom_set_label();
+        maps_rebuild(false, true);
+        s_map.fallback_start_zoom = original;
+        s_map.fallback_active = true;
+    } else {
+        s_map.zoom = original;
+        maps_zoom_set_label();
+        maps_rebuild(false, true);
+        maps_status_set("No tiles for this area");
+        maps_viewport_save_later();
+    }
 }
 
 static void maps_apply_drag_and_rebuild()
 {
     if (s_map.drag_dx == 0 && s_map.drag_dy == 0) return;
 
-    const double old_lat = s_map.center_lat;
-    const double old_lon = s_map.center_lon;
     double cwx = 0.0, cwy = 0.0;
     maps_latlon_to_world(s_map.center_lat, s_map.center_lon, s_map.zoom, &cwx, &cwy);
     cwx -= s_map.drag_dx;
@@ -1588,17 +1708,12 @@ static void maps_apply_drag_and_rebuild()
     s_map.drag_dy = 0;
 
     if (maps_should_rebuild_after_drag()) {
-        if (maps_rebuild(false, false) <= 0) {
-            s_map.center_lat = old_lat;
-            s_map.center_lon = old_lon;
-            maps_rebuild(true, true);
-            return;
-        }
+        maps_rebuild(false, true);
         maps_schedule_marker_restore();
     } else {
-        maps_set_marker_visibility(true);
+        maps_schedule_marker_restore();
     }
-    maps_viewport_save_now();
+    maps_viewport_save_later();
 }
 
 static void maps_on_pressing(lv_event_t *)
@@ -1609,7 +1724,9 @@ static void maps_on_pressing(lv_event_t *)
     lv_indev_get_vect(indev, &v);
     if (v.x == 0 && v.y == 0) return;
 
-    if (!s_map_markers_hidden)
+    s_map.gesture_travel += abs(v.x) + abs(v.y);
+    s_map.fallback_active = false;
+    if (s_map.gesture_travel > 10 && !s_map_markers_hidden)
         maps_set_marker_visibility(false);
     s_map_marker_restore_ms = 0;
     s_map.drag_dx += v.x;
@@ -1617,9 +1734,83 @@ static void maps_on_pressing(lv_event_t *)
     lv_obj_set_pos(s_map.pan, lv_obj_get_x(s_map.pan) + v.x, lv_obj_get_y(s_map.pan) + v.y);
 }
 
+static void maps_popup_close(lv_event_t * = nullptr)
+{
+    if (!s_map_popup) return;
+    lv_obj_delete(s_map_popup);
+    s_map_popup = nullptr;
+}
+
 static void maps_on_released(lv_event_t *)
 {
+    const bool tapped = s_map.gesture_travel <= 10;
     maps_apply_drag_and_rebuild();
+    s_map.gesture_travel = 0;
+    if (!tapped || !s_map.tiles_ready || !nodeDB) return;
+    lv_indev_t *indev = lv_indev_get_act();
+    if (!indev) return;
+    lv_point_t point;
+    lv_indev_get_point(indev, &point);
+    MapMarkerSlot *nearest = nullptr;
+    int best = 20 * 20 + 1;
+    for (MapMarkerSlot &m : s_map_markers) {
+        if (!m.active) continue;
+        lv_area_t area;
+        lv_obj_get_coords(m.dot, &area);
+        const int dx = point.x - (area.x1 + area.x2) / 2;
+        const int dy = point.y - (area.y1 + area.y2) / 2;
+        const int distance = dx * dx + dy * dy;
+        if (distance < best) { best = distance; nearest = &m; }
+    }
+    if (!nearest) return;
+    char title[64], details[128];
+    if (nearest->count > 1) {
+        snprintf(title, sizeof(title), "%d nearby nodes", nearest->count);
+        snprintf(details, sizeof(details), "Zoom %d", s_map.zoom);
+    } else {
+        const auto *node = nodeDB->getMeshNode(nearest->node_num);
+        if (!node) return;
+        maps_node_short_name(node, title, sizeof(title));
+        double lat, lon;
+        if (!maps_extract_node_latlon(node, &lat, &lon)) return;
+        snprintf(details, sizeof(details), "!%08x\n%.5f, %.5f", (unsigned)nearest->node_num, lat, lon);
+    }
+    maps_popup_close();
+    s_map_popup = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(s_map_popup);
+    lv_obj_set_size(s_map_popup, SCR_W, SCR_H);
+    lv_obj_set_style_bg_color(s_map_popup, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_map_popup, LV_OPA_60, 0);
+    lv_obj_remove_flag(s_map_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_map_popup, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_map_popup, maps_popup_close, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *box = lv_obj_create(s_map_popup);
+    lv_obj_set_size(box, SCR_W - 40, 200);
+    lv_obj_set_style_bg_color(box, lv_color_hex(TH_SURFACE), 0);
+    lv_obj_set_style_radius(box, 6, 0);
+    lv_obj_set_style_pad_all(box, 12, 0);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_center(box);
+    lv_obj_t *title_label = lv_label_create(box);
+    lv_label_set_text(title_label, title);
+    lv_obj_set_style_text_font(title_label, MCUI_FONT_16, 0);
+    lv_obj_set_style_text_color(title_label, lv_color_hex(TH_TEXT), 0);
+    lv_obj_set_width(title_label, SCR_W - 124);
+    lv_label_set_long_mode(title_label, LV_LABEL_LONG_WRAP);
+    lv_obj_t *details_label = lv_label_create(box);
+    lv_label_set_text(details_label, details);
+    lv_obj_set_pos(details_label, 0, 80);
+    lv_obj_set_width(details_label, SCR_W - 72);
+    lv_obj_set_style_text_font(details_label, MCUI_FONT_16, 0);
+    lv_obj_set_style_text_color(details_label, lv_color_hex(TH_TEXT), 0);
+    lv_obj_t *close = lv_button_create(box);
+    lv_obj_set_size(close, 40, 40);
+    lv_obj_align(close, LV_ALIGN_TOP_RIGHT, 0, 0);
+    lv_obj_add_event_cb(close, maps_popup_close, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *close_label = lv_label_create(close);
+    lv_label_set_text(close_label, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(close_label, MCUI_FONT_16, 0);
+    lv_obj_center(close_label);
 }
 
 static void maps_zoom_delta(int delta)
@@ -1631,7 +1822,7 @@ static void maps_zoom_delta(int delta)
     s_map.drag_dy = 0;
     maps_zoom_set_label();
     maps_rebuild(true, true);
-    maps_viewport_save_now();
+    maps_viewport_save_later();
 }
 
 static void maps_btn_plus_cb(lv_event_t *) { maps_zoom_delta(+1); }
@@ -1640,10 +1831,17 @@ static void maps_btn_center_cb(lv_event_t *)
 {
     if (maps_center_from_local_node()) {
         maps_rebuild(true, true);
-        maps_viewport_save_now();
+        maps_viewport_save_later();
     } else {
         maps_status_set("No local position yet");
     }
+}
+
+static void maps_names_cb(lv_event_t *event)
+{
+    s_map.show_names = lv_obj_has_state(static_cast<lv_obj_t *>(lv_event_get_target(event)), LV_STATE_CHECKED);
+    if (s_map.tiles_ready) maps_refresh_markers();
+    maps_viewport_save_later();
 }
 
 lv_obj_t *maps_screen_create(lv_obj_t *parent)
@@ -1654,7 +1852,7 @@ lv_obj_t *maps_screen_create(lv_obj_t *parent)
     lv_obj_remove_style_all(s_map.content);
     lv_obj_set_size(s_map.content, SCR_W, PAGE_H);
     lv_obj_set_pos(s_map.content, 0, 0);
-    lv_obj_set_style_bg_color(s_map.content, lv_color_hex(0x172233), 0);
+    lv_obj_set_style_bg_color(s_map.content, lv_color_hex(0x1B2024), 0);
     lv_obj_set_style_bg_opa(s_map.content, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_map.content, 0, 0);
     lv_obj_set_style_pad_all(s_map.content, 0, 0);
@@ -1682,9 +1880,9 @@ lv_obj_t *maps_screen_create(lv_obj_t *parent)
         s_map_tiles[i].placeholder = lv_obj_create(s_map.pan);
         lv_obj_remove_style_all(s_map_tiles[i].placeholder);
         lv_obj_set_size(s_map_tiles[i].placeholder, kMapTilePx, kMapTilePx);
-        lv_obj_set_style_bg_color(s_map_tiles[i].placeholder, lv_color_hex(0x2D3F59), 0);
+        lv_obj_set_style_bg_color(s_map_tiles[i].placeholder, lv_color_hex(0x30363B), 0);
         lv_obj_set_style_bg_opa(s_map_tiles[i].placeholder, LV_OPA_40, 0);
-        lv_obj_set_style_border_color(s_map_tiles[i].placeholder, lv_color_hex(0x4E6484), 0);
+        lv_obj_set_style_border_color(s_map_tiles[i].placeholder, lv_color_hex(0x464C50), 0);
         lv_obj_set_style_border_width(s_map_tiles[i].placeholder, 1, 0);
         lv_obj_set_style_radius(s_map_tiles[i].placeholder, 0, 0);
         lv_obj_add_flag(s_map_tiles[i].placeholder, LV_OBJ_FLAG_HIDDEN);
@@ -1703,7 +1901,8 @@ lv_obj_t *maps_screen_create(lv_obj_t *parent)
         lv_obj_set_style_radius(s_map_markers[i].dot, 0, 0);
         lv_obj_set_style_bg_color(s_map_markers[i].dot, lv_color_hex(0x4DA3FF), 0);
         lv_obj_set_style_bg_opa(s_map_markers[i].dot, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(s_map_markers[i].dot, 0, 0);
+        lv_obj_set_style_border_width(s_map_markers[i].dot, 1, 0);
+        lv_obj_set_style_border_color(s_map_markers[i].dot, lv_color_hex(0xFFFFFF), 0);
         lv_obj_add_flag(s_map_markers[i].dot, LV_OBJ_FLAG_HIDDEN);
         lv_obj_remove_flag(s_map_markers[i].dot, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_remove_flag(s_map_markers[i].dot, LV_OBJ_FLAG_CLICKABLE);
@@ -1711,11 +1910,12 @@ lv_obj_t *maps_screen_create(lv_obj_t *parent)
         s_map_markers[i].tag = lv_obj_create(s_map.pan);
         lv_obj_remove_style_all(s_map_markers[i].tag);
         lv_obj_set_size(s_map_markers[i].tag, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_color(s_map_markers[i].tag, lv_color_hex(0xD3D3D3), 0);
-        lv_obj_set_style_bg_opa(s_map_markers[i].tag, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_color(s_map_markers[i].tag, lv_color_hex(0x9A9A9A), 0);
+        lv_obj_set_style_bg_color(s_map_markers[i].tag, lv_color_hex(0x62686E), 0);
+        lv_obj_set_style_bg_opa(s_map_markers[i].tag, LV_OPA_70, 0);
+        lv_obj_set_style_border_color(s_map_markers[i].tag, lv_color_hex(0x9AA0A6), 0);
+        lv_obj_set_style_border_opa(s_map_markers[i].tag, LV_OPA_30, 0);
         lv_obj_set_style_border_width(s_map_markers[i].tag, 1, 0);
-        lv_obj_set_style_radius(s_map_markers[i].tag, 0, 0);
+        lv_obj_set_style_radius(s_map_markers[i].tag, 3, 0);
         lv_obj_set_style_pad_hor(s_map_markers[i].tag, 3, 0);
         lv_obj_set_style_pad_ver(s_map_markers[i].tag, 1, 0);
         lv_obj_add_flag(s_map_markers[i].tag, LV_OBJ_FLAG_HIDDEN);
@@ -1724,7 +1924,8 @@ lv_obj_t *maps_screen_create(lv_obj_t *parent)
 
         s_map_markers[i].tag_label = lv_label_create(s_map_markers[i].tag);
         lv_label_set_text(s_map_markers[i].tag_label, "");
-        lv_obj_set_style_text_color(s_map_markers[i].tag_label, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_text_color(s_map_markers[i].tag_label, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_max_width(s_map_markers[i].tag_label, 108, 0);
         lv_obj_set_style_text_font(s_map_markers[i].tag_label, MCUI_FONT_16, 0);
         lv_obj_center(s_map_markers[i].tag_label);
 
@@ -1747,6 +1948,8 @@ lv_obj_t *maps_screen_create(lv_obj_t *parent)
     lv_label_set_text(s_map.status, "Maps: init");
     lv_obj_set_style_text_color(s_map.status, lv_color_hex(TH_TEXT), 0);
     lv_obj_set_style_text_font(s_map.status, MCUI_FONT_16, 0);
+    lv_obj_set_width(s_map.status, SCR_W - 78);
+    lv_label_set_long_mode(s_map.status, LV_LABEL_LONG_DOT);
     lv_obj_align(s_map.status, LV_ALIGN_LEFT_MID, 0, 0);
 
     s_map.zoom_lbl = lv_label_create(topbar);
@@ -1800,6 +2003,18 @@ lv_obj_t *maps_screen_create(lv_obj_t *parent)
         s_map.initialized = true;
     }
     maps_zoom_set_label();
+    lv_obj_t *names = lv_checkbox_create(s_map.content);
+    lv_checkbox_set_text(names, "Names");
+    lv_obj_set_size(names, 110, 36);
+    lv_obj_set_style_text_font(names, MCUI_FONT_16, 0);
+    lv_obj_set_style_text_color(names, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_color(names, lv_color_hex(0x30363B), 0);
+    lv_obj_set_style_bg_opa(names, LV_OPA_80, 0);
+    lv_obj_set_style_pad_all(names, 8, 0);
+    lv_obj_set_style_radius(names, 3, 0);
+    lv_obj_align(names, LV_ALIGN_TOP_RIGHT, -10, 46);
+    if (s_map.show_names) lv_obj_add_state(names, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(names, maps_names_cb, LV_EVENT_VALUE_CHANGED, nullptr);
 #if defined(CROWPANEL_DISABLE_MAPS)
     maps_status_set("Maps disabled");
     s_map.first_render_pending = false;
@@ -1838,11 +2053,20 @@ void maps_screen_on_show()
 void maps_screen_on_hide()
 {
 #if !defined(CROWPANEL_DISABLE_MAPS)
+    maps_popup_close();
+    maps_apply_drag_and_rebuild();
+    if (s_map.save_pending) maps_viewport_save_now();
     s_map.drag_dx = 0;
     s_map.drag_dy = 0;
+    s_map.gesture_travel = 0;
     s_map_marker_restore_ms = 0;
     maps_hide_all_markers();
+    // Retain decoded tile sources when the shared boot-time SD mount survives.
+#if defined(ARCH_ESP32) && defined(CROWPANEL_DHE04005D)
+    if (s_map_sd_own_mount) maps_clear_all_tiles();
+#else
     maps_clear_all_tiles();
+#endif
     maps_storage_release();
 #endif
 }
@@ -1866,6 +2090,9 @@ void maps_screen_tick()
         return;
     }
     s_map_blocked_by_wifi = false;
+    if (s_map.save_pending && !s_map.fallback_active && s_map.drag_dx == 0 && s_map.drag_dy == 0 &&
+        !Throttle::isWithinTimespanMs(s_map.save_changed_ms, 2000))
+        maps_viewport_save_now();
 
     if (s_map.first_render_pending) {
         s_map.first_render_pending = false;
@@ -1874,19 +2101,23 @@ void maps_screen_tick()
         return;
     }
 
-    if (s_map_marker_restore_ms != 0 && (int32_t)(now - s_map_marker_restore_ms) >= 0) {
+    if (s_map_marker_restore_ms != 0 &&
+        !Throttle::isWithinTimespanMs(s_map_marker_restore_ms, kMapMarkerRestoreDelayMs)) {
         s_map_marker_restore_ms = 0;
-        maps_rebuild(false, true);
+        if (s_map.tiles_ready) maps_refresh_markers();
         s_map.last_nodes_refresh_ms = now;
-        return;
     }
 
-    if ((uint32_t)(now - s_map.last_nodes_refresh_ms) >= kMapNodeRefreshMs) {
+    if (!Throttle::isWithinTimespanMs(s_map.last_nodes_refresh_ms, kMapNodeRefreshMs)) {
         s_map.last_nodes_refresh_ms = now;
         if (s_map.drag_dx == 0 && s_map.drag_dy == 0) {
-            maps_rebuild(false, true);
+            if (s_map.tiles_ready) {
+                maps_refresh_markers();
+                maps_tile_status();
+            }
         }
     }
+    if (s_map.drag_dx == 0 && s_map.drag_dy == 0) maps_load_next_tile();
 #endif
 }
 

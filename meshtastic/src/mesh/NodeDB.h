@@ -3,6 +3,7 @@
 #include "Observer.h"
 #include <Arduino.h>
 #include <algorithm>
+#include <atomic>
 #include <assert.h>
 #include <pb_encode.h>
 #include <string>
@@ -98,6 +99,9 @@ extern meshtastic_Position localPosition;
 static constexpr const char *deviceStateFileName = "/prefs/device.proto";
 static constexpr const char *legacyPrefFileName = "/prefs/db.proto";
 static constexpr const char *nodeDatabaseFileName = "/prefs/nodes.proto";
+#if defined(CROWPANEL_DHE04005D)
+static constexpr const char *nodeDatabaseBackupFileName = "/prefs/nodes.proto.bak";
+#endif
 static constexpr const char *configFileName = "/prefs/config.proto";
 static constexpr const char *uiconfigFileName = "/prefs/uiconfig.proto";
 static constexpr const char *moduleConfigFileName = "/prefs/module.proto";
@@ -183,7 +187,7 @@ class NodeDB
 
     /** Update user info and channel for this node based on received user data
      */
-    bool updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelIndex = 0);
+    bool updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelIndex = 0, bool viaMqtt = false);
 
     /*
      * Sets a node either favorite or unfavorite
@@ -255,6 +259,7 @@ class NodeDB
 
     virtual meshtastic_NodeInfoLite *getMeshNode(NodeNum n);
     size_t getNumMeshNodes() { return numMeshNodes; }
+    uint32_t getNodeMembershipRevision() const { return nodeMembershipRevision.load(std::memory_order_acquire); }
 
     UserLicenseStatus getLicenseStatus(uint32_t nodeNum);
 
@@ -307,8 +312,9 @@ class NodeDB
         newStatus.notifyObservers(&status);
     }
 
-    /// CrowPanel: flush the batched new-node save if its deadline passed (or force).
+    /// CrowPanel: flush pending discoveries/updates when due, even without traffic.
     void flushPendingNodeDbSave(bool force = false);
+    bool hasPendingNodeDbSave() const { return nodeDbBatchPendingSince != 0; }
 
   private:
     static constexpr uint32_t NEW_NODE_SAVE_INTERVAL_MS = 5000;
@@ -318,10 +324,16 @@ class NodeDB
     uint32_t lastNodeDbNewNodeSave = 0; // fast debounce window for newly discovered nodes
     uint32_t nodeDbBatchPendingSince = 0; // 0 = no batched new-node save pending
     uint16_t nodeDbBatchPendingCount = 0; // new nodes accumulated in the pending batch
+    bool nodeDbBatchHasNewNodes = false;
+    bool nodeDbRecoveredFromBackup = false;
+    uint32_t nodeDbLastSaveAttempt = 0;
+    uint32_t nodeDbFullWarningMs = 0;
+    std::atomic<uint32_t> nodeMembershipRevision{0};
+    void markNodeDbSavePending(bool newNode = false);
     uint32_t lastBackupAttempt = 0; // when we last tried a backup automatically or manually
     uint32_t lastSort = 0;          // When last sorted the nodeDB
     /// Find a node in our DB, create an empty NodeInfoLite if missing
-    meshtastic_NodeInfoLite *getOrCreateMeshNode(NodeNum n);
+    meshtastic_NodeInfoLite *getOrCreateMeshNode(NodeNum n, bool viaMqtt = false);
 
     /*
      * Internal boolean to track sorting paused
@@ -334,7 +346,7 @@ class NodeDB
     /// read our db from flash
     void loadFromDisk();
 
-    /// purge db entries without user info
+    /// Clean unused entries (CrowPanel retains discovered nodes without user info).
     void cleanupMeshDB();
 
     /// Reinit device state from scratch (not loading from disk)

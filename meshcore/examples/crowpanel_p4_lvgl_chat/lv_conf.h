@@ -671,10 +671,7 @@
 #endif
 
 /*PNG decoder library*/
-// Enabled for Phase 1 of map support (OSM PNG tiles on SD card). PNG
-// software decode is ~100-200 ms per 256x256 tile via lodepng, which
-// makes pan/zoom sluggish at Phase 2 scale; we'll revisit whether to
-// switch to hardware-JPEG tiles once there's a real perf target.
+// Required for OSM PNG map tiles loaded from the SD card.
 #define LV_USE_PNG 1
 
 /*BMP decoder library*/

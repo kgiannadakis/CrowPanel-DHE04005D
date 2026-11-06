@@ -1210,7 +1210,7 @@ void loop()
 
     if (RadioLibInterface::instance != nullptr) {
         static uint32_t lastRadioMissedIrqPoll;
-        if (!Throttle::isWithinTimespanMs(lastRadioMissedIrqPoll, 1000)) {
+        if (!Throttle::isWithinTimespanMs(lastRadioMissedIrqPoll, RADIO_IRQ_POLL_INTERVAL_MS)) {
             lastRadioMissedIrqPoll = millis();
             RadioLibInterface::instance->pollMissedIrqs();
         }
@@ -1285,6 +1285,12 @@ void loop()
     messageStoreAutosaveTick();
 #endif
     long delayMsec = mainController.runOrDelay();
+#if defined(CROWPANEL_DHE04005D)
+    nodeDB->flushPendingNodeDbSave();
+    // Keep the fallback IRQ poll responsive even when no worker is due.
+    delayMsec = std::min(delayMsec, static_cast<long>(RADIO_IRQ_POLL_INTERVAL_MS));
+    if (nodeDB->hasPendingNodeDbSave()) delayMsec = std::min(delayMsec, 1000L);
+#endif
 
     // We want to sleep as long as possible here - because it saves power
     if (!runASAP && loopCanSleep()) {

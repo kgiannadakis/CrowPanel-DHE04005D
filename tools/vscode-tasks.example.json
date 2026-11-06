@@ -1,0 +1,21 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Repository: Check",
+      "type": "process",
+      "command": "python",
+      "args": ["tools/check_repository.py"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "problemMatcher": []
+    },
+    {
+      "label": "MeshCore: Build",
+      "type": "process",
+      "command": "platformio",
+      "args": ["run", "-d", "meshcore", "-e", "dhe04005d-5inch-P4-meshcore"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "problemMatcher": ["$gcc"]
+    }
+  ]
+}

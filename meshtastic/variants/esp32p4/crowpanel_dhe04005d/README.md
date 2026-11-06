@@ -131,10 +131,27 @@ toolchain is fetched by PlatformIO on the first build.
 firmware; the LittleFS image holds `/prefs` (node DB, config, chat history) and
 should only be re-flashed when you intend to wipe that data.
 
+## Screen timeout and preference storage
+
+The MeshCore-style CPU sleep, idle clock scaling and retained RGB stop/resume
+experiment has been reverted. The previous backlight-only timeout and early
+ESP-Hosted initialization are restored; WiFi scanning no longer requires the
+restart introduced by that experiment.
+
+LittleFS mounts the private `mtdata` partition before UI/network startup. If
+mounting fails, first-boot initialization is permitted only after every byte of
+that partition has been read successfully and found to be erased (0xFF).
+Nonblank or unreadable storage is never automatically formatted, including a
+partition with an erased header but data elsewhere. There is one mount owner,
+and later filesystem initialization reuses its result.
+
+A mount failure does not establish corruption: an uninitialized partition can
+produce the same LittleFS error. Nonblank mount failures require backup and
+recovery assessment, not an automatic erase. First setup still refuses to reboot
+if saving its settings fails.
+
 ## Known cosmetic issues (non-blocking)
 
-- `CPU clock could not be set to 80 MHz. Supported frequencies: 360 MHz` — the
-  idle-power code tries to slow down; the P4 only runs at 360 MHz.
 - A stray `LittleFS partition "spiffs" could not be found` line at boot comes from
   an unrelated mount probe; the real data partitions mount fine.
 

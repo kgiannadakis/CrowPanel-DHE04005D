@@ -1,10 +1,16 @@
 #include "TraceRouteModule.h"
+#include "TraceRoutePolicy.h"
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "graphics/Screen.h"
 #include "graphics/ScreenFonts.h"
 #include "graphics/SharedUIDisplay.h"
 #include "mesh/Router.h"
+#include "mesh/Channels.h"
+#include "mesh/Throttle.h"
+#if !MESHTASTIC_EXCLUDE_MQTT
+#include "mqtt/MQTT.h"
+#endif
 #include "meshUtils.h"
 #include <vector>
 
@@ -130,7 +136,7 @@ void TraceRouteModule::alterReceivedProtobuf(meshtastic_MeshPacket &p, meshtasti
     const meshtastic_Data &incoming = p.decoded;
 
     // Update next-hops using returned route
-    if (incoming.request_id) {
+    if (incoming.request_id && !p.via_mqtt) {
         updateNextHops(p, r);
     }
 
@@ -138,7 +144,9 @@ void TraceRouteModule::alterReceivedProtobuf(meshtastic_MeshPacket &p, meshtasti
     insertUnknownHops(p, r, !incoming.request_id);
 
     // Append ID and SNR. If the last hop is to us, we only need to append the SNR
-    appendMyIDandSNR(r, p.rx_snr, !incoming.request_id, isToUs(&p));
+    // Broker delivery has no RF SNR, and must not teach the LoRa router a next hop.
+    const float snr = p.via_mqtt ? static_cast<float>(INT8_MIN) / 4.0f : p.rx_snr;
+    appendMyIDandSNR(r, snr, !incoming.request_id, isToUs(&p));
     if (!incoming.request_id)
         printRoute(r, p.from, p.to, true);
     else
@@ -177,7 +185,8 @@ void TraceRouteModule::alterReceivedProtobuf(meshtastic_MeshPacket &p, meshtasti
         LOG_INFO("TracRoute conditions: isResponseFromTarget=%d, isRequestToUs=%d, containsTargetNode=%d, hasCompleteRoute=%d",
                  isResponseFromTarget, isRequestToUs, containsTargetNode, hasCompleteRoute);
 
-        if (isResponseFromTarget || isRequestToUs || (containsTargetNode && hasCompleteRoute)) {
+        if (TraceRoutePolicy::matchesResponse(isToUs(&p), p.from, incoming.request_id,
+                                             runState == TRACEROUTE_STATE_TRACKING, tracingNode, tracingPacketId)) {
             LOG_INFO("TracRoute result detected: isResponseFromTarget=%d, isRequestToUs=%d", isResponseFromTarget, isRequestToUs);
 
             LOG_INFO("SNR arrays - towards_count=%d, back_count=%d", r->snr_towards_count, r->snr_back_count);
@@ -188,7 +197,7 @@ void TraceRouteModule::alterReceivedProtobuf(meshtastic_MeshPacket &p, meshtasti
                 LOG_INFO("SNR back[%d] = %d (%.1fdB)", i, r->snr_back[i], (float)r->snr_back[i] / 4.0f);
             }
 
-            String result = "";
+            String result = p.via_mqtt ? "MQTT: " : "";
 
             // Show request path (from initiator to target)
             if (r->route_count > 0) {
@@ -227,6 +236,8 @@ void TraceRouteModule::alterReceivedProtobuf(meshtastic_MeshPacket &p, meshtasti
             }
 
             // Show response path (from target back to initiator)
+            if (p.via_mqtt)
+                result += "MQTT: ";
             if (r->route_back_count > 0) {
                 result += getNodeName(tracingNode);
                 for (int8_t i = r->route_back_count - 1; i >= 0; i--) {
@@ -440,7 +451,7 @@ void TraceRouteModule::printRoute(meshtastic_RouteDiscovery *r, uint32_t origin,
     // If there's a route back (or we are the destination as then the route is complete), print it
     if (r->route_back_count > 0 || origin == nodeDB->getNodeNum()) {
         route += "\n";
-        if (r->snr_towards_count > 0 && origin == nodeDB->getNodeNum())
+        if (r->snr_back_count > 0 && origin == nodeDB->getNodeNum() && r->snr_back[r->snr_back_count - 1] != INT8_MIN)
             route += vformat("(%.2fdB) 0x%x <-- ", (float)r->snr_back[r->snr_back_count - 1] / 4, origin);
         else
             route += "...";
@@ -473,7 +484,10 @@ meshtastic_MeshPacket *TraceRouteModule::allocReply()
     meshtastic_RouteDiscovery scratch;
     meshtastic_RouteDiscovery *updated = NULL;
     memset(&scratch, 0, sizeof(scratch));
-    pb_decode_from_bytes(p.payload.bytes, p.payload.size, &meshtastic_RouteDiscovery_msg, &scratch);
+    if (!pb_decode_from_bytes(p.payload.bytes, p.payload.size, &meshtastic_RouteDiscovery_msg, &scratch)) {
+        ignoreRequest = true;
+        return nullptr;
+    }
     updated = &scratch;
 
     // Create a MeshPacket with this payload and set it as the reply
@@ -510,6 +524,10 @@ bool TraceRouteModule::startTraceRoute(NodeNum node)
 {
     LOG_INFO("=== TraceRoute startTraceRoute CALLED: node=0x%08x ===", node);
     unsigned long now = millis();
+    if (!nodeDB || !router || !service) {
+        handleTraceRouteResult("Router/service unavailable");
+        return false;
+    }
 
     if (node == 0 || node == NODENUM_BROADCAST) {
         LOG_ERROR("Invalid node number for trace route: 0x%08x", node);
@@ -550,9 +568,9 @@ bool TraceRouteModule::startTraceRoute(NodeNum node)
         return false;
     }
 
-    if (initialized && lastTraceRouteTime > 0 && now - lastTraceRouteTime < cooldownMs) {
+    if (initialized && lastTraceRouteTime > 0 && Throttle::isWithinTimespanMs(lastTraceRouteTime, cooldownMs)) {
         // Cooldown
-        unsigned long wait = (cooldownMs - (now - lastTraceRouteTime)) / 1000;
+        unsigned long wait = (cooldownMs - (now - lastTraceRouteTime) + 999) / 1000;
         bannerText = String("Wait for ") + String(wait) + String("s");
         runState = TRACEROUTE_STATE_COOLDOWN;
         resultText = "";
@@ -590,6 +608,10 @@ bool TraceRouteModule::startTraceRoute(NodeNum node)
     // Allocate a packet directly from router like the reference code
     meshtastic_MeshPacket *p = router->allocForSending();
     if (p) {
+        if (!prepareRequest(p, node)) {
+            packetPool.release(p);
+            return false;
+        }
         // Set destination and port
         p->to = node;
         p->decoded.portnum = meshtastic_PortNum_TRACEROUTE_APP;
@@ -612,6 +634,7 @@ bool TraceRouteModule::startTraceRoute(NodeNum node)
             LOG_INFO("sendToMesh called successfully for trace route to node 0x%08x", node);
         } else {
             LOG_ERROR("MeshService is NULL!");
+            packetPool.release(p);
             runState = TRACEROUTE_STATE_RESULT;
             setResultText("Service unavailable");
             resultShowTime = millis();
@@ -641,6 +664,12 @@ bool TraceRouteModule::startTraceRoute(NodeNum node)
 
 void TraceRouteModule::launch(NodeNum node)
 {
+    if (!nodeDB || !router || !service) {
+        handleTraceRouteResult("Router/service unavailable");
+        return;
+    }
+    if (runState == TRACEROUTE_STATE_TRACKING)
+        return;
     if (node == 0 || node == NODENUM_BROADCAST) {
         LOG_ERROR("Invalid node number for trace route: 0x%08x", node);
         runState = TRACEROUTE_STATE_RESULT;
@@ -676,8 +705,8 @@ void TraceRouteModule::launch(NodeNum node)
     }
 
     unsigned long now = millis();
-    if (initialized && lastTraceRouteTime > 0 && now - lastTraceRouteTime < cooldownMs) {
-        unsigned long wait = (cooldownMs - (now - lastTraceRouteTime)) / 1000;
+    if (initialized && lastTraceRouteTime > 0 && Throttle::isWithinTimespanMs(lastTraceRouteTime, cooldownMs)) {
+        unsigned long wait = (cooldownMs - (now - lastTraceRouteTime) + 999) / 1000;
         bannerText = String("Wait for ") + String(wait) + String("s");
         runState = TRACEROUTE_STATE_COOLDOWN;
         resultText = "";
@@ -711,6 +740,10 @@ void TraceRouteModule::launch(NodeNum node)
 
     meshtastic_MeshPacket *p = router->allocForSending();
     if (p) {
+        if (!prepareRequest(p, node)) {
+            packetPool.release(p);
+            return;
+        }
         p->to = node;
         p->decoded.portnum = meshtastic_PortNum_TRACEROUTE_APP;
         p->decoded.want_response = true;
@@ -729,6 +762,7 @@ void TraceRouteModule::launch(NodeNum node)
             LOG_INFO("sendToMesh called successfully for trace route to node 0x%08x", node);
         } else {
             LOG_ERROR("MeshService is NULL!");
+            packetPool.release(p);
             runState = TRACEROUTE_STATE_RESULT;
             setResultText("Service unavailable");
             resultShowTime = millis();
@@ -743,12 +777,128 @@ void TraceRouteModule::launch(NodeNum node)
     }
 }
 
+bool TraceRouteModule::acceptsMqttPacket(const meshtastic_MeshPacket &packet) const
+{
+    return packet.which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
+           packet.decoded.portnum == meshtastic_PortNum_TRACEROUTE_APP &&
+           TraceRoutePolicy::acceptsMqtt(isToUs(&packet), packet.decoded.want_response, packet.from,
+                                        packet.decoded.request_id, runState == TRACEROUTE_STATE_TRACKING,
+                                        tracingNode, tracingPacketId);
+}
+
+bool TraceRouteModule::prepareRequest(meshtastic_MeshPacket *packet, NodeNum node)
+{
+    mqttTracePossible = false;
+    publicBrokerTrace = false;
+    targetAckSeen = false;
+    brokerEchoSeen = false;
+    radioFailureSeen = false;
+    mqttRejectionReason = nullptr;
+    const auto *target = nodeDB->getMeshNode(node);
+    packet->channel = target ? target->channel : channels.getPrimaryIndex();
+    if (packet->channel >= channels.getNumChannels() ||
+        channels.getByIndex(packet->channel).role == meshtastic_Channel_Role_DISABLED) {
+        handleTraceRouteResult("Node channel unavailable");
+        return false;
+    }
+    const bool viaMqtt = target && target->via_mqtt;
+#if !MESHTASTIC_EXCLUDE_MQTT
+    const auto &settings = channels.getByIndex(packet->channel).settings;
+    mqttTracePossible = moduleConfig.mqtt.enabled && mqtt && settings.uplink_enabled && settings.downlink_enabled;
+    publicBrokerTrace = mqttTracePossible && mqtt->isUsingDefaultServer() && channels.isDefaultChannel(packet->channel);
+#endif
+    // A saved contact's origin flag can be stale. The channel decides whether
+    // this request also has a broker return path, not the contact's display flag.
+    trackingTimeoutMs = TraceRoutePolicy::timeoutMs(mqttTracePossible);
+    if (viaMqtt) {
+#if !MESHTASTIC_EXCLUDE_MQTT
+        if (!moduleConfig.mqtt.enabled || !mqtt) {
+            handleTraceRouteResult("MQTT is disabled");
+            return false;
+        }
+        if (!settings.uplink_enabled || !settings.downlink_enabled) {
+            handleTraceRouteResult("MQTT uplink/downlink disabled on node channel");
+            return false;
+        }
+#else
+        handleTraceRouteResult("MQTT unavailable in this build");
+        return false;
+#endif
+        bannerText = String("Tracing via MQTT: ") + getNodeName(node);
+    } else if (mqttTracePossible) {
+        bannerText = String("Tracing LoRa/MQTT: ") + getNodeName(node);
+    }
+    if (publicBrokerTrace)
+        LOG_WARN("Traceroute: public MQTT default-key filtering may block port 70; a contact advertisement is not proof of reachability");
+    tracingPacketId = packet->id;
+    LOG_INFO("Traceroute request id=0x%08x target=0x%08x channel=%u MQTT=%d contact_mqtt=%d timeout=%lu ms", packet->id,
+             node, (unsigned)packet->channel, mqttTracePossible, viaMqtt, trackingTimeoutMs);
+    return true;
+}
+
+void TraceRouteModule::handleRoutingReport(const meshtastic_MeshPacket &packet, const meshtastic_Routing &report)
+{
+    if (!nodeDB || packet.which_payload_variant != meshtastic_MeshPacket_decoded_tag ||
+        packet.decoded.portnum != meshtastic_PortNum_ROUTING_APP || report.which_variant != meshtastic_Routing_error_reason_tag)
+        return;
+    const bool mqttTransport = packet.via_mqtt ||
+                              packet.transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT;
+    const auto event = TraceRoutePolicy::routingReport(isToUs(&packet), packet.from, nodeDB->getNodeNum(),
+                                                      packet.decoded.request_id, runState == TRACEROUTE_STATE_TRACKING,
+                                                      tracingNode, tracingPacketId, mqttTransport,
+                                                      report.error_reason != meshtastic_Routing_Error_NONE);
+    using TraceRoutePolicy::RoutingReport;
+    if (event == RoutingReport::Ignore)
+        return;
+    if (event == RoutingReport::BrokerEcho) {
+        if (!brokerEchoSeen)
+            LOG_INFO("Traceroute broker echo id=0x%08x: upload returned; this is NOT a target acknowledgement", tracingPacketId);
+        brokerEchoSeen = true;
+    } else if (event == RoutingReport::TargetAck) {
+        if (!targetAckSeen)
+            LOG_INFO("Traceroute target ACK id=0x%08x from=0x%08x viaMQTT=%d; still waiting for RouteDiscovery",
+                     tracingPacketId, packet.from, mqttTransport);
+        targetAckSeen = true;
+        bannerText = "Target acknowledged; waiting for route";
+    } else if (event == RoutingReport::TargetError) {
+        LOG_WARN("Traceroute target NAK id=0x%08x from=0x%08x error=%d viaMQTT=%d", tracingPacketId, packet.from,
+                 report.error_reason, mqttTransport);
+        handleTraceRouteResult(report.error_reason == meshtastic_Routing_Error_NO_RESPONSE
+                                   ? String("Target received request but did not provide a traceroute")
+                                   : String("Target rejected traceroute (error ") + String((int)report.error_reason) + ")");
+    } else {
+        if (!radioFailureSeen)
+            LOG_WARN("Traceroute local send error id=0x%08x error=%d MQTT=%d", tracingPacketId, report.error_reason,
+                     mqttTracePossible);
+        radioFailureSeen = true;
+        const bool rfDeliveryFailure = report.error_reason == meshtastic_Routing_Error_MAX_RETRANSMIT ||
+                                       report.error_reason == meshtastic_Routing_Error_NO_ROUTE ||
+                                       report.error_reason == meshtastic_Routing_Error_TIMEOUT;
+        // RF retries ending do not cancel an independently published MQTT request.
+        if (!mqttTracePossible || !rfDeliveryFailure)
+            handleTraceRouteResult(String("Traceroute send failed (error ") + String((int)report.error_reason) + ")");
+    }
+}
+
+void TraceRouteModule::noteMqttReplyRejected(const meshtastic_MeshPacket &packet, const char *reason)
+{
+    if (packet.which_payload_variant != meshtastic_MeshPacket_decoded_tag ||
+        packet.decoded.portnum != meshtastic_PortNum_TRACEROUTE_APP || mqttRejectionReason ||
+        !TraceRoutePolicy::matchesResponse(isToUs(&packet), packet.from, packet.decoded.request_id,
+                                           runState == TRACEROUTE_STATE_TRACKING, tracingNode, tracingPacketId))
+        return;
+    // Callers supply static reasons; no allocation in the MQTT receive callback.
+    mqttRejectionReason = reason;
+    LOG_WARN("Traceroute matching MQTT reply rejected id=0x%08x from=0x%08x: %s", tracingPacketId, packet.from, reason);
+}
+
 void TraceRouteModule::handleTraceRouteResult(const String &result)
 {
     setResultText(result);
     runState = TRACEROUTE_STATE_RESULT;
     resultShowTime = millis();
     tracingNode = 0;
+    tracingPacketId = 0;
 
     LOG_INFO("TraceRoute result ready, requesting focus. Result: %s", result.c_str());
 
@@ -824,17 +974,16 @@ int32_t TraceRouteModule::runOnce()
     }
 
     // Check for tracking timeout
-    if (runState == TRACEROUTE_STATE_TRACKING && now - lastTraceRouteTime > trackingTimeoutMs) {
-        LOG_INFO("TraceRoute timeout, no response received");
-        runState = TRACEROUTE_STATE_RESULT;
-        setResultText("No response received");
-        resultShowTime = now;
-        tracingNode = 0;
-
-        requestFocus();
-        UIFrameEvent e;
-        e.action = UIFrameEvent::Action::REGENERATE_FRAMESET;
-        notifyObservers(&e);
+    if (runState == TRACEROUTE_STATE_TRACKING && !Throttle::isWithinTimespanMs(lastTraceRouteTime, trackingTimeoutMs)) {
+        LOG_INFO("Traceroute timeout id=0x%08x target=0x%08x after=%lu ms MQTT=%d broker_echo=%d target_ack=%d RF_error=%d",
+                 tracingPacketId, tracingNode, trackingTimeoutMs, mqttTracePossible, brokerEchoSeen, targetAckSeen,
+                 radioFailureSeen);
+        String result = mqttRejectionReason ? String("Traceroute reply rejected: ") + mqttRejectionReason
+                        : targetAckSeen     ? String("Target acknowledged, but no traceroute reply")
+                                            : String("No traceroute reply within ") + String(trackingTimeoutMs / 1000) + "s";
+        if (publicBrokerTrace && !mqttRejectionReason)
+            result += " (public MQTT may filter traceroute)";
+        handleTraceRouteResult(result);
 
         setIntervalFromNow(resultDisplayMs);
         return resultDisplayMs;
@@ -842,7 +991,9 @@ int32_t TraceRouteModule::runOnce()
 
     // Update cooldown display every second
     if (runState == TRACEROUTE_STATE_COOLDOWN) {
-        unsigned long wait = (cooldownMs - (now - lastTraceRouteTime)) / 1000;
+        unsigned long wait = Throttle::isWithinTimespanMs(lastTraceRouteTime, cooldownMs)
+                                 ? (cooldownMs - (now - lastTraceRouteTime) + 999) / 1000
+                                 : 0;
         if (wait > 0) {
             String newBannerText = String("Wait for ") + String(wait) + String("s");
             bannerText = newBannerText;

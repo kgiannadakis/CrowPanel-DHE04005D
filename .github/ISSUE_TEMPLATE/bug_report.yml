@@ -1,0 +1,42 @@
+name: Bug Report
+description: Report a reproducible CrowPanel firmware problem.
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Do not post private keys, Wi-Fi passwords, precise locations or full device backups.
+        Report security vulnerabilities privately using SECURITY.md.
+  - type: dropdown
+    id: firmware
+    attributes:
+      label: Firmware
+      options: [MeshCore, Meshtastic, Boot selector, Installation tooling]
+    validations:
+      required: true
+  - type: input
+    id: build
+    attributes:
+      label: Build Identifier
+      description: Firmware version, build date, commit and ELF SHA-256 when available.
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware And Conditions
+      description: Board revision, radio module/settings, power source, Wi-Fi and screen state.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction Steps
+      description: Include expected behavior, actual behavior and how often it occurs.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized Logs Or Reboot Report
+      description: Keep only relevant excerpts and redact identifying/private information.
+      render: text

@@ -1,4 +1,5 @@
 #include "crowpanel_backlight.h"
+#include "CrowPanelStorage.h"
 
 #include <Arduino.h>
 #include "i2c_bus.h"
@@ -156,7 +157,8 @@ extern "C" void initVariant() {
     }
 #endif
 
-    LittleFS.begin(true, "/littlefs", 10, "mtdata");
+    if (!crowpanel_preferences_begin())
+        ESP_LOGE("crowpanel", "Preferences unavailable; existing partition data preserved");
 #if HAS_TFT && USE_MCUI
     // Mount /sdcard and load the color-emoji atlas now, before ESP-Hosted WiFi
     // starts and before the framebuffer touches PSRAM. The SD mount is kept

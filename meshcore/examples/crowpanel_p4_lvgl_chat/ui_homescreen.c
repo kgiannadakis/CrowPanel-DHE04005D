@@ -3,6 +3,7 @@
 
 #include "ui.h"
 #include "ui_tabbar.h"
+#include "ui_battery.h"
 
 // ── Widget pointers ─────────────────────────────────────────
 
@@ -18,9 +19,6 @@ lv_obj_t * ui_textsend_counter = NULL;
 lv_obj_t * ui_backbutton       = NULL;
 lv_obj_t * ui_backlabel        = NULL;
 lv_obj_t * ui_timelabel        = NULL;
-lv_obj_t * ui_batterylabel     = NULL;
-lv_obj_t * ui_batterybody      = NULL;
-lv_obj_t * ui_batteryfill      = NULL;
 lv_obj_t * ui_Keyboard1        = NULL;
 
 // Stubs — SquareLine-era symbols still referenced in display.cpp widget arrays.
@@ -76,7 +74,8 @@ void ui_homescreen_screen_init(void) {
     ui_devicenamelabel = lv_label_create(statusbar);
     lv_label_set_text(ui_devicenamelabel, "MeshCore");
     lv_label_set_long_mode(ui_devicenamelabel, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(ui_devicenamelabel, 300);
+    // Reserve the battery/back area and the chat mute/time controls.
+    lv_obj_set_width(ui_devicenamelabel, SCR_W - 280);
     lv_obj_set_style_text_align(ui_devicenamelabel, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(ui_devicenamelabel, lv_color_hex(TH_TEXT), 0);
     lv_obj_set_style_text_font(ui_devicenamelabel, &lv_font_montserrat_20, 0);
@@ -89,47 +88,7 @@ void ui_homescreen_screen_init(void) {
     lv_obj_set_style_text_font(ui_timelabel, &lv_font_montserrat_18, 0);
     lv_obj_align(ui_timelabel, LV_ALIGN_RIGHT_MID, 0, 0);
 
-    // Battery indicator (from the onboard STC8 at I2C 0x2F), on the LEFT of the
-    // status bar (left of the centred device name) so it never overlaps the
-    // mute/silence button that appears on the right in chat mode. Placed clear
-    // of the 50px back button. Drawn icon + percentage label; both hidden/blank
-    // until the first successful read, so a missing reading simply shows nothing.
-    // Icon body (rounded outline). Font-independent geometry; fill tracks level.
-    ui_batterybody = lv_obj_create(statusbar);
-    lv_obj_remove_style_all(ui_batterybody);
-    lv_obj_set_size(ui_batterybody, 24, 12);
-    lv_obj_align(ui_batterybody, LV_ALIGN_LEFT_MID, 56, 0);
-    lv_obj_set_style_radius(ui_batterybody, 2, 0);
-    lv_obj_set_style_border_width(ui_batterybody, 1, 0);
-    lv_obj_set_style_border_color(ui_batterybody, lv_color_hex(TH_TEXT2), 0);
-    lv_obj_set_style_bg_opa(ui_batterybody, LV_OPA_TRANSP, 0);
-    lv_obj_clear_flag(ui_batterybody, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(ui_batterybody, LV_OBJ_FLAG_HIDDEN);
-
-    // Positive-terminal nub on the right end of the body.
-    lv_obj_t * batt_nub = lv_obj_create(ui_batterybody);
-    lv_obj_remove_style_all(batt_nub);
-    lv_obj_set_size(batt_nub, 2, 6);
-    lv_obj_align(batt_nub, LV_ALIGN_RIGHT_MID, 3, 0);
-    lv_obj_set_style_bg_color(batt_nub, lv_color_hex(TH_TEXT2), 0);
-    lv_obj_set_style_bg_opa(batt_nub, LV_OPA_COVER, 0);
-
-    // Fill bar inside the body; width is set from the level at refresh time.
-    ui_batteryfill = lv_obj_create(ui_batterybody);
-    lv_obj_remove_style_all(ui_batteryfill);
-    lv_obj_set_size(ui_batteryfill, 0, 8);
-    lv_obj_align(ui_batteryfill, LV_ALIGN_LEFT_MID, 1, 0);
-    lv_obj_set_style_radius(ui_batteryfill, 1, 0);
-    lv_obj_set_style_bg_color(ui_batteryfill, lv_color_hex(TH_TEXT2), 0);
-    lv_obj_set_style_bg_opa(ui_batteryfill, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(ui_batteryfill, LV_OBJ_FLAG_SCROLLABLE);
-
-    // Percentage label, just to the right of the icon.
-    ui_batterylabel = lv_label_create(statusbar);
-    lv_label_set_text(ui_batterylabel, "");
-    lv_obj_set_style_text_color(ui_batterylabel, lv_color_hex(TH_TEXT2), 0);
-    lv_obj_set_style_text_font(ui_batterylabel, &lv_font_montserrat_14, 0);
-    lv_obj_align(ui_batterylabel, LV_ALIGN_LEFT_MID, 88, 0);
+    ui_battery_create(statusbar);
 
     // [3] Back button — HIDDEN by default. main.cpp shows it in enter_chat_mode.
     ui_backbutton = lv_btn_create(ui_homescreen);

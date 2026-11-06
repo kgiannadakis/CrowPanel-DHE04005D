@@ -34,8 +34,8 @@ uint64_t sd_total_bytes() {
 uint64_t sd_free_bytes() {
   // statvfs() isn't shipped in arduino-esp32's newlib build, and
   // FatFS's f_getfree needs drive-number plumbing that esp_vfs_fat
-  // doesn't expose. Free-space reporting isn't essential for Phase 1
-  // (maps + emoji both only READ from the card), so this is a stub.
+  // doesn't expose. Maps and emoji only read the card; free-space reporting
+  // remains unavailable and returns zero.
   // If a feature later needs it, add an f_getfree helper behind a
   // small wrapper that pokes esp_vfs_fat's internal drive number.
   return 0;

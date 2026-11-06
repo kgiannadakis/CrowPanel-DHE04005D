@@ -764,7 +764,9 @@ void AdminModule::handleSetConfig(const meshtastic_Config &c)
         LOG_INFO("Set config: LoRa");
         config.has_lora = true;
 
-        if (validatedLora.coding_rate != clampCodingRate(validatedLora.coding_rate)) {
+        // Preset mode uses zero to mean no custom coding-rate override.
+        if (!(validatedLora.use_preset && validatedLora.coding_rate == 0) &&
+            validatedLora.coding_rate != clampCodingRate(validatedLora.coding_rate)) {
             LOG_WARN("Invalid coding_rate %d, setting to %d", validatedLora.coding_rate, LORA_CR_DEFAULT);
             validatedLora.coding_rate = LORA_CR_DEFAULT;
         }

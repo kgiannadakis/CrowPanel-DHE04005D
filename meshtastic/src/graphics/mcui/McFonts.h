@@ -7,6 +7,7 @@
 namespace mcui {
 
 const lv_font_t *font_16();
+const lv_font_t *font_keyboard();
 
 }
 

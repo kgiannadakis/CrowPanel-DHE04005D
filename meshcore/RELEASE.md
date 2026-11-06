@@ -1,15 +1,17 @@
-# Releasing Firmware
+# Releasing The CrowPanel Firmware
 
-GitHub Actions is set up to automatically build and release firmware.
+Follow the repository [publishing checklist](../docs/publishing.md). This fork
+does not configure the upstream tag-triggered multi-board release pipeline.
+The repository workflow runs checks only; it does not flash hardware or publish
+a firmware release.
 
-It will automatically build firmware when one of the following tag formats are pushed.
+Build the `dhe04005d-5inch-P4-meshcore` environment, preserve its matching ELF for
+crash decoding, and record the tested hardware, radio, SDK and firmware versions.
+Include unresolved issues and untested behavior in release notes. A successful
+compile is not a hardware-stability qualification.
 
-- `companion-v1.0.0`
-- `repeater-v1.0.0`
-- `room-server-v1.0.0`
-
-> NOTE: replace `v1.0.0` with the version you want to release as.
-
-- You can push one, or more tags on the same commit, and they will all build separately.
-- Once the firmware has been built, a new (draft) GitHub Release will be created.
-- You will need to update the release notes, and publish it.
+Publish only the intended firmware and documentation assets. Never attach a
+full-flash/NVS capture, device identity, saved contacts, Wi-Fi credentials or
+unredacted crash logs. Normal firmware updates must not require formatting the
+user's filesystem. A partition-layout migration needs separate, explicit
+installation instructions and a data-loss warning.
